@@ -1,0 +1,23 @@
+# ST 官方韌體包與 BSP：體積龐大且有自己的倉庫，用 scripts/setup.sh 取得
+cube/
+bsp/
+
+# CubeIDE headless build 的工作區
+ws/
+
+# 建置產物
+*.o
+*.d
+*.su
+*.cyclo
+*.elf
+*.bin
+*.hex
+*.map
+*.list
+Debug/
+Release/
+
+# 測試中間檔
+test/*.elf
+shots/*.raw
