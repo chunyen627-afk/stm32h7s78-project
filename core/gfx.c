@@ -3,10 +3,20 @@
 
 static uint16_t *g_fb;
 static gfx_fill_hw_fn g_fill_hw;
+static gfx_sync_hw_fn g_sync_hw;
 
 void gfx_set_framebuffer(uint16_t *fb) { g_fb = fb; }
 uint16_t *gfx_framebuffer(void)        { return g_fb; }
 void gfx_set_fill_hw(gfx_fill_hw_fn fn) { g_fill_hw = fn; }
+void gfx_set_sync_hw(gfx_sync_hw_fn fn) { g_sync_hw = fn; }
+
+/* 在 CPU 動到 framebuffer 之前呼叫，確保非同步的硬體填色已經結束。 */
+static inline void sync_hw(void)
+{
+    if (g_sync_hw) {
+        g_sync_hw();
+    }
+}
 
 /* Portrait (x,y) -> physical linear offset.
  * The panel is landscape and the portrait canvas is rotated 90 degrees
@@ -16,6 +26,8 @@ static inline uint32_t map_offset(int x, int y)
     return (uint32_t)(GFX_W - 1 - x) * PHYS_W + (uint32_t)y;
 }
 
+/* 注意：這裡刻意不做硬體同步。逐像素檢查在畫文字時會呼叫上千次，成本太高。
+ * 同步交給呼叫端在迴圈外做一次（gfx_char、gfx_circle 等都已處理）。 */
 void gfx_pixel(int x, int y, uint16_t color)
 {
     if ((unsigned)x >= GFX_W || (unsigned)y >= GFX_H || !g_fb) {
@@ -29,6 +41,7 @@ uint16_t gfx_get_pixel(int x, int y)
     if ((unsigned)x >= GFX_W || (unsigned)y >= GFX_H || !g_fb) {
         return 0;
     }
+    sync_hw();
     return g_fb[map_offset(x, y)];
 }
 
@@ -37,6 +50,7 @@ void gfx_clear(uint16_t color)
     if (!g_fb) {
         return;
     }
+    sync_hw();
     uint32_t n = (uint32_t)PHYS_W * PHYS_H;
     for (uint32_t i = 0; i < n; i++) {
         g_fb[i] = color;
@@ -67,6 +81,7 @@ void gfx_fill_rect(int x, int y, int w, int h, uint16_t color)
 
     /* A portrait column is a physical row, so for each logical x walk the
      * y range as a contiguous physical run. */
+    sync_hw();
     for (int xx = x; xx < x + w; xx++) {
         uint16_t *p = &g_fb[(uint32_t)(GFX_W - 1 - xx) * PHYS_W + (uint32_t)y];
         for (int yy = 0; yy < h; yy++) {
@@ -129,6 +144,7 @@ void gfx_circle(int cx, int cy, int r, uint16_t color)
         return;
     }
     /* Midpoint circle, plotting all eight octants. */
+    sync_hw();
     int x = r, y = 0, err = 1 - r;
     while (x >= y) {
         gfx_pixel(cx + x, cy + y, color);
@@ -167,6 +183,8 @@ void gfx_char(int x, int y, uint16_t cp, uint16_t color)
     if (!glyph) {
         return;
     }
+    /* 一個字約寫幾百個像素，在這裡同步一次即可。 */
+    sync_hw();
     for (int r = 0; r < FONT_ZH_SIZE; r++) {
         const uint8_t *row = &glyph[r * FONT_ZH_STRIDE];
         for (int c = 0; c < FONT_ZH_SIZE; c++) {

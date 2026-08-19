@@ -34,6 +34,14 @@ typedef void (*gfx_fill_hw_fn)(uint16_t *dst, int px, int py,
                                int pw, int ph, uint16_t color);
 void gfx_set_fill_hw(gfx_fill_hw_fn fn);
 
+/* 讓繪圖層在 CPU 直接寫入 framebuffer 之前，先等硬體停下來。
+ *
+ * 硬體填色是非同步的，發出後函式就返回。任何隨後的 CPU 寫入若沒等它結束，
+ * 會被硬體正在進行的傳輸蓋掉。文字、線條、圓形都是 CPU 逐像素畫的，所以
+ * 這個同步點必須在繪圖層裡，不能只靠呼叫端記得。 */
+typedef void (*gfx_sync_hw_fn)(void);
+void gfx_set_sync_hw(gfx_sync_hw_fn fn);
+
 void gfx_clear(uint16_t color);
 void gfx_pixel(int x, int y, uint16_t color);
 /* Read a pixel back; returns 0 outside the canvas.

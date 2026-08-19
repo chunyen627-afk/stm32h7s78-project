@@ -58,6 +58,15 @@ void dma2d_fill(uint16_t *dst, int px, int py, int pw, int ph, uint16_t color)
      * 對幾百個像素來說設定成本大於傳輸本身。門檻設 0 可強制全走硬體，
      * 診斷程式用這個方式確保真的在測 DMA2D。 */
     if ((uint32_t)pw * (uint32_t)ph < dma2d_cpu_threshold) {
+        /* 走 CPU 之前一定要等硬體停下來。dma2d_fill 是非同步的（發完就返回），
+         * 所以前一次的大面積填色可能還在寫。若在那時用 CPU 畫小東西，
+         * DMA2D 隨後的寫入會把剛畫好的內容蓋掉。
+         *
+         * 預覽框正是這個情形：框底 190x68 走硬體，裡面的方塊 14x14 走 CPU。
+         * 沒有這個等待，方塊會被框底的填色抹掉，而且每格抹掉的程度不同，
+         * 看起來就是「方塊不完整而且會閃」。 */
+        dma2d_wait();
+
         for (int r = 0; r < ph; r++) {
             uint16_t *row = &dst[(uint32_t)(py + r) * PHYS_W + (uint32_t)px];
             for (int c = 0; c < pw; c++) {

@@ -207,6 +207,7 @@ void game_run(void)
      * 皆零錯誤（含大量小矩形、與 CPU 交錯寫入）。 */
     dma2d_init();
     gfx_set_fill_hw(dma2d_fill);
+    gfx_set_sync_hw(dma2d_wait);
 
     tetris_init(&g_game, seed_from_hardware());
     input_init(&g_input);
