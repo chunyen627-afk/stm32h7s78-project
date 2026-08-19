@@ -15,6 +15,11 @@
 #include "ui.h"
 #include "input.h"
 
+/* DMA2D 硬體填色，實作在 dma2d.c。 */
+void dma2d_init(void);
+void dma2d_wait(void);
+void dma2d_fill(uint16_t *dst, int px, int py, int pw, int ph, uint16_t color);
+
 /* PSRAM is mapped at XSPI1. The BSP's own layer addresses sit here. */
 #define FB0_ADDR   LCD_LAYER_0_ADDRESS   /* 0x90000000 */
 #define FB1_ADDR   LCD_LAYER_1_ADDRESS   /* 0x90200000 */
@@ -76,93 +81,6 @@ static void framebuffer_mpu_init(void)
     SCB_CleanInvalidateDCache();
 }
 
-/* DMA2D-accelerated rectangle fill - CURRENTLY DISABLED.
- *
- * Filling PSRAM a pixel at a time is the slowest part of a frame, and DMA2D
- * measurably helps (9.87ms -> 7.07ms). But enabling it also produces
- * occasional large patches of stale PSRAM across the screen, and fragments of
- * the playfield appearing over the controls. Bisecting confirmed DMA2D is the
- * cause: with gfx_set_fill_hw() left unset the artefacts disappear entirely.
- *
- * The colour encoding, the OOR-only reconfiguration and the wait before
- * presenting are all correct as written - those were real bugs, found and
- * fixed. What remains is most likely the sheer number of transfers: a frame
- * issues 200+ start/poll cycles, one per cell. See docs/stm32h7s78-notes.md
- * section 3 for the suggested rewrite (one large transfer instead of many
- * small ones).
- *
- * Kept compiled-in so the working parts are not lost. The panel is 60Hz and
- * CPU drawing already holds 64fps, so nothing is currently gained by fixing
- * this - it will matter for a game that redraws the whole screen.
- */
-__attribute__((unused))
-static DMA2D_HandleTypeDef hdma2d;
-
-__attribute__((unused))
-static void dma2d_init(void)
-{
-    __HAL_RCC_DMA2D_CLK_ENABLE();
-
-    hdma2d.Instance          = DMA2D;
-    hdma2d.Init.Mode         = DMA2D_R2M;              /* register to memory */
-    hdma2d.Init.ColorMode    = DMA2D_OUTPUT_RGB565;
-    hdma2d.Init.OutputOffset = 0;
-    if (HAL_DMA2D_Init(&hdma2d) != HAL_OK) {
-        Error_Handler();
-    }
-}
-
-__attribute__((unused))
-static void dma2d_fill(uint16_t *dst, int px, int py,
-                       int pw, int ph, uint16_t color)
-{
-    /* Small rectangles are not worth the setup cost; the crossover sits
-     * around a few hundred pixels on this part. */
-    if ((uint32_t)pw * (uint32_t)ph < 256u) {
-        for (int r = 0; r < ph; r++) {
-            uint16_t *row = &dst[(uint32_t)(py + r) * PHYS_W + (uint32_t)px];
-            for (int c = 0; c < pw; c++) {
-                row[c] = color;
-            }
-        }
-        return;
-    }
-
-    /* Only the line offset changes between fills. Calling HAL_DMA2D_Init here
-     * would rewrite CR - including the MODE field - on every one of the two
-     * hundred-odd fills a frame needs, reconfiguring the controller while a
-     * previous transfer may still be retiring. That shows up as large patches
-     * of stale PSRAM appearing at random. Write OOR directly instead. */
-    MODIFY_REG(DMA2D->OOR, DMA2D_OOR_LO, (uint32_t)(PHYS_W - pw));
-
-    /* In R2M mode HAL_DMA2D_Start always takes ARGB8888 and narrows it to the
-     * output format itself. Passing the RGB565 value straight through makes it
-     * read the 16 bits as if they were ARGB8888, which loses most of the red
-     * and green channels and leaves everything looking dark and washed out.
-     * Expand each channel back to 8 bits, replicating the high bits so that
-     * full-scale stays full-scale. */
-    uint32_t r5 = (color >> 11) & 0x1F;
-    uint32_t g6 = (color >> 5)  & 0x3F;
-    uint32_t b5 =  color        & 0x1F;
-    uint32_t r8 = (r5 << 3) | (r5 >> 2);
-    uint32_t g8 = (g6 << 2) | (g6 >> 4);
-    uint32_t b8 = (b5 << 3) | (b5 >> 2);
-    uint32_t argb = 0xFF000000u | (r8 << 16) | (g8 << 8) | b8;
-
-    uint32_t addr = (uint32_t)&dst[(uint32_t)py * PHYS_W + (uint32_t)px];
-
-    if (HAL_DMA2D_Start(&hdma2d, argb, addr,
-                        (uint32_t)pw, (uint32_t)ph) == HAL_OK) {
-        (void)HAL_DMA2D_PollForTransfer(&hdma2d, 100);
-        /* The CPU draws arrows and text straight into the same buffer right
-         * after this returns. Without a barrier those stores can reach PSRAM
-         * before DMA2D's last burst has landed, and the fill then overwrites
-         * them - seen as fragments of the playfield appearing over the
-         * d-pad. */
-        __DSB();
-    }
-}
-
 /* Seed the piece bag from something that differs run to run. */
 static uint32_t seed_from_hardware(void)
 {
@@ -222,13 +140,8 @@ static void touch_init(void)
 /* Present the buffer we just drew and start drawing into the other one. */
 static void present(void)
 {
-    /* Make sure every accelerated fill has actually landed before this buffer
-     * is handed to the panel. Presenting while DMA2D is still writing shows
-     * the half-finished result. */
-    while (DMA2D->CR & DMA2D_CR_START) {
-        /* transfer in flight */
-    }
-    __DSB();
+    /* 交給面板前，確定所有硬體填色都已落地。 */
+    dma2d_wait();
 
     /* g_front is the buffer the LTDC is showing, so we have been drawing into
      * the other one. */
@@ -288,9 +201,12 @@ void game_run(void)
     cycle_counter_init();
     framebuffer_mpu_init();
     screen_init();
-    /* DMA2D disabled for bisection */
-    /* gfx_set_fill_hw(dma2d_fill); */
     touch_init();
+
+    /* 硬體加速填色。實作在 dma2d.c，並由 dma2d_probe.c 驗證過四種使用情境
+     * 皆零錯誤（含大量小矩形、與 CPU 交錯寫入）。 */
+    dma2d_init();
+    gfx_set_fill_hw(dma2d_fill);
 
     tetris_init(&g_game, seed_from_hardware());
     input_init(&g_input);

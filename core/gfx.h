@@ -36,7 +36,12 @@ void gfx_set_fill_hw(gfx_fill_hw_fn fn);
 
 void gfx_clear(uint16_t color);
 void gfx_pixel(int x, int y, uint16_t color);
-/* Read a pixel back; returns 0 outside the canvas. */
+/* Read a pixel back; returns 0 outside the canvas.
+ *
+ * 注意：當硬體填色啟用時，DMA2D 是繞過 D-Cache 直接寫 PSRAM 的，CPU 從這裡
+ * 讀到的可能是快取中的舊值。若真的需要讀回畫過的內容，讀之前要先呼叫
+ * SCB_InvalidateDCache_by_Addr()。目前遊戲不依賴讀回，所以沒有在這裡做
+ * （每次呼叫都失效快取會很慢）。 */
 uint16_t gfx_get_pixel(int x, int y);
 void gfx_fill_rect(int x, int y, int w, int h, uint16_t color);
 void gfx_rect(int x, int y, int w, int h, uint16_t color);
