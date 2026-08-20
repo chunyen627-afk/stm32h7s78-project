@@ -39,6 +39,21 @@
 - Python 3 + Pillow（產生字型用）
 - QEMU（選用，跑測試用）：`winget install SoftwareFreedomConservancy.QEMU`
 
+## 直接玩（不想自己編譯）
+
+`firmware/` 底下有預編譯好的燒錄檔，接上板子燒進去就能玩：
+
+```bash
+CLI="STM32_Programmer_CLI"
+EL=".../ExternalLoader/MX66UW1G45G_STM32H7S78-DK.stldr"
+
+"$CLI" -c port=SWD mode=UR -w firmware/boot_xip.hex -v              # 只需第一次
+"$CLI" -c port=SWD mode=UR -el "$EL" -w firmware/tetris_appli.hex -v
+"$CLI" -c port=SWD mode=HOTPLUG -rst
+```
+
+詳細說明見 [firmware/README.md](firmware/README.md)。
+
 ## 建置與燒錄
 
 ```bash
@@ -84,7 +99,8 @@ core/          遊戲本體（與硬體無關，可移植）
 app_src/       韌體整合層（LTDC、DMA2D、觸控初始化）
 test/          QEMU 測試
 tools/         字型產生、專案設定、畫面轉檔
-scripts/       建置、燒錄、測試腳本
+scripts/       建置、燒錄、測試、匯出腳本
+firmware/      預編譯燒錄檔
 docs/          開發筆記
 ```
 

@@ -11,12 +11,16 @@ ws/
 *.su
 *.cyclo
 *.elf
-*.bin
-*.hex
 *.map
 *.list
 Debug/
 Release/
+
+# firmware/ 底下是刻意提交的預編譯燒錄檔，不要排除
+*.bin
+*.hex
+!firmware/*.bin
+!firmware/*.hex
 
 # 測試中間檔
 test/*.elf

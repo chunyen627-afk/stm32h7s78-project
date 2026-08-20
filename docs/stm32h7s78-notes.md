@@ -407,3 +407,71 @@ qemu-system-arm -M mps2-an500 -nographic \
 
 4. **測試要先驗證它會失敗**。寫完閃爍偵測測試後，我故意把 bug 改回去確認測試
    真的會 FAIL——第一版測試其實是無效的，改回去也照樣 PASS。
+
+---
+
+## 九、SWD 除錯的連線模式（另一個專案踩過的坑）
+
+### 9.1 mode=UR 會讓核心永遠停在 reset vector
+
+**症狀**：讀 RAM marker 永遠是 0，看起來像「main() 根本沒跑」「iRoT 擋住 boot」。
+
+**原因**：`mode=UR`（Connect Under Reset）每次連線都 halt-on-reset。
+而 CLI 的每個指令是**獨立連線** —— 你 `-g` run 之後，下一個讀取指令重新連線
+又把核心 halt 回 reset 點，marker 永遠沒機會被寫。
+
+```bash
+# ❌ 跨連線讀取，每次都把核心 halt 掉
+STM32_Programmer_CLI -c port=SWD mode=UR -r32 0x24000100 1
+
+# ✅ HOTPLUG 不 halt 執行中的核心
+STM32_Programmer_CLI -c port=SWD mode=HOTPLUG -r32 0x24000100 1
+
+# ✅ 或單一連線內做完所有動作
+STM32_Programmer_CLI -c port=SWD mode=0 -hardRst -r32 0x24000100 4
+```
+
+**燒錄用 UR、觀察執行狀態用 HOTPLUG**，不要混用。
+
+> 這個坑讓另一個專案誤判成「iRoT secure boot 擋住未簽名映像」，
+> 花了整整一個 session 追不存在的問題。實際上 chainload 一直是通的。
+
+### 9.2 ST-Link VCP 是 UART4，不是 USART2
+
+從 Nucleo 等其他板子抄來的 `USART2 / PA2-PA3` 在這塊板子行不通。
+
+| | 值 |
+|---|---|
+| UART | **UART4** |
+| TX / RX | **PD1 / PD0** |
+| AF | **8** |
+| Baud | 115200 8N1 |
+
+Boot 跟 Appli **兩個 context** 都要設（hal_conf 啟用模組、hal_msp 加 MspInit、
+main.c 加 huart4 + `__io_putchar`）。
+
+### 9.3 GPIO 在 AHB4：0x58020000
+
+H7RS 系列跟傳統 H7 不同。
+
+```c
+#define GPIOD_BASE_ADDR 0x48020C00   // ❌ 無效映射 → BusFault → LOCKUP
+#define GPIOD_BASE_ADDR 0x58020C00   // ✅ AHB4PERIPH_BASE + 0x0C00
+```
+
+症狀是 CFSR=0x8200、HFSR LOCKUP。寫 raw 暫存器（不透過 HAL）時特別容易踩。
+
+### 9.4 reset 直後的時鐘是 HSI 16MHz
+
+還沒跑 `SystemClock_Config()` 之前是 **HSI 16MHz**，不是 64MHz。
+早期 raw UART print 的 BRR 要照 16MHz 算，否則會變成約 461k baud，終端機讀不到。
+
+### 9.5 AFR 的位元組位置
+
+```c
+/* pin N 的 AF 欄位在 AFR[N/8] 的 bits[(N%8)*4 +: 4] */
+GPIOD->AFR[0] = (8 << 4);    /* PD1 = AF8 */
+```
+
+寫錯位移會設到別的 pin，症狀是「UART 初始化了但沒輸出」。
+
