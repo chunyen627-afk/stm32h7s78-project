@@ -10,7 +10,7 @@ PROJ="$ROOT/cube/Projects/STM32H7S78-DK/Templates/Tetris"
 [ -d "$PROJ" ] || { echo "專案不存在，請先跑 scripts/setup.sh"; exit 1; }
 
 echo "==> 同步原始碼"
-cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/game_main.c "$PROJ/Appli/Game/"
+cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/game_main.c "$ROOT"/app_src/dma2d.c "$PROJ/Appli/Game/"
 
 echo "==> 編譯（CubeIDE headless）"
 # 注意：-data 與 -import 必須用 Windows 反斜線路徑，

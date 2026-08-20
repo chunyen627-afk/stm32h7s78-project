@@ -47,7 +47,7 @@ COMPONENTS = [
 ]
 
 GAME_SOURCES = ["tetris.c", "gfx.c", "ui.c", "input.c",
-                "font_zh.c", "game_main.c"]
+                "font_zh.c", "game_main.c", "dma2d.c"]
 
 INCLUDES = [
     f"{'../' * 7}Drivers/BSP/STM32H7S78-DK",

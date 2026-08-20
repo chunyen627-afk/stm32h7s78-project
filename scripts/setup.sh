@@ -37,7 +37,7 @@ python "$ROOT/tools/patch_project.py"
 
 echo "==> 複製遊戲原始碼"
 mkdir -p "$PROJ/Appli/Game"
-cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/game_main.c "$PROJ/Appli/Game/"
+cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/game_main.c "$ROOT"/app_src/dma2d.c "$PROJ/Appli/Game/"
 
 echo
 echo "完成。接著執行："
