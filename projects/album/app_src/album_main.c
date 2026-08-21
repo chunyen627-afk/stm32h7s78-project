@@ -770,6 +770,28 @@ static int touch_gesture(void)
 #define BAR_H       120
 #define BAR_MID     (GFX_W / 2)
 
+/* 操作列蓋住的照片區域備份在這裡，收起時原樣還原。
+ * 480 列 x 120 行 x 2 bytes = 115KB，放在資料夾索引之後的空位。 */
+#define BAR_SAVE    ((uint16_t *)0x91F00000u)
+
+/* restore=false 備份、true 還原。操作列在邏輯 y=BAR_Y..BAR_Y+BAR_H，
+ * 對應實體 framebuffer 每一列的第 BAR_Y~BAR_Y+BAR_H 行。 */
+static void bar_backup(bool restore)
+{
+    uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+
+    for (uint32_t r = 0; r < PHYS_H; r++) {
+        uint16_t *fb  = front + r * PHYS_W + BAR_Y;
+        uint16_t *sav = BAR_SAVE + r * BAR_H;
+
+        if (restore) {
+            memcpy(fb, sav, BAR_H * sizeof(uint16_t));
+        } else {
+            memcpy(sav, fb, BAR_H * sizeof(uint16_t));
+        }
+    }
+}
+
 /* 把一塊區域壓暗，做出半透明的感覺。
  *
  * RGB565 沒有 alpha 通道，所以是讀回原像素、把亮度減半再寫回去。照片內容
@@ -791,8 +813,14 @@ static void overlay_dim(int x, int y, int w, int h)
  *
  * 不能畫在 back buffer —— 那塊還沒輪到顯示，畫了看不見。present() 之後
  * gfx 指向的是 back buffer，所以要先把它切到 front，畫完再切回來。 */
+/* 四顆按鈕：上一張 | 繼續 | 下一張 | 選單。
+ * 觸控判定用四等分（各 120 寬），比按鈕本體寬，好點。 */
+#define BAR_BTN_W   105
+#define BAR_BTN_GAP 12
+
 static void draw_pause_bar(void)
 {
+    static const char *label[4] = { "上一張", "繼續", "下一張", "選單" };
     uint16_t *back  = gfx_framebuffer();
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
 
@@ -800,22 +828,37 @@ static void draw_pause_bar(void)
 
     overlay_dim(0, BAR_Y, GFX_W, BAR_H);
 
-    gfx_pill(16, BAR_Y + 24, BAR_MID - 32, BAR_H - 48, COL_ACCENT);
-    gfx_text_center(16 + (BAR_MID - 32) / 2, BAR_Y + 44, "繼續播放", COL_BG);
+    for (int i = 0; i < 4; i++) {
+        int x = BAR_BTN_GAP + i * (BAR_BTN_W + BAR_BTN_GAP);
+        bool accent = (i == 1);                 /* 「繼續」高亮 */
 
-    gfx_pill(BAR_MID + 16, BAR_Y + 24, BAR_MID - 32, BAR_H - 48, COL_PANEL);
-    gfx_text_center(BAR_MID + 16 + (BAR_MID - 32) / 2, BAR_Y + 44,
-                    "返回選單", COL_TEXT);
+        gfx_pill(x, BAR_Y + 24, BAR_BTN_W, BAR_H - 48,
+                 accent ? COL_ACCENT : COL_PANEL);
+        gfx_text_center(x + BAR_BTN_W / 2, BAR_Y + 44, label[i],
+                        accent ? COL_BG : COL_TEXT);
+    }
 
     gfx_set_framebuffer(back);
 }
 
-/* 暫停：畫面停在目前這張，直到再按一次。長按則回選單。
- * 回傳 true 表示要離開播放。 */
-static bool paused_loop(void)
+/* 暫停：畫面停在目前這張。
+ * 回傳 PAUSE_RESUME / PAUSE_MENU / PAUSE_PREV / PAUSE_NEXT。 */
+#define PAUSE_RESUME 0
+#define PAUSE_MENU   1
+#define PAUSE_PREV   2
+#define PAUSE_NEXT   3
+static int paused_loop(void)
 {
+    bool     bar_on;
+    uint32_t bar_t0;
+
     g_paused = 1u;
+
+    /* 先備份被列蓋住的區域，收起時才能原樣還原照片。 */
+    bar_backup(false);
     draw_pause_bar();
+    bar_on = true;
+    bar_t0 = HAL_GetTick();
 
     for (;;) {
         int x, y;
@@ -823,29 +866,51 @@ static bool paused_loop(void)
         watchdog_feed();
         if (!sd_present()) {
             g_paused = 0u;
-            return true;
+            return PAUSE_MENU;
         }
         if (!screen_poll()) {
             HAL_Delay(100);
             continue;
         }
 
-        /* 座標要在「確認觸碰的當下」抓，不能確認完再讀一次 ——
-         * 輕點的話那時手指已經放開，read_touch 撲空，按鈕就像沒反應。 */
+        /* 列只停留一秒就收起，讓照片乾淨地顯示；再點一下隨時喚醒。 */
+        if (bar_on && (HAL_GetTick() - bar_t0 > 1000u)) {
+            bar_backup(true);
+            bar_on = false;
+        }
+
         if (read_touch(&x, &y)) {
             int x2, y2;
-            bool in_bar, go_menu;
 
+            /* 座標在確認的當下就抓，事後再讀手指已放開會撲空。 */
             HAL_Delay(20);
-            if (read_touch(&x2, &y2)) {   /* 第二次讀到就採信，並用新座標 */
-                x = x2; y = y2;
+            if (read_touch(&x2, &y2)) {
+                x = x2;
+                y = y2;
             }
-            in_bar  = (y >= BAR_Y && y < BAR_Y + BAR_H);
-            go_menu = in_bar && (x >= BAR_MID);
-
             wait_release();
-            g_paused = 0u;
-            return go_menu;         /* 點右半＝回選單，其餘＝繼續播放 */
+
+            if (!bar_on) {
+                /* 列已收起：這一下只負責喚醒，不觸發動作。 */
+                bar_backup(false);
+                draw_pause_bar();
+                bar_on = true;
+                bar_t0 = HAL_GetTick();
+                continue;
+            }
+
+            if (y >= BAR_Y && y < BAR_Y + BAR_H) {
+                bar_backup(true);       /* 還原照片再離開 */
+                g_paused = 0u;
+                if (x < GFX_W / 4)          { return PAUSE_PREV; }
+                if (x < GFX_W / 2)          { return PAUSE_RESUME; }
+                if (x < GFX_W * 3 / 4)      { return PAUSE_NEXT; }
+                return PAUSE_MENU;
+            }
+
+            /* 點在列外：提前收起。 */
+            bar_backup(true);
+            bar_on = false;
         }
         HAL_Delay(30);
     }
@@ -857,7 +922,8 @@ static bool paused_loop(void)
  * 解碼期間前一張本來就在螢幕上，那段時間當然要算進展示時間裡，否則使用者
  * 設 2 秒會變成「解碼 1.5 秒 + 等 2 秒 = 3.5 秒」，設定值和實際對不上。
  *
- * 回傳 0 = 正常等完，1 = 要離開播放，2 = 卡片被拔掉。 */
+ * 回傳 0 = 正常等完，1 = 要離開播放，2 = 卡片被拔掉，
+ *     3 = 暫停中按了上一張，4 = 下一張。 */
 static int wait_interval(uint32_t already_ms)
 {
     uint32_t wait_ms = g_interval_s * 1000u;
@@ -888,9 +954,10 @@ static int wait_interval(uint32_t already_ms)
             return 1;               /* 長按：回選單 */
         }
         if (g == 1) {
-            if (paused_loop()) {    /* 短按：暫停，停在這張 */
-                return 1;
-            }
+            int a = paused_loop();  /* 短按：暫停，停在這張 */
+            if (a == PAUSE_MENU) { return 1; }
+            if (a == PAUSE_PREV) { return 3; }
+            if (a == PAUSE_NEXT) { return 4; }
             last = HAL_GetTick();   /* 暫停的時間不算進展示時間 */
         }
         HAL_Delay(15);
@@ -905,8 +972,8 @@ static int wait_interval(uint32_t already_ms)
  * 只要解碼比間隔快。解碼比間隔慢的話，展示時間就等於解碼時間，沒辦法更快。 */
 static void slideshow(void)
 {
-    uint32_t pos   = 0;
-    bool     shown = false;
+    uint32_t pos = 0;           /* 下一張要解碼的 g_order 索引 */
+    int32_t  cur = -1;          /* 顯示中的索引，-1 = 還沒顯示過 */
 
     /* 先確定手指已經離開「開始播放」那一下。 */
     wait_release();
@@ -931,14 +998,58 @@ static void slideshow(void)
         if (r == PHOTO_OK) {
             g_decode_ok++;
 
-            if (shown) {
+            if (cur >= 0) {
                 int w = wait_interval(g_last_ms);
-                if (w != 0) {
-                    return;             /* 觸控離開或卡片被拔掉 */
+                if (w == 1 || w == 2) {
+                    return;         /* 回選單或卡片被拔掉 */
+                }
+                if (w == 3 || w == 4) {
+                    /* 暫停中的手動瀏覽：往指定方向同步解碼並顯示，
+                     * 顯示完回到暫停狀態等下一個指令。back buffer 裡
+                     * 預解好的那張作廢，恢復播放時重解。 */
+                    int dir = (w == 3) ? -1 : 1;
+
+                    for (;;) {
+                        uint32_t target = (uint32_t)cur;
+                        uint32_t tries  = 0;
+                        photo_result_t br = PHOTO_ERR_READ;
+                        int a;
+
+                        /* 解不開就往同方向繼續找，最多繞一圈。 */
+                        while (tries < g_order_count) {
+                            watchdog_feed();
+                            target = (target + g_order_count +
+                                      (uint32_t)dir) % g_order_count;
+                            br = photo_show(PLAYLIST_BASE +
+                                            g_order[target] * PATH_MAX);
+                            tries++;
+                            if (br == PHOTO_OK) {
+                                break;
+                            }
+                            g_decode_fail++;
+                        }
+                        if (br == PHOTO_OK) {
+                            present();
+                            cur = (int32_t)target;
+                            g_decode_ok++;
+                        }
+
+                        a = paused_loop();
+                        if (a == PAUSE_MENU) {
+                            return;
+                        }
+                        if (a == PAUSE_RESUME) {
+                            break;
+                        }
+                        dir = (a == PAUSE_PREV) ? -1 : 1;
+                    }
+
+                    pos = ((uint32_t)cur + 1u) % g_order_count;
+                    continue;
                 }
             }
             present();
-            shown = true;
+            cur = (int32_t)pos;
         } else {
             /* 一張壞掉的照片不能讓相框停住，記錄之後直接換下一張。 */
             g_decode_fail++;
