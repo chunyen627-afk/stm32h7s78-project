@@ -66,6 +66,19 @@
 
 static JPEG_HandleTypeDef g_hjpeg;
 
+/* 使用者要求放棄時回傳 true。未註冊就永遠不放棄。 */
+static bool (*g_abort_fn)(void);
+
+void photo_set_abort_check(bool (*fn)(void))
+{
+    g_abort_fn = fn;
+}
+
+static bool aborted(void)
+{
+    return (g_abort_fn != NULL) && g_abort_fn();
+}
+
 /* 解碼器實際吐出的 YCbCr 位元組數。
  *
  * 不能在 HAL_JPEG_Decode() 返回後去讀 hjpeg.JpegOutCount —— HAL 在結束時會先
@@ -317,6 +330,11 @@ static void downscale(const uint8_t *src, uint32_t sw,
 
     for (uint32_t dy = 0; dy < g_dh; dy++) {
         uint32_t sy0 = soy + ((dy * sy_step) >> 16);
+
+        /* 每 32 列給一次放棄的機會，把最壞反應時間壓到幾十毫秒。 */
+        if ((dy & 31u) == 0u && aborted()) {
+            return;
+        }
         uint32_t sy1 = soy + (((dy + 1u) * sy_step) >> 16);
         uint8_t *dst = SCALED_BUF + (size_t)dy * g_dw * 3u;
 
@@ -386,6 +404,10 @@ static void sharpen_dither_rotate(void)
 
     for (uint32_t y = 0; y < g_dh; y++) {
         const uint8_t *row = SCALED_BUF + (size_t)y * stride;
+
+        if ((y & 31u) == 0u && aborted()) {
+            return;
+        }
         const uint8_t *up  = (y > 0u)          ? row - stride : row;
         const uint8_t *dn  = (y + 1u < g_dh)   ? row + stride : row;
         uint32_t phys_col  = g_oy + y;
@@ -442,6 +464,9 @@ photo_result_t photo_show(const char *path)
     size = read_whole_file(path);
     if (size == 0u) {
         return PHOTO_ERR_READ;
+    }
+    if (aborted()) {
+        return PHOTO_ABORTED;
     }
     find_sof(JPEG_FILE_BUF, size);
 
@@ -519,6 +544,10 @@ photo_result_t photo_show(const char *path)
     g_dbg_maxsy = 0; g_dbg_maxsx = 0; g_dbg_maxdst = 0;
     g_dbg_maxfb = 0; g_dbg_maxscl = 0;
 
+    if (aborted()) {
+        return PHOTO_ABORTED;
+    }
+
     plan_geometry(info.ImageWidth, info.ImageHeight,
                   &src_w, &src_h, &sox, &soy);
 
@@ -533,9 +562,13 @@ photo_result_t photo_show(const char *path)
     downscale(RGB_BUF, info.ImageWidth, src_w, src_h, sox, soy);
     g_dbg_ms_scale = HAL_GetTick() - t0;
 
+    if (aborted()) {
+        return PHOTO_ABORTED;
+    }
+
     t0 = HAL_GetTick();
     sharpen_dither_rotate();
     g_dbg_ms_out = HAL_GetTick() - t0;
 
-    return PHOTO_OK;
+    return aborted() ? PHOTO_ABORTED : PHOTO_OK;
 }

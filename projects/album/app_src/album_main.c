@@ -85,7 +85,14 @@ volatile uint32_t g_last_ms;
 volatile uint32_t g_exit_touch;   /* 因觸控離開播放的次數 */
 volatile uint32_t g_skipped_long; /* 路徑太長被跳過的照片數 */
 volatile uint32_t g_skipped_full; /* 清單滿了之後被跳過的照片數 */
-volatile uint32_t g_paused;       /* 1 = 播放暫停中（畫面凍結）*/
+volatile uint32_t g_paused;
+/* 手感問題的診斷計數 */
+volatile uint32_t g_dbg_btn_edge;    /* 按鍵中斷進來幾次 */
+volatile uint32_t g_dbg_btn_short;   /* 判定為短按 */
+volatile uint32_t g_dbg_btn_long;    /* 判定為長按 */
+volatile uint32_t g_dbg_touch_hit;   /* 暫停中 read_touch 讀到觸碰幾次 */
+volatile int32_t  g_dbg_swipe_dx;    /* 最後一次滑動的位移 */
+volatile int32_t  g_dbg_swipe_dy;       /* 1 = 播放暫停中（畫面凍結）*/
 
 /* ------------------------------------------------------------------ */
 /* 基礎設施                                                            */
@@ -157,6 +164,28 @@ static void present(void)
     gfx_set_framebuffer((uint16_t *)(g_front ? FB0_ADDR : FB1_ADDR));
 }
 
+/* 睡到下一個中斷才醒，用來取代輪詢迴圈裡的 HAL_Delay()。
+ *
+ * HAL_Delay() 是忙等 —— 核心全速空轉一直讀 uwTick，600MHz 的 M7 這樣燒電
+ * 很不划算。相簿大部分時間都在等（每張顯示 2~5 秒、解碼只佔 1.5 秒），
+ * 所以這裡是最值得省的地方。
+ *
+ * __WFI() 讓核心停住，直到有中斷才繼續。SysTick 每 1ms 一次，所以每毫秒
+ * 醒一下、其餘時間都在睡，等待的精度不變但核心幾乎不耗電。
+ *
+ * 注意：中斷必須是開著的，否則會永遠睡下去。這裡是主迴圈，沒有關中斷的
+ * 情況；如果哪天在臨界區裡呼叫就會卡死。 */
+static void nap(uint32_t ms)
+{
+    /* 見 album_run() 裡的 HAL_DBGMCU_EnableDBGSleepMode()：沒開的話，
+     * 核心一睡 SWD 就整個連不上（Unable to read device id from ROM table）。 */
+    uint32_t t0 = HAL_GetTick();
+
+    while ((HAL_GetTick() - t0) < ms) {
+        __WFI();
+    }
+}
+
 static void rnd_mix(uint32_t v);      /* 定義在下面的亂數區塊 */
 static void watchdog_feed(void);      /* 定義在下面的記憶卡狀態區塊 */
 static bool sd_present(void);
@@ -201,24 +230,11 @@ static void wait_release(void)
         } else {
             clean++;
         }
-        HAL_Delay(25);
+        nap(25);
     }
-    HAL_Delay(120);
+    nap(120);
 }
 
-/* 偵測一次「確實的」觸碰：要連續讀到才算，避免雜訊誤觸發。 */
-static bool touch_confirmed(void)
-{
-    int x, y;
-
-    if (!read_touch(&x, &y)) {
-        return false;
-    }
-    /* 原本要連續 4 次讀到才算數，短按很容易在中間被漏掉，變成「點不到」。
-     * 兩次已經足以濾掉雜訊，反應也快得多。 */
-    HAL_Delay(20);
-    return read_touch(&x, &y);
-}
 
 static uint32_t rnd_state = 0x2545F491u;
 
@@ -293,85 +309,165 @@ static bool sd_present(void)
 /* USER 按鈕：螢幕開關                                                 */
 /* ------------------------------------------------------------------ */
 
-static int32_t g_btn_idle;      /* 開機時的電位，當成「沒按」的基準 */
-static int32_t g_btn_last;
-static bool    g_screen_on = true;
+/* 亮度分檔。人眼對亮度的感知接近對數，線性分檔（100/75/50/25）看起來
+ * 差別很小 —— 25% 佔空比看起來大約還有一半亮。所以改成感知上等距的級距。 */
+static void brightness_set(uint32_t pct);   /* 定義在下面，中斷會直接呼叫 */
 
-/* 不假設按鈕是高電位還是低電位觸發，開機時量到什麼就當成放開的狀態，
- * 之後偏離這個值就是按下。這樣換板子或改接線都不用回來改程式。 */
+static const uint8_t BRIGHT_STEP[] = { 100u, 50u, 20u, 6u, 0u };
+#define BRIGHT_STEPS  (sizeof(BRIGHT_STEP) / sizeof(BRIGHT_STEP[0]))
+
+static uint32_t         g_bright_idx;      /* 指向 BRIGHT_STEP */
+static uint32_t         g_brightness = 100u;
+static bool             g_screen_on  = true;
+
+/* 觸控維持輪詢，不要用 BSP_TS_EnableIT()。
+ *
+ * 踩過的雷：啟用觸控中斷之後，ISR 只清了 EXTI 的旗標，沒有去讀 GT911 的
+ * 狀態暫存器。控制器的資料沒被取走就不再回報新的觸碰，於是
+ * BSP_TS_GetState() 之後永遠回傳「沒碰到」—— 症狀是觸控整個失效。
+ *
+ * 要正確使用中斷，回呼裡必須把資料讀走（等於還是要做一次 I2C 交易），
+ * 省不到什麼。而且現在的控制是按鍵負責、觸控只在暫停時判滑動，輪詢完全
+ * 夠用。 */
+
+
+
+/* USER 鍵三段手勢，全部在中斷裡判斷：
+ *
+ *   短按 (<600ms)    切換背光亮度（立刻套用）
+ *   長按 (>=600ms)   暫停 / 繼續播放
+ *
+ * 沒有「更長按」這一段：使用者反映很容易不小心按過頭，本來只想暫停卻跳回
+ * 選單。回選單改由暫停中往下滑提供 —— 用時間長度區分三段操作，對手指來說
+ * 太難拿捏。
+ *
+ * BSP 預設是 GPIO_MODE_IT_FALLING（下拉、按下為高），中斷只在放開時觸發，
+ * 量不出按了多久。這裡改成雙邊緣，在中斷裡讀腳位判斷是按下還是放開：
+ * 按下記時間、放開算長度再分派。
+ *
+ * 亮度直接在中斷裡套用（只寫 GPIO 與 LPTIM 暫存器，很快）；暫停與回選單
+ * 要主迴圈配合，所以立旗標，並由 photo_show() 的中斷檢查即時放棄解碼 ——
+ * 否則按下去要等解碼那 1.5 秒跑完才有反應。 */
+#define PRESS_LONG_MS   600u
+
+static volatile uint8_t  g_req_pause;
+static volatile uint32_t g_press_t0;
+static volatile uint8_t  g_pressing;
+
+void EXTI13_IRQHandler(void)
+{
+    BSP_PB_IRQHandler(BUTTON_USER);
+}
+
+void BSP_PB_Callback(Button_TypeDef Button)
+{
+    uint32_t now = HAL_GetTick();
+    uint32_t held;
+
+    if (Button != BUTTON_USER) {
+        return;
+    }
+    g_dbg_btn_edge++;
+
+    if (HAL_GPIO_ReadPin(BUTTON_USER_GPIO_PORT, BUTTON_USER_PIN)
+        == GPIO_PIN_SET) {
+        if (!g_pressing) {
+            g_pressing = 1u;
+            g_press_t0 = now;
+        }
+        return;
+    }
+
+    if (!g_pressing) {
+        return;                     /* 沒配對到的放開，忽略 */
+    }
+    g_pressing = 0u;
+
+    held = now - g_press_t0;
+    if (held < 30u) {
+        return;                     /* 太短，是彈跳 */
+    }
+    if (held >= PRESS_LONG_MS) {
+        g_dbg_btn_long++;
+        g_req_pause = 1u;
+    } else {
+        g_dbg_btn_short++;
+        g_bright_idx = (g_bright_idx + 1u) % BRIGHT_STEPS;
+        brightness_set(BRIGHT_STEP[g_bright_idx]);
+    }
+}
+
+/* 給 photo.c：有待處理的按鍵指令就別把這張解完了。 */
+static bool ctrl_waiting(void)
+{
+    return (g_req_pause != 0u);
+}
+
 static void button_init(void)
 {
-    (void)BSP_PB_Init(BUTTON_USER, BUTTON_MODE_GPIO);
-    g_btn_idle = BSP_PB_GetState(BUTTON_USER);
-    g_btn_last = g_btn_idle;
+    GPIO_InitTypeDef btn = {0};
+
+    LCD_BL_CTRL_GPIO_CLK_ENABLE();      /* brightness_set 從中斷呼叫，不碰 RCC */
+    (void)BSP_PB_Init(BUTTON_USER, BUTTON_MODE_EXTI);
+
+    /* BSP 只設下降邊緣（放開才觸發），量不出按了多久。改成雙邊緣。 */
+    BUTTON_USER_GPIO_CLK_ENABLE();
+    btn.Pin   = BUTTON_USER_PIN;
+    btn.Mode  = GPIO_MODE_IT_RISING_FALLING;
+    btn.Pull  = GPIO_PULLDOWN;
+    btn.Speed = GPIO_SPEED_FREQ_HIGH;
+    HAL_GPIO_Init(BUTTON_USER_GPIO_PORT, &btn);
 }
 
-/* 偵測一次「按下」的邊緣。要連續兩次讀到同一個值才採信，濾掉接點彈跳。 */
-static bool button_pressed(void)
-{
-    int32_t now = BSP_PB_GetState(BUTTON_USER);
-    bool    edge;
-
-    if (now != g_btn_last) {
-        HAL_Delay(15);
-        if (BSP_PB_GetState(BUTTON_USER) != now) {
-            return false;               /* 彈跳，不算 */
-        }
-    }
-    edge = (now != g_btn_idle) && (g_btn_last == g_btn_idle);
-    g_btn_last = now;
-    return edge;
-}
-
-/* 關螢幕時連播放一起暫停。
+/* 設定背光亮度（0~100）。0 等同關螢幕，播放也會一起暫停。
  *
- * 「螢幕關掉但背景繼續解碼」在這個專案裡沒有任何好處：順序是隨機的，使用者
- * 分不出「現在這張」和「暫停那張」的差別，卻要付出每 2~5 秒一次全速解碼的
- * 電力、以及整晚無意義的記憶卡讀取。背景運算要有價值，前提是背景有別的東西
- * 在跑（時鐘、網路同步之類），目前沒有。 */
-static void screen_set(bool on)
+ * 全程只呼叫 BSP_LCD_SetBrightness()，「不碰」BSP_LCD_DisplayOn/Off ——
+ * 那兩支是 ST 的不對稱陷阱：DisplayOff 會把背光腳（GPIOG15）從 LPTIM 的
+ * PWM 替代功能改成一般 GPIO 並拉低，DisplayOn 卻完全不碰它。結果是
+ * 「關得掉、開不回來」，而且腳位一旦離開 AF 模式，亮度調節就整個失效。
+ *
+ * SetBrightness 只改 LPTIM 的比較值（佔空比），那支腳從頭到尾維持 AF，
+ * 所以 0% 就是 PWM 歸零＝背光全滅，100% 就是全亮，中間任意檔位都可用。 */
+static void brightness_set(uint32_t pct)
 {
-    if (on == g_screen_on) {
-        return;
-    }
-    g_screen_on = on;
+    GPIO_InitTypeDef bl = {0};
 
-    if (!on) {
-        (void)BSP_LCD_DisplayOff(0);
-        return;
-    }
+    g_brightness = pct;
+    g_screen_on  = (pct > 0u);
 
-    (void)BSP_LCD_DisplayOn(0);
+    /* 這支函式會從中斷裡被呼叫，所以不碰 RCC —— 時脈在 button_init() 開好。
+     * 剩下的只有 GPIO 與 LPTIM 的暫存器寫入，沒有其他人同時在動這兩個周邊。 */
+    bl.Pull  = GPIO_NOPULL;
+    bl.Speed = GPIO_SPEED_FREQ_MEDIUM;
+    bl.Pin   = LCD_BL_CTRL_PIN;
 
-    /* BSP 的 DisplayOn 不會把背光打開，這是 ST 兩邊不對稱的地方：
-     *
-     *   DisplayOff  把背光腳（GPIOG15）從 LPTIM 的 PWM 替代功能改成一般
-     *               輸出，而 ODR 是 0，等於把背光關掉
-     *   DisplayOn   只做 __HAL_LTDC_ENABLE 和拉高 LCD_DISP_EN，
-     *               完全沒碰背光腳
-     *
-     * 結果就是「關得掉、開不回來」：LTDC 恢復了、面板也 enable 了，就是沒有
-     * 背光。這裡直接把那支腳拉高（全亮）。本專案不用亮度調節，所以維持一般
-     * 輸出即可，不必還原成 PWM。 */
-    {
-        GPIO_InitTypeDef bl = {0};
-
-        LCD_BL_CTRL_GPIO_CLK_ENABLE();
-        bl.Mode  = GPIO_MODE_OUTPUT_PP;
-        bl.Pull  = GPIO_NOPULL;
-        bl.Speed = GPIO_SPEED_FREQ_MEDIUM;
-        bl.Pin   = LCD_BL_CTRL_PIN;
+    if (pct == 0u) {
+        /* BSP 的亮度公式在 0 會整數下溢：
+         *     Pulse = (10001 * 0 / 100) - 1 = 0 - 1 -> 0xFFFFFFFF
+         * 比較值變成天文數字，PWM 永遠不翻轉，背光根本關不掉。
+         * 所以 0% 不走 PWM，直接把腳位切成一般輸出並拉低。 */
+        bl.Mode = GPIO_MODE_OUTPUT_PP;
         HAL_GPIO_Init(LCD_BL_CTRL_GPIO_PORT, &bl);
-        HAL_GPIO_WritePin(LCD_BL_CTRL_GPIO_PORT, LCD_BL_CTRL_PIN, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(LCD_BL_CTRL_GPIO_PORT, LCD_BL_CTRL_PIN,
+                          GPIO_PIN_RESET);
+        return;
     }
+
+    /* 從 0% 回來時腳位還停在一般輸出，要先還原成 LPTIM 的替代功能，
+     * 否則 SetBrightness 改了比較值也沒有用（腳位不歸 LPTIM 管）。 */
+    bl.Mode      = GPIO_MODE_AF_PP;
+    bl.Alternate = LCD_LPTIMx_CHANNEL_AF;
+    HAL_GPIO_Init(LCD_BL_CTRL_GPIO_PORT, &bl);
+
+    (void)BSP_LCD_SetBrightness(0, pct);
 }
 
-/* 放在每個迴圈裡。回傳 true 代表螢幕是亮的（可以接受觸控）。 */
+/* 放在每個迴圈裡。回傳 true 代表螢幕是亮的（可以接受觸控）。
+ * USER 鍵每按一次降一檔，到 0 之後回到 100。 */
+/* 亮度已經在中斷裡套用了，這裡只回報「螢幕是不是亮的」，
+ * 決定要不要繼續解碼與接受觸控。 */
 static bool screen_poll(void)
 {
-    if (button_pressed()) {
-        screen_set(!g_screen_on);
-    }
     return g_screen_on;
 }
 
@@ -650,12 +746,12 @@ static bool select_screen(void)
         }
         if (!screen_poll()) {
             /* 螢幕關著時不吃觸控，否則會在看不見的情況下改到設定。 */
-            HAL_Delay(30);
+            nap(30);
             continue;
         }
 
         if (!read_touch(&x, &y)) {
-            HAL_Delay(15);
+            nap(15);
             continue;
         }
 
@@ -733,7 +829,7 @@ static bool wait_screen_on(void)
         if (!sd_present()) {
             return false;
         }
-        HAL_Delay(100);
+        nap(100);
     }
     return true;
 }
@@ -742,179 +838,174 @@ static bool wait_screen_on(void)
  *
  * 短按暫停／繼續、長按回選單。原本短按就直接離開，結果想停下來看某一張時
  * 只能被踢回選單，反而看不到。 */
-#define LONG_PRESS_MS   700u
 
-static int touch_gesture(void)
-{
-    uint32_t t0;
-    int x, y;
 
-    if (!touch_confirmed()) {
-        return 0;
-    }
-    t0 = HAL_GetTick();
-    while (read_touch(&x, &y)) {
-        watchdog_feed();
-        if (HAL_GetTick() - t0 >= LONG_PRESS_MS) {
-            wait_release();
-            return 2;               /* 長按：回選單 */
-        }
-        HAL_Delay(20);
-    }
-    wait_release();
-    return 1;                       /* 短按：暫停／繼續 */
-}
+/* 暫停 / 繼續的視覺回饋。
+ *
+ * 按鍵操作沒有觸覺以外的回饋，使用者按下去看畫面沒變會不確定有沒有成功。
+ * 在畫面中央閃一個圖示一秒再還原 —— 蓋住的區域先備份，還原後照片完整。 */
+#define ICON_SZ     140
+#define ICON_X      ((GFX_W - ICON_SZ) / 2)
+#define ICON_Y      ((GFX_H - ICON_SZ) / 2)
+#define ICON_SAVE   ((uint16_t *)0x91F00000u)   /* 140x140x2 = 39KB */
 
-/* 暫停時的操作列版面（直立座標）。 */
-#define BAR_Y       660
-#define BAR_H       120
-#define BAR_MID     (GFX_W / 2)
-
-/* 操作列蓋住的照片區域備份在這裡，收起時原樣還原。
- * 480 列 x 120 行 x 2 bytes = 115KB，放在資料夾索引之後的空位。 */
-#define BAR_SAVE    ((uint16_t *)0x91F00000u)
-
-/* restore=false 備份、true 還原。操作列在邏輯 y=BAR_Y..BAR_Y+BAR_H，
- * 對應實體 framebuffer 每一列的第 BAR_Y~BAR_Y+BAR_H 行。 */
-static void bar_backup(bool restore)
+static void icon_backup(bool restore)
 {
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
 
-    for (uint32_t r = 0; r < PHYS_H; r++) {
-        uint16_t *fb  = front + r * PHYS_W + BAR_Y;
-        uint16_t *sav = BAR_SAVE + r * BAR_H;
+    /* 邏輯 (x,y) -> 實體 (GFX_W-1-x) 列、y 行。逐邏輯列搬。 */
+    for (uint32_t i = 0; i < ICON_SZ; i++) {
+        uint32_t r   = (uint32_t)(GFX_W - 1 - (ICON_X + i));
+        uint16_t *fb = front + r * PHYS_W + ICON_Y;
+        uint16_t *sv = ICON_SAVE + i * ICON_SZ;
 
         if (restore) {
-            memcpy(fb, sav, BAR_H * sizeof(uint16_t));
+            memcpy(fb, sv, ICON_SZ * sizeof(uint16_t));
         } else {
-            memcpy(sav, fb, BAR_H * sizeof(uint16_t));
+            memcpy(sv, fb, ICON_SZ * sizeof(uint16_t));
         }
     }
 }
 
-/* 把一塊區域壓暗，做出半透明的感覺。
- *
- * RGB565 沒有 alpha 通道，所以是讀回原像素、把亮度減半再寫回去。照片內容
- * 還看得見，但按鈕的字浮得出來。 */
-static void overlay_dim(int x, int y, int w, int h)
+static void flash_icon(bool paused)
 {
-    for (int j = 0; j < h; j++) {
-        for (int i = 0; i < w; i++) {
-            uint16_t v = gfx_get_pixel(x + i, y + j);
-            uint16_t r = (uint16_t)((v >> 11) & 0x1Fu) >> 1;
-            uint16_t g = (uint16_t)((v >> 5) & 0x3Fu) >> 1;
-            uint16_t b = (uint16_t)(v & 0x1Fu) >> 1;
-            gfx_pixel(x + i, y + j, (uint16_t)((r << 11) | (g << 5) | b));
-        }
-    }
-}
-
-/* 在「正在顯示」的那塊 buffer 上直接畫操作列。
- *
- * 不能畫在 back buffer —— 那塊還沒輪到顯示，畫了看不見。present() 之後
- * gfx 指向的是 back buffer，所以要先把它切到 front，畫完再切回來。 */
-/* 四顆按鈕：上一張 | 繼續 | 下一張 | 選單。
- * 觸控判定用四等分（各 120 寬），比按鈕本體寬，好點。 */
-#define BAR_BTN_W   105
-#define BAR_BTN_GAP 12
-
-static void draw_pause_bar(void)
-{
-    static const char *label[4] = { "上一張", "繼續", "下一張", "選單" };
     uint16_t *back  = gfx_framebuffer();
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    int cx = GFX_W / 2;
+    int cy = GFX_H / 2;
 
+    icon_backup(false);
     gfx_set_framebuffer(front);
 
-    overlay_dim(0, BAR_Y, GFX_W, BAR_H);
+    /* 半透明底：把區域壓暗，圖示才浮得出來。 */
+    for (int j = 0; j < ICON_SZ; j++) {
+        for (int i = 0; i < ICON_SZ; i++) {
+            uint16_t v = gfx_get_pixel(ICON_X + i, ICON_Y + j);
+            gfx_pixel(ICON_X + i, ICON_Y + j,
+                      (uint16_t)((((v >> 11) & 0x1Fu) >> 1) << 11 |
+                                 (((v >> 5) & 0x3Fu) >> 1) << 5 |
+                                 ((v & 0x1Fu) >> 1)));
+        }
+    }
 
-    for (int i = 0; i < 4; i++) {
-        int x = BAR_BTN_GAP + i * (BAR_BTN_W + BAR_BTN_GAP);
-        bool accent = (i == 1);                 /* 「繼續」高亮 */
-
-        gfx_pill(x, BAR_Y + 24, BAR_BTN_W, BAR_H - 48,
-                 accent ? COL_ACCENT : COL_PANEL);
-        gfx_text_center(x + BAR_BTN_W / 2, BAR_Y + 44, label[i],
-                        accent ? COL_BG : COL_TEXT);
+    if (paused) {
+        gfx_fill_rect(cx - 30, cy - 36, 20, 72, COL_TEXT);   /* ▮▮ */
+        gfx_fill_rect(cx + 10, cy - 36, 20, 72, COL_TEXT);
+    } else {
+        /* ▶：逐列畫，寬度隨高度線性收斂 */
+        for (int j = 0; j < 72; j++) {
+            int half = (j < 36) ? j : (71 - j);
+            gfx_fill_rect(cx - 24, cy - 36 + j, 12 + half, 1, COL_TEXT);
+        }
     }
 
     gfx_set_framebuffer(back);
+    nap(1000);
+    icon_backup(true);
 }
 
-/* 暫停：畫面停在目前這張。
- * 回傳 PAUSE_RESUME / PAUSE_MENU / PAUSE_PREV / PAUSE_NEXT。 */
+/* 暫停中的滑動判定。
+ * 邏輯座標：x 是橫向（0~479），y 是縱向（0~799，往下遞增）。
+ * 縱向門檻設得比橫向大，因為畫面高是寬的 1.67 倍，手滑起來也比較長。 */
+#define SWIPE_MIN_X  60
+#define SWIPE_MIN_Y  120
+#define SWIPE_GAP_MS 150u   /* 容忍觸控中途漏報多久 */
+
+/* 暫停：畫面停在目前這張。按鍵控制暫停/選單，滑動翻頁。 */
 #define PAUSE_RESUME 0
 #define PAUSE_MENU   1
 #define PAUSE_PREV   2
 #define PAUSE_NEXT   3
+
 static int paused_loop(void)
 {
-    bool     bar_on;
-    uint32_t bar_t0;
-
-    g_paused = 1u;
-
-    /* 先備份被列蓋住的區域，收起時才能原樣還原照片。 */
-    bar_backup(false);
-    draw_pause_bar();
-    bar_on = true;
-    bar_t0 = HAL_GetTick();
+    g_paused    = 1u;
+    g_req_pause = 0u;               /* 消化掉進來的那一次 */
+    flash_icon(true);
 
     for (;;) {
-        int x, y;
+        int x0, y0;
 
         watchdog_feed();
         if (!sd_present()) {
-            g_paused = 0u;
+            g_req_pause = 0u;
+            g_paused    = 0u;
             return PAUSE_MENU;
         }
-        if (!screen_poll()) {
-            HAL_Delay(100);
-            continue;
+        if (g_req_pause) {
+            g_req_pause = 0u;
+            g_paused    = 0u;
+            flash_icon(false);
+            return PAUSE_RESUME;
         }
 
-        /* 列只停留一秒就收起，讓照片乾淨地顯示；再點一下隨時喚醒。 */
-        if (bar_on && (HAL_GetTick() - bar_t0 > 1000u)) {
-            bar_backup(true);
-            bar_on = false;
+        /* 暫停中用滑動操作。
+         *
+         * 這塊板子只有一顆 USER 鍵，三段手勢已經吃掉亮度/暫停/選單，再塞
+         * 翻頁只會變成沒人記得住的組合技。滑動是相簿的通用手勢，判定區是
+         * 整個螢幕 —— 比先前那排小按鈕好按得多。
+         *
+         *   往左滑  下一張      往右滑  上一張      往下滑  回選單
+         *
+         * 取「位移較大的那個軸」判斷方向，避免斜著滑時兩種動作互搶。 */
+        if (read_touch(&x0, &y0)) {
+            int      x, y, dx = 0, dy = 0;
+            uint32_t t0   = HAL_GetTick();
+            uint32_t seen = t0;
+
+            g_dbg_touch_hit++;
+
+            /* 取「整段過程中的最大位移」，而不是放開瞬間的位置。
+             *
+             * 而且要容忍中途漏報：觸控控制器在手指快速移動時會掉幾筆，
+             * 一讀不到就結束的話，位移只算到中斷點為止 —— 橫向滑動通常
+             * 比較快，所以特別容易被截斷（實測往下滑慢而長就沒事）。 */
+            for (;;) {
+                uint32_t now = HAL_GetTick();
+
+                watchdog_feed();
+                if (read_touch(&x, &y)) {
+                    int cx = x - x0;
+                    int cy = y - y0;
+
+                    seen = now;
+                    if (((cx < 0) ? -cx : cx) > ((dx < 0) ? -dx : dx)) {
+                        dx = cx;
+                    }
+                    if (((cy < 0) ? -cy : cy) > ((dy < 0) ? -dy : dy)) {
+                        dy = cy;
+                    }
+                } else if (now - seen > SWIPE_GAP_MS) {
+                    break;              /* 真的放開了 */
+                }
+                if (now - t0 > 2000u) {
+                    break;              /* 按著不放就不算滑動 */
+                }
+                nap(10);
+            }
+
+            g_dbg_swipe_dx = dx;
+            g_dbg_swipe_dy = dy;
+
+            /* 取位移較大的那個軸，避免斜著滑時兩種動作互搶。 */
+            {
+                int ax = (dx < 0) ? -dx : dx;
+                int ay = (dy < 0) ? -dy : dy;
+
+                if (ay >= SWIPE_MIN_Y && ay > ax && dy > 0) {
+                    g_paused = 0u;
+                    return PAUSE_MENU;      /* 往下滑：回選單 */
+                }
+                if (ax >= SWIPE_MIN_X && ax > ay) {
+                    g_paused = 0u;
+                    return (dx < 0) ? PAUSE_NEXT : PAUSE_PREV;
+                }
+            }
         }
-
-        if (read_touch(&x, &y)) {
-            int x2, y2;
-
-            /* 座標在確認的當下就抓，事後再讀手指已放開會撲空。 */
-            HAL_Delay(20);
-            if (read_touch(&x2, &y2)) {
-                x = x2;
-                y = y2;
-            }
-            wait_release();
-
-            if (!bar_on) {
-                /* 列已收起：這一下只負責喚醒，不觸發動作。 */
-                bar_backup(false);
-                draw_pause_bar();
-                bar_on = true;
-                bar_t0 = HAL_GetTick();
-                continue;
-            }
-
-            if (y >= BAR_Y && y < BAR_Y + BAR_H) {
-                bar_backup(true);       /* 還原照片再離開 */
-                g_paused = 0u;
-                if (x < GFX_W / 4)          { return PAUSE_PREV; }
-                if (x < GFX_W / 2)          { return PAUSE_RESUME; }
-                if (x < GFX_W * 3 / 4)      { return PAUSE_NEXT; }
-                return PAUSE_MENU;
-            }
-
-            /* 點在列外：提前收起。 */
-            bar_backup(true);
-            bar_on = false;
-        }
-        HAL_Delay(30);
+        nap(30);
     }
 }
+
 
 /* 等目前這張照片的展示時間走完。
  *
@@ -932,14 +1023,14 @@ static int wait_interval(uint32_t already_ms)
 
     while (waited < wait_ms) {
         uint32_t now;
-        int g;
 
         watchdog_feed();
         if (!sd_present()) {
             return 2;
         }
         if (!screen_poll()) {
-            HAL_Delay(100);
+            /* 亮度 0（螢幕關著）：不累計時間，再點亮時這張還有完整時間。 */
+            nap(100);
             last = HAL_GetTick();
             continue;
         }
@@ -948,21 +1039,62 @@ static int wait_interval(uint32_t already_ms)
         waited += now - last;
         last = now;
 
-        g = touch_gesture();
-        if (g == 2) {
-            g_exit_touch++;
-            return 1;               /* 長按：回選單 */
+        if (g_req_pause) {
+            return 3;               /* 交給 slideshow 統一處理暫停 */
         }
-        if (g == 1) {
-            int a = paused_loop();  /* 短按：暫停，停在這張 */
-            if (a == PAUSE_MENU) { return 1; }
-            if (a == PAUSE_PREV) { return 3; }
-            if (a == PAUSE_NEXT) { return 4; }
-            last = HAL_GetTick();   /* 暫停的時間不算進展示時間 */
-        }
-        HAL_Delay(15);
+        nap(15);
     }
     return 0;
+}
+
+/* 暫停期間的互動，含翻頁。
+ *
+ * 翻頁之後要「留在暫停」，所以這裡是個迴圈：paused_loop() 回報翻頁就解碼
+ * 並顯示，然後再進 paused_loop() 等下一個指令，直到使用者要繼續或回選單。
+ *
+ * 先前這段邏輯散在 wait_interval 和 slideshow 兩處，而 wait_interval 只判斷
+ * 「是不是回選單」，翻頁的回傳值被當成沒事發生 —— 症狀就是滑動翻了頁卻
+ * 立刻自動繼續播放。集中在一個地方就不會再漏。
+ *
+ * *cur 進來是目前顯示的索引，出去是最後顯示的那張。
+ * 回傳 0 = 繼續播放，1 = 回選單。 */
+static int pause_session(int32_t *cur)
+{
+    for (;;) {
+        int a = paused_loop();
+        int dir;
+        uint32_t target, tries;
+        photo_result_t r;
+
+        if (a == PAUSE_MENU) {
+            return 1;
+        }
+        if (a == PAUSE_RESUME) {
+            return 0;
+        }
+
+        /* 翻頁：往指定方向找一張解得開的，最多繞一圈。 */
+        dir    = (a == PAUSE_PREV) ? -1 : 1;
+        target = (uint32_t)((*cur < 0) ? 0 : *cur);
+        tries  = 0;
+        r      = PHOTO_ERR_READ;
+
+        while (tries < g_order_count) {
+            watchdog_feed();
+            target = (target + g_order_count + (uint32_t)dir) % g_order_count;
+            r = photo_show(PLAYLIST_BASE + g_order[target] * PATH_MAX);
+            tries++;
+            if (r == PHOTO_OK || r == PHOTO_ABORTED) {
+                break;
+            }
+            g_decode_fail++;
+        }
+        if (r == PHOTO_OK) {
+            present();
+            *cur = (int32_t)target;
+            g_decode_ok++;
+        }
+    }
 }
 
 /* 播放。
@@ -975,7 +1107,6 @@ static void slideshow(void)
     uint32_t pos = 0;           /* 下一張要解碼的 g_order 索引 */
     int32_t  cur = -1;          /* 顯示中的索引，-1 = 還沒顯示過 */
 
-    /* 先確定手指已經離開「開始播放」那一下。 */
     wait_release();
 
     for (;;) {
@@ -990,61 +1121,37 @@ static void slideshow(void)
         /* 解下一張：畫進 back buffer，此時前一張還在螢幕上。 */
         t0 = HAL_GetTick();
         r = photo_show(PLAYLIST_BASE + g_order[pos] * PATH_MAX);
-        if (r != PHOTO_OK) {
+        if (r != PHOTO_OK && r != PHOTO_ABORTED) {
             r = photo_show(PLAYLIST_BASE + g_order[pos] * PATH_MAX);
         }
         g_last_ms = HAL_GetTick() - t0;
+
+        if (r == PHOTO_ABORTED) {
+            /* 解碼途中按了暫停：這張不要了，停在螢幕上那張。
+             * 半畫好的 back buffer 沒有 present，看不到。 */
+            if (pause_session(&cur)) {
+                return;
+            }
+            pos = (uint32_t)((cur < 0) ? 0 : (cur + 1)) % g_order_count;
+            continue;
+        }
 
         if (r == PHOTO_OK) {
             g_decode_ok++;
 
             if (cur >= 0) {
                 int w = wait_interval(g_last_ms);
+
                 if (w == 1 || w == 2) {
-                    return;         /* 回選單或卡片被拔掉 */
+                    return;             /* 回選單或卡片被拔掉 */
                 }
-                if (w == 3 || w == 4) {
-                    /* 暫停中的手動瀏覽：往指定方向同步解碼並顯示，
-                     * 顯示完回到暫停狀態等下一個指令。back buffer 裡
-                     * 預解好的那張作廢，恢復播放時重解。 */
-                    int dir = (w == 3) ? -1 : 1;
-
-                    for (;;) {
-                        uint32_t target = (uint32_t)cur;
-                        uint32_t tries  = 0;
-                        photo_result_t br = PHOTO_ERR_READ;
-                        int a;
-
-                        /* 解不開就往同方向繼續找，最多繞一圈。 */
-                        while (tries < g_order_count) {
-                            watchdog_feed();
-                            target = (target + g_order_count +
-                                      (uint32_t)dir) % g_order_count;
-                            br = photo_show(PLAYLIST_BASE +
-                                            g_order[target] * PATH_MAX);
-                            tries++;
-                            if (br == PHOTO_OK) {
-                                break;
-                            }
-                            g_decode_fail++;
-                        }
-                        if (br == PHOTO_OK) {
-                            present();
-                            cur = (int32_t)target;
-                            g_decode_ok++;
-                        }
-
-                        a = paused_loop();
-                        if (a == PAUSE_MENU) {
-                            return;
-                        }
-                        if (a == PAUSE_RESUME) {
-                            break;
-                        }
-                        dir = (a == PAUSE_PREV) ? -1 : 1;
+                if (w == 3) {
+                    if (pause_session(&cur)) {
+                        return;
                     }
-
-                    pos = ((uint32_t)cur + 1u) % g_order_count;
+                    /* 暫停期間可能翻過頁，接著要播的是目前這張的下一張。
+                     * back buffer 裡預解的那張作廢，重新解。 */
+                    pos = (uint32_t)(cur + 1) % g_order_count;
                     continue;
                 }
             }
@@ -1113,13 +1220,13 @@ static void wait_for_card(void)
     show_message("請插入記憶卡", "插入後會自動重新掃描");
     while (!sd_present()) {
         watchdog_feed();
-        HAL_Delay(100);
+        nap(100);
     }
 
     /* 插入的瞬間接點會彈跳，等它穩定再動卡片，否則初始化容易失敗。 */
     for (int i = 0; i < 10; i++) {
         watchdog_feed();
-        HAL_Delay(100);
+        nap(100);
     }
     show_message("讀取記憶卡", "載入中");
 }
@@ -1131,6 +1238,17 @@ void album_run(void)
     bool wdt_reset;
 
     g_stage = 1;
+
+    /* 睡眠時保持除錯連線。
+     *
+     * nap() 用 __WFI() 讓核心睡到下一次中斷，省電效果好，但代價是核心一睡
+     * 除錯介面的時脈就被關掉 —— SWD 會直接失聯，報
+     * "Unable to read device id from ROM table"，連讀個變數都做不到。
+     * （還救得回來：mode=UR 是連線時按住重置，核心來不及睡。）
+     *
+     * 這一位元讓睡眠時的除錯時脈保持開啟。代價是省電效果打折，但這台是
+     * 開發板、隨時要用 SWD 讀狀態，值得。真的要壓到最低耗電時再拿掉。 */
+    HAL_DBGMCU_EnableDBGSleepMode();
 
     /* 開啟週期計數器，rnd_mix() 拿它當高解析度的熵來源。 */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -1148,6 +1266,14 @@ void album_run(void)
         show_message("觸控初始化失敗", 0);
     }
     button_init();
+    photo_set_abort_check(ctrl_waiting);
+
+    /* 初始化過程中設定腳位會產生假的邊緣事件，清掉再開始。 */
+    g_req_pause = 0u;
+    g_pressing  = 0u;
+
+    g_bright_idx = 0u;
+    brightness_set(BRIGHT_STEP[0]);   /* 100%，並給 LPTIM 明確初值 */
 
     g_stage = 2;
     if (!photo_init()) {
@@ -1184,7 +1310,7 @@ void album_run(void)
     if (wdt_reset) {
         show_message("記憶卡沒有回應", "請拔出記憶卡再重新插入");
         while (sd_present()) {
-            HAL_Delay(100);
+            nap(100);
         }
     }
 
