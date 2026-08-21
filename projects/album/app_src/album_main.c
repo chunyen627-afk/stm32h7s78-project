@@ -331,10 +331,34 @@ static void screen_set(bool on)
         return;
     }
     g_screen_on = on;
-    if (on) {
-        (void)BSP_LCD_DisplayOn(0);
-    } else {
+
+    if (!on) {
         (void)BSP_LCD_DisplayOff(0);
+        return;
+    }
+
+    (void)BSP_LCD_DisplayOn(0);
+
+    /* BSP 的 DisplayOn 不會把背光打開，這是 ST 兩邊不對稱的地方：
+     *
+     *   DisplayOff  把背光腳（GPIOG15）從 LPTIM 的 PWM 替代功能改成一般
+     *               輸出，而 ODR 是 0，等於把背光關掉
+     *   DisplayOn   只做 __HAL_LTDC_ENABLE 和拉高 LCD_DISP_EN，
+     *               完全沒碰背光腳
+     *
+     * 結果就是「關得掉、開不回來」：LTDC 恢復了、面板也 enable 了，就是沒有
+     * 背光。這裡直接把那支腳拉高（全亮）。本專案不用亮度調節，所以維持一般
+     * 輸出即可，不必還原成 PWM。 */
+    {
+        GPIO_InitTypeDef bl = {0};
+
+        LCD_BL_CTRL_GPIO_CLK_ENABLE();
+        bl.Mode  = GPIO_MODE_OUTPUT_PP;
+        bl.Pull  = GPIO_NOPULL;
+        bl.Speed = GPIO_SPEED_FREQ_MEDIUM;
+        bl.Pin   = LCD_BL_CTRL_PIN;
+        HAL_GPIO_Init(LCD_BL_CTRL_GPIO_PORT, &bl);
+        HAL_GPIO_WritePin(LCD_BL_CTRL_GPIO_PORT, LCD_BL_CTRL_PIN, GPIO_PIN_SET);
     }
 }
 

@@ -26,7 +26,7 @@ GCC_BIN="/c/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.
 if [ -f "$DEBUG_DIR/makefile" ] && [ -z "$FORCE_IDE" ]; then
     echo "==> 編譯（make）"
     PATH="$GCC_BIN:$PATH" make -C "$DEBUG_DIR" -j8 all 2>&1 |
-        grep -iE "error|warning|\.elf|^ +[0-9]+ +[0-9]+" || true
+        grep -iE "error|warning|No rule|Stop\.|\.elf|^ +[0-9]+ +[0-9]+" || true
     exit 0
 fi
 
