@@ -14,7 +14,8 @@ import re
 import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-PROJ = os.path.join(ROOT, "cube", "Projects", "STM32H7S78-DK",
+REPO = os.path.dirname(os.path.dirname(ROOT))   # projects/tetris -> repo 根
+PROJ = os.path.join(REPO, "cube", "Projects", "STM32H7S78-DK",
                     "Templates", "Tetris")
 APPLI = os.path.join(PROJ, "STM32CubeIDE", "Appli")
 

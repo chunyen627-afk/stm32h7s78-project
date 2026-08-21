@@ -25,3 +25,11 @@ Release/
 # 測試中間檔
 test/*.elf
 shots/*.raw
+
+# album 的字型表由 tools/genfont.py 產生（6.4MB），不進版控。
+# scripts/setup.sh 會在缺少時自動產生。
+projects/album/core/font_zh.c
+projects/album/core/font_zh.h
+
+# 韌體包位置（舊版 album 用過，已不需要）
+.cube_path

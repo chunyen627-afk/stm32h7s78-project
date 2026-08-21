@@ -7,29 +7,32 @@ set -e
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
+# 韌體包與共用程式碼放在 repo 根目錄，所有專案共用。
+REPO=$(cd "$ROOT/../.." && pwd)
+
 echo "==> 下載 STM32CubeH7RS 韌體包（約 540MB，含 submodules）"
-if [ ! -d cube ]; then
-    git clone --depth 1 https://github.com/STMicroelectronics/STM32CubeH7RS.git cube
+if [ ! -d "$REPO/cube" ]; then\
+    git clone --depth 1 https://github.com/STMicroelectronics/STM32CubeH7RS.git "$REPO/cube"
 fi
 
 echo "==> 取得 submodules（HAL / CMSIS / BSP / GT911 觸控驅動）"
-(cd cube && git submodule update --init --depth 1 --recursive)
+(cd "$REPO/cube" && git submodule update --init --depth 1 --recursive)
 
-TPL="$ROOT/cube/Projects/STM32H7S78-DK/Templates"
+TPL="$REPO/cube/Projects/STM32H7S78-DK/Templates"
 PROJ="$TPL/Tetris"
 
 echo "==> 以 Template_XIP 為基底建立專案"
 # 專案必須放在韌體包內的這個層級，因為 .cproject 用相對路徑
 # （../../../../../../..）指向 Drivers/ 與 Middlewares/。搬到別處會編不過。
-if [ ! -d "$PROJ" ]; then
+if [ ! -d "$PROJ" ]; then\
     cp -r "$TPL/Template_XIP" "$PROJ"
 fi
 
 echo "==> 複製元件設定檔"
 # Template_XIP 本身不含這些，要從 BSP 範例借用。
-cp "$ROOT/cube/Projects/STM32H7S78-DK/Examples/BSP/Inc/gt911_conf.h" \
-   "$ROOT/cube/Projects/STM32H7S78-DK/Examples/BSP/Inc/mx66uw1g45g_conf.h" \
-   "$ROOT/cube/Projects/STM32H7S78-DK/Examples/BSP/Inc/aps256xx_conf.h" \
+cp "$REPO/cube/Projects/STM32H7S78-DK/Examples/BSP/Inc/gt911_conf.h" \\
+   "$REPO/cube/Projects/STM32H7S78-DK/Examples/BSP/Inc/mx66uw1g45g_conf.h" \\
+   "$REPO/cube/Projects/STM32H7S78-DK/Examples/BSP/Inc/aps256xx_conf.h" \\
    "$PROJ/Appli/Inc/"
 
 echo "==> 套用專案設定（HAL 模組、原始碼、include 路徑）"
@@ -37,7 +40,7 @@ python "$ROOT/tools/patch_project.py"
 
 echo "==> 複製遊戲原始碼"
 mkdir -p "$PROJ/Appli/Game"
-cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/game_main.c "$ROOT"/app_src/dma2d.c "$PROJ/Appli/Game/"
+cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$REPO"/shared/gfx.c "$REPO"/shared/gfx.h  "$ROOT"/app_src/game_main.c "$ROOT"/app_src/dma2d.c "$PROJ/Appli/Game/"
 
 echo
 echo "完成。接著執行："
