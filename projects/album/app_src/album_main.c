@@ -39,16 +39,19 @@ extern const Diskio_drvTypeDef SD_BSP_Driver;
 #define COL_PANEL       RGB565(30, 34, 44)
 #define COL_LINE        RGB565(54, 60, 74)
 
-#define MAX_TOP         24U
-#define MAX_PHOTOS      4096U
-#define PATH_MAX        128U
+#define MAX_TOP         64U
+#define MAX_PHOTOS      8192U
+/* 完整路徑上限。中文/日文一個字 3 bytes，加上多層子資料夾很容易超過 128，
+ * 超過的照片會被跳過。PSRAM 還有空間，放寬到 256 免得使用者莫名其妙少照片。 */
+#define PATH_MAX        256U
 #define NAME_MAX        96U
 #define MAX_DEPTH       10U
 #define SCAN_PATH_LEN   512U
 
-/* 清單放 PSRAM：4096 x 128 = 512KB，內部 RAM 放不下。 */
-#define PLAYLIST_BASE   ((char *)0x91E00000u)
-#define TOPIDX_BASE     ((uint8_t *)0x91E80000u)
+/* 清單放 PSRAM：8192 x 256 = 2MB，內部 RAM 放不下。
+ * 位置接在 photo.c 的縮圖緩衝區之後（見那邊的記憶體配置表）。 */
+#define PLAYLIST_BASE   ((char *)0x91C00000u)     /* 8192 x 256 = 2 MB */
+#define TOPIDX_BASE     ((uint8_t *)0x91E00000u)  /* 8 KB */
 
 typedef struct {
     char     name[NAME_MAX];
@@ -80,6 +83,9 @@ volatile uint32_t g_decode_ok;
 volatile uint32_t g_decode_fail;
 volatile uint32_t g_last_ms;
 volatile uint32_t g_exit_touch;   /* 因觸控離開播放的次數 */
+volatile uint32_t g_skipped_long; /* 路徑太長被跳過的照片數 */
+volatile uint32_t g_skipped_full; /* 清單滿了之後被跳過的照片數 */
+volatile uint32_t g_paused;       /* 1 = 播放暫停中（畫面凍結）*/
 
 /* ------------------------------------------------------------------ */
 /* 基礎設施                                                            */
@@ -154,6 +160,7 @@ static void present(void)
 static void rnd_mix(uint32_t v);      /* 定義在下面的亂數區塊 */
 static void watchdog_feed(void);      /* 定義在下面的記憶卡狀態區塊 */
 static bool sd_present(void);
+static void show_scan_progress(void);
 
 /* 觸控座標換成直立座標。
  * gfx 把邏輯 (x,y) 映到實體 offset (GFX_W-1-x)*PHYS_W + y，
@@ -207,13 +214,10 @@ static bool touch_confirmed(void)
     if (!read_touch(&x, &y)) {
         return false;
     }
-    for (int i = 0; i < 3; i++) {
-        HAL_Delay(20);
-        if (!read_touch(&x, &y)) {
-            return false;
-        }
-    }
-    return true;
+    /* 原本要連續 4 次讀到才算數，短按很容易在中間被漏掉，變成「點不到」。
+     * 兩次已經足以濾掉雜訊，反應也快得多。 */
+    HAL_Delay(20);
+    return read_touch(&x, &y);
 }
 
 static uint32_t rnd_state = 0x2545F491u;
@@ -401,7 +405,12 @@ static void add_photo(const char *path, uint32_t top)
 {
     char *slot;
 
-    if (g_photo_count >= MAX_PHOTOS || strlen(path) >= PATH_MAX) {
+    if (g_photo_count >= MAX_PHOTOS) {
+        g_skipped_full++;
+        return;
+    }
+    if (strlen(path) >= PATH_MAX) {
+        g_skipped_long++;
         return;
     }
     slot = PLAYLIST_BASE + g_photo_count * PATH_MAX;
@@ -459,6 +468,12 @@ static void scan(uint32_t depth)
         } else if (is_jpeg(fi->fname) && depth > 0U && g_cur_top < MAX_TOP) {
             add_photo(g_scan_path, g_cur_top);
             g_top[g_cur_top].photos++;
+
+            /* 掃幾萬個檔案要花上數十秒，畫面一直停在「載入中」會像當機。
+             * 每 200 張更新一次數字，讓使用者看得到它在動。 */
+            if ((g_photo_count % 200u) == 0u) {
+                show_scan_progress();
+            }
         }
 
         g_scan_path[base] = 0;
@@ -685,6 +700,19 @@ static bool select_screen(void)
 /* 播放                                                                */
 /* ------------------------------------------------------------------ */
 
+/* 掃描進度。數字會一直跳，讓使用者知道它在動而不是當掉了。 */
+static void show_scan_progress(void)
+{
+    watchdog_feed();
+    for (int i = 0; i < 2; i++) {
+        gfx_clear(COL_BG);
+        gfx_text_center(GFX_W / 2, GFX_H / 2 - 60, "掃描記憶卡", COL_TEXT);
+        gfx_number_right(GFX_W / 2 + 20, GFX_H / 2, g_photo_count, COL_ACCENT);
+        gfx_text(GFX_W / 2 + 28, GFX_H / 2, "張", COL_DIM);
+        present();
+    }
+}
+
 static void show_message(const char *line1, const char *line2)
 {
     for (int i = 0; i < 2; i++) {
@@ -697,85 +725,228 @@ static void show_message(const char *line1, const char *line2)
     }
 }
 
-static void slideshow(void)
+/* 螢幕關著時停在這裡。回傳 false 代表卡片被拔掉。 */
+static bool wait_screen_on(void)
 {
-    uint32_t pos = 0;
+    while (!screen_poll()) {
+        watchdog_feed();
+        if (!sd_present()) {
+            return false;
+        }
+        HAL_Delay(100);
+    }
+    return true;
+}
 
-    /* 進來時先確定手指已經離開「開始播放」那一下，再開始接受離開的觸碰。 */
+/* 判斷觸控是短按還是長按。回傳 0=沒碰到，1=短按，2=長按。
+ *
+ * 短按暫停／繼續、長按回選單。原本短按就直接離開，結果想停下來看某一張時
+ * 只能被踢回選單，反而看不到。 */
+#define LONG_PRESS_MS   700u
+
+static int touch_gesture(void)
+{
+    uint32_t t0;
+    int x, y;
+
+    if (!touch_confirmed()) {
+        return 0;
+    }
+    t0 = HAL_GetTick();
+    while (read_touch(&x, &y)) {
+        watchdog_feed();
+        if (HAL_GetTick() - t0 >= LONG_PRESS_MS) {
+            wait_release();
+            return 2;               /* 長按：回選單 */
+        }
+        HAL_Delay(20);
+    }
     wait_release();
+    return 1;                       /* 短按：暫停／繼續 */
+}
+
+/* 暫停時的操作列版面（直立座標）。 */
+#define BAR_Y       660
+#define BAR_H       120
+#define BAR_MID     (GFX_W / 2)
+
+/* 把一塊區域壓暗，做出半透明的感覺。
+ *
+ * RGB565 沒有 alpha 通道，所以是讀回原像素、把亮度減半再寫回去。照片內容
+ * 還看得見，但按鈕的字浮得出來。 */
+static void overlay_dim(int x, int y, int w, int h)
+{
+    for (int j = 0; j < h; j++) {
+        for (int i = 0; i < w; i++) {
+            uint16_t v = gfx_get_pixel(x + i, y + j);
+            uint16_t r = (uint16_t)((v >> 11) & 0x1Fu) >> 1;
+            uint16_t g = (uint16_t)((v >> 5) & 0x3Fu) >> 1;
+            uint16_t b = (uint16_t)(v & 0x1Fu) >> 1;
+            gfx_pixel(x + i, y + j, (uint16_t)((r << 11) | (g << 5) | b));
+        }
+    }
+}
+
+/* 在「正在顯示」的那塊 buffer 上直接畫操作列。
+ *
+ * 不能畫在 back buffer —— 那塊還沒輪到顯示，畫了看不見。present() 之後
+ * gfx 指向的是 back buffer，所以要先把它切到 front，畫完再切回來。 */
+static void draw_pause_bar(void)
+{
+    uint16_t *back  = gfx_framebuffer();
+    uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+
+    gfx_set_framebuffer(front);
+
+    overlay_dim(0, BAR_Y, GFX_W, BAR_H);
+
+    gfx_pill(16, BAR_Y + 24, BAR_MID - 32, BAR_H - 48, COL_ACCENT);
+    gfx_text_center(16 + (BAR_MID - 32) / 2, BAR_Y + 44, "繼續播放", COL_BG);
+
+    gfx_pill(BAR_MID + 16, BAR_Y + 24, BAR_MID - 32, BAR_H - 48, COL_PANEL);
+    gfx_text_center(BAR_MID + 16 + (BAR_MID - 32) / 2, BAR_Y + 44,
+                    "返回選單", COL_TEXT);
+
+    gfx_set_framebuffer(back);
+}
+
+/* 暫停：畫面停在目前這張，直到再按一次。長按則回選單。
+ * 回傳 true 表示要離開播放。 */
+static bool paused_loop(void)
+{
+    g_paused = 1u;
+    draw_pause_bar();
 
     for (;;) {
-        const char *path = PLAYLIST_BASE + g_order[pos] * PATH_MAX;
-        uint32_t t0 = HAL_GetTick();
+        int x, y;
 
         watchdog_feed();
         if (!sd_present()) {
-            return;                     /* 卡片被拔掉，回到上層 */
+            g_paused = 0u;
+            return true;
         }
-
-        /* 螢幕關著就停在這裡，不要開始解下一張。 */
-        while (!screen_poll()) {
-            watchdog_feed();
-            if (!sd_present()) {
-                return;
-            }
+        if (!screen_poll()) {
             HAL_Delay(100);
+            continue;
         }
 
-        photo_result_t r = photo_show(path);
-        if (r != PHOTO_OK) {
-            r = photo_show(path);      /* 偶發讀取失敗重試一次 */
+        /* 座標要在「確認觸碰的當下」抓，不能確認完再讀一次 ——
+         * 輕點的話那時手指已經放開，read_touch 撲空，按鈕就像沒反應。 */
+        if (read_touch(&x, &y)) {
+            int x2, y2;
+            bool in_bar, go_menu;
+
+            HAL_Delay(20);
+            if (read_touch(&x2, &y2)) {   /* 第二次讀到就採信，並用新座標 */
+                x = x2; y = y2;
+            }
+            in_bar  = (y >= BAR_Y && y < BAR_Y + BAR_H);
+            go_menu = in_bar && (x >= BAR_MID);
+
+            wait_release();
+            g_paused = 0u;
+            return go_menu;         /* 點右半＝回選單，其餘＝繼續播放 */
         }
+        HAL_Delay(30);
+    }
+}
+
+/* 等目前這張照片的展示時間走完。
+ *
+ * already_ms 是「這張已經在螢幕上待了多久」—— 也就是解下一張花掉的時間。
+ * 解碼期間前一張本來就在螢幕上，那段時間當然要算進展示時間裡，否則使用者
+ * 設 2 秒會變成「解碼 1.5 秒 + 等 2 秒 = 3.5 秒」，設定值和實際對不上。
+ *
+ * 回傳 0 = 正常等完，1 = 要離開播放，2 = 卡片被拔掉。 */
+static int wait_interval(uint32_t already_ms)
+{
+    uint32_t wait_ms = g_interval_s * 1000u;
+    uint32_t waited  = (already_ms > wait_ms) ? wait_ms : already_ms;
+    uint32_t last    = HAL_GetTick();
+
+    while (waited < wait_ms) {
+        uint32_t now;
+        int g;
+
+        watchdog_feed();
+        if (!sd_present()) {
+            return 2;
+        }
+        if (!screen_poll()) {
+            HAL_Delay(100);
+            last = HAL_GetTick();
+            continue;
+        }
+
+        now = HAL_GetTick();
+        waited += now - last;
+        last = now;
+
+        g = touch_gesture();
+        if (g == 2) {
+            g_exit_touch++;
+            return 1;               /* 長按：回選單 */
+        }
+        if (g == 1) {
+            if (paused_loop()) {    /* 短按：暫停，停在這張 */
+                return 1;
+            }
+            last = HAL_GetTick();   /* 暫停的時間不算進展示時間 */
+        }
+        HAL_Delay(15);
+    }
+    return 0;
+}
+
+/* 播放。
+ *
+ * 解碼與顯示重疊：目前這張在螢幕上的時候，就先把下一張解進另一塊 buffer，
+ * 時間到直接切換。這樣換頁是瞬間的，而且間隔設定值就是實際的展示時間 ——
+ * 只要解碼比間隔快。解碼比間隔慢的話，展示時間就等於解碼時間，沒辦法更快。 */
+static void slideshow(void)
+{
+    uint32_t pos   = 0;
+    bool     shown = false;
+
+    /* 先確定手指已經離開「開始播放」那一下。 */
+    wait_release();
+
+    for (;;) {
+        photo_result_t r;
+        uint32_t t0;
+
+        watchdog_feed();
+        if (!sd_present() || !wait_screen_on()) {
+            return;
+        }
+
+        /* 解下一張：畫進 back buffer，此時前一張還在螢幕上。 */
+        t0 = HAL_GetTick();
+        r = photo_show(PLAYLIST_BASE + g_order[pos] * PATH_MAX);
+        if (r != PHOTO_OK) {
+            r = photo_show(PLAYLIST_BASE + g_order[pos] * PATH_MAX);
+        }
+        g_last_ms = HAL_GetTick() - t0;
+
         if (r == PHOTO_OK) {
             g_decode_ok++;
+
+            if (shown) {
+                int w = wait_interval(g_last_ms);
+                if (w != 0) {
+                    return;             /* 觸控離開或卡片被拔掉 */
+                }
+            }
             present();
+            shown = true;
         } else {
             /* 一張壞掉的照片不能讓相框停住，記錄之後直接換下一張。 */
             g_decode_fail++;
         }
-        g_last_ms = HAL_GetTick() - t0;
-
-        /* 等到間隔時間到；中途有明確的觸碰就回選擇畫面。
-         *
-         * 螢幕關著的時間不列入計算，所以再點亮時目前這張會有完整的展示時間，
-         * 不會一亮起來就立刻跳下一張。 */
-        {
-            uint32_t wait_ms = g_interval_s * 1000u;
-            uint32_t waited  = 0;
-            uint32_t last    = HAL_GetTick();
-
-            while (waited < wait_ms) {
-                uint32_t now;
-
-                watchdog_feed();
-                if (!sd_present()) {
-                    return;
-                }
-
-                if (!screen_poll()) {
-                    /* 螢幕關著：停在這裡不解碼、不吃觸控，也不累計時間。
-                     * 輪詢放慢到 100ms，減少不必要的耗電。 */
-                    HAL_Delay(100);
-                    last = HAL_GetTick();
-                    continue;
-                }
-
-                now = HAL_GetTick();
-                waited += now - last;
-                last = now;
-
-                if (touch_confirmed()) {
-                    g_exit_touch++;
-                    wait_release();
-                    return;
-                }
-                HAL_Delay(15);
-            }
-        }
 
         pos++;
         if (pos >= g_order_count) {
-            build_order();          /* 播完一輪重新洗牌 */
+            build_order();              /* 播完一輪重新洗牌 */
             pos = 0;
         }
     }
@@ -873,6 +1044,24 @@ void album_run(void)
         for (;;) { }
     }
 
+    /* 插卡偵測腳要自己先設定好。
+     *
+     * BSP_SD_IsDetected() 只是讀 GPIO，不會設定它 —— 真正設定的是
+     * BSP_SD_Init()。但主迴圈在掛載之前就會用 sd_present() 判斷有沒有卡，
+     * 那時這支腳還沒被初始化過，讀到的是未定義狀態。實測沒插卡卻被判成
+     * 有卡，於是走進掛載流程，最後顯示「記憶卡無法讀取，請確認格式為
+     * FAT32」—— 訊息完全誤導。 */
+    SD_DETECT_GPIO_CLK_ENABLE();
+    {
+        GPIO_InitTypeDef det = {0};
+        det.Pin   = SD_DETECT_PIN;
+        det.Mode  = GPIO_MODE_INPUT;
+        det.Pull  = GPIO_NOPULL;
+        det.Speed = GPIO_SPEED_FREQ_HIGH;
+        HAL_GPIO_Init(SD_DETECT_GPIO_PORT, &det);
+        HAL_Delay(10);              /* 讓腳位穩定再開始判斷 */
+    }
+
     g_stage = 30;
     if (FATFS_LinkDriver(&SD_BSP_Driver, g_drive) != 0) {
         show_message("磁碟介面初始化失敗", 0);
@@ -909,12 +1098,35 @@ void album_run(void)
             continue;
         }
 
+#if DEBUG_ONE_SHOT
+        /* 除錯：連續解好幾張（重現播放時的雙緩衝交替），最後停在一張上不動，
+         * 方便用 SWD 把畫面完整抓下來。只解一張重現不了跨照片的問題。 */
+        g_stage = 9;
+        build_order();
+        for (uint32_t k = 0; k < 6u && k < g_order_count; k++) {
+            watchdog_feed();
+            if (photo_show(PLAYLIST_BASE + g_order[k] * PATH_MAX) == PHOTO_OK) {
+                g_decode_ok++;
+                present();
+            } else {
+                g_decode_fail++;
+            }
+            HAL_Delay(300);
+        }
+        g_stage = 10;
+        for (;;) {
+            watchdog_feed();
+            BSP_LED_Toggle(LD1);
+            HAL_Delay(500);
+        }
+#else
         g_stage = 5;
         while (sd_present()) {
             if (select_screen()) {
                 slideshow();
             }
         }
+#endif
         /* 跳出來代表卡片被拔掉了。 */
     }
 }

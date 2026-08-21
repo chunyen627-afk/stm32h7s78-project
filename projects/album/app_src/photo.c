@@ -31,14 +31,30 @@
 
 #include <string.h>
 
-/* PSRAM 配置。彼此不重疊，最後一塊之後是 album_main.c 的播放清單。 */
+/* PSRAM 配置（總共 32MB：0x90000000 ~ 0x91FFFFFF）
+ *
+ *   0x90000000  FB0 + FB1      4 MB   framebuffer（BSP 固定）
+ *   0x90400000  JPEG 原始檔    2 MB
+ *   0x90600000  YCbCr         10 MB   ← 必須裝得下 4:4:4（見下）
+ *   0x91000000  RGB888        10 MB
+ *   0x91A00000  縮圖 RGB888    2 MB   實際只用 480x800x3 = 1.15MB
+ *   0x91C00000  播放清單       2 MB   見 album_main.c
+ *   0x91E00000  資料夾索引     8 KB＋餘裕
+ *
+ * YCbCr 的大小踩過一個大坑：一開始配 6MB，是照 4:2:0（每像素 1.5 bytes）
+ * 估的。但相機直出的 JPEG 很多是 4:4:4 —— 每像素 3 bytes，1800x1200 就要
+ * 6.48MB，裝不下。HAL 的行為是「輸出緩衝區滿了就繞回開頭繼續寫」：
+ * 照片尾端的 MCU 蓋掉開頭的 MCU，畫面上就是「照片底部跑到最上面、
+ * 底部留著上一張的殘影」。所以這塊必須以 4:4:4 的最壞情況來配。
+ */
 #define JPEG_FILE_BUF   ((uint8_t *)0x90400000u)
-#define JPEG_FILE_CAP   (4u * 1024u * 1024u)
-#define YCBCR_BUF       ((uint8_t *)0x90800000u)
-#define YCBCR_CAP       (8u * 1024u * 1024u)
+#define JPEG_FILE_CAP   (2u * 1024u * 1024u)
+#define YCBCR_BUF       ((uint8_t *)0x90600000u)
+#define YCBCR_CAP       (10u * 1024u * 1024u)
 #define RGB_BUF         ((uint8_t *)0x91000000u)      /* RGB888 全尺寸 */
-#define RGB_CAP_PIXELS  (4u * 1024u * 1024u)          /* 12MB / 3 bytes */
-#define SCALED_BUF      ((uint8_t *)0x91C00000u)      /* RGB888 縮圖 */
+#define RGB_CAP         (10u * 1024u * 1024u)
+#define SCALED_BUF      ((uint8_t *)0x91A00000u)      /* RGB888 縮圖 */
+#define SCALED_CAP      (2u * 1024u * 1024u)
 
 /* 填滿畫面時容許裁掉的最大比例，超過就退回完整顯示（留黑邊）。
  * 2:3 的直式照片放到 3:5 的畫面只需裁 10%；設 25 足以擋掉全景照那種
@@ -69,21 +85,43 @@ volatile uint32_t g_dbg_sof;
 volatile uint32_t g_dbg_outcount;
 volatile uint32_t g_dbg_w, g_dbg_h, g_dbg_css;
 volatile uint32_t g_dbg_ms_decode, g_dbg_ms_scale, g_dbg_ms_out;
+volatile uint32_t g_dbg_need_rgb;   /* 這張照片解碼需要多少 RGB 空間 */
+volatile uint32_t g_dbg_toobig;     /* 因為太大被跳過的張數 */
+
+/* 實際的讀寫範圍。與預期值一比就知道有沒有越界，不用再靠推理。 */
+volatile uint32_t g_dbg_dw, g_dbg_dh, g_dbg_ox, g_dbg_oy;
+volatile uint32_t g_dbg_srcw, g_dbg_srch, g_dbg_sox, g_dbg_soy;
+volatile uint32_t g_dbg_maxsy;      /* downscale 讀到的最大來源列 */
+volatile uint32_t g_dbg_maxsx;      /* downscale 讀到的最大來源行 */
+volatile uint32_t g_dbg_maxdst;     /* downscale 寫到的最大縮圖位移 */
+volatile uint32_t g_dbg_maxfb;      /* 寫到的最大 framebuffer 索引 */
+volatile uint32_t g_dbg_maxscl;     /* sharpen 讀到的最大縮圖位移 */
 char              g_dbg_path[160];
 
 void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *hjpeg, uint8_t *pDataOut,
                                 uint32_t OutDataLength)
 {
-    /* 用「這批資料的結束位移」而不是累加：HAL 在某些路徑上會對同一批資料
-     * 呼叫兩次，累加會得到剛好兩倍的長度。 */
+    /* 只記錄長度，「不要」在這裡呼叫 HAL_JPEG_ConfigOutputBuffer()。
+     *
+     * 這裡踩過一個很難查的坑：原本為了防止輸出緩衝區填滿時 HAL 從頭覆蓋，
+     * 在回呼裡把緩衝區往後推。但 HAL 在**解碼結束時也會呼叫這個回呼**，
+     * 這時又餵一塊新緩衝區給它，HAL 就當作還能繼續輸出 —— 於是反覆觸發，
+     * 直到把整個緩衝區用完才停。
+     *
+     * 後果是連鎖的：輸出長度從 3,254,400 變成 6,291,456（剛好是緩衝區上限），
+     * 轉色函式據此算出 16384 個 MCU（實際只有 8475），多轉的部分往 RGB 緩衝區
+     * 後面寫，溢位落點正好是縮圖緩衝區的開頭 —— 也就是畫面最上面幾列；
+     * 而真正的影像尾端從未被填入，畫面下方就是未初始化記憶體。
+     * 「上緣出現別張照片、下緣一片雜訊」這兩個症狀，其實是同一個原因。
+     *
+     * 正確做法：一開始就把整塊緩衝區交給 HAL_JPEG_Decode()（它已經這麼做了），
+     * 回呼只負責回報「這批資料寫到哪裡為止」。用結束位移取最大值而不是累加，
+     * 因為 HAL 在某些路徑上會對同一批資料呼叫兩次。 */
     uint32_t end = (uint32_t)(pDataOut - YCBCR_BUF) + OutDataLength;
 
+    (void)hjpeg;
     if (end > g_out_total) {
         g_out_total = end;
-    }
-    if (g_out_total + 4u < YCBCR_CAP) {
-        HAL_JPEG_ConfigOutputBuffer(hjpeg, YCBCR_BUF + g_out_total,
-                                    YCBCR_CAP - g_out_total);
     }
 }
 
@@ -187,30 +225,73 @@ static void find_sof(const uint8_t *p, uint32_t len)
 
 static uint32_t g_dw, g_dh, g_ox, g_oy;   /* 目的地幾何（邏輯直立座標） */
 
-/* 決定縮放比例與來源取用範圍。 */
+/* 決定縮放比例與來源取用範圍。
+ *
+ * 目的地尺寸「直接指定」，不從縮放比例反算 —— 這是先前踩過的坑：
+ *
+ *   by_h  = (800 << 16) / 1800 = 29127.11 -> 截斷成 29127
+ *   g_dh  = (1800 * 29127) >> 16 = 799.99 -> 截斷成 799
+ *
+ * 差 0.11 就讓高度變成 799，繪圖迴圈只寫到 y=798，最後一列永遠是清畫面留下
+ * 的黑色，看起來就是底部一條黑線。填滿模式的目的地本來就是整個螢幕，不該
+ * 讓它去承受兩次除法的誤差。
+ *
+ * 所以改成：先決定要「填滿」還是「完整顯示」，再直接寫死目的地尺寸，
+ * 用目的地去反推該取用哪一塊來源。誤差只會落在來源取樣座標上，那裡差一個
+ * 像素看不出來，也不會留下沒畫到的空白。
+ */
 static void plan_geometry(uint32_t sw, uint32_t sh,
                           uint32_t *src_w, uint32_t *src_h,
                           uint32_t *sox, uint32_t *soy)
 {
-    uint32_t by_w    = (GFX_W * 65536u) / sw;
-    uint32_t by_h    = (GFX_H * 65536u) / sh;
-    uint32_t contain = (by_w < by_h) ? by_w : by_h;
-    uint32_t cover   = (by_w > by_h) ? by_w : by_h;
-    uint32_t crop    = 100u - (contain * 100u) / cover;
-    uint32_t scale   = (crop <= MAX_CROP_PCT) ? cover : contain;
+    /* 比較「來源寬高比」與「畫面寬高比」，用交叉相乘避免浮點與除法誤差。 */
+    uint64_t src_ratio = (uint64_t)sw * GFX_H;    /* sw/sh vs GFX_W/GFX_H */
+    uint64_t dst_ratio = (uint64_t)GFX_W * sh;
+    bool     wider     = (src_ratio > dst_ratio); /* 來源比畫面更寬 */
 
-    g_dw = (sw * scale) >> 16;
-    g_dh = (sh * scale) >> 16;
+    /* 填滿畫面要裁掉多少？用面積比估算，超過上限就退回完整顯示。 */
+    uint32_t crop_pct;
+    if (wider) {
+        /* 以高度為準放大，裁掉左右 */
+        uint32_t used_w = (uint32_t)(((uint64_t)sh * GFX_W) / GFX_H);
+        crop_pct = 100u - (used_w * 100u) / sw;
+    } else {
+        /* 以寬度為準放大，裁掉上下 */
+        uint32_t used_h = (uint32_t)(((uint64_t)sw * GFX_H) / GFX_W);
+        crop_pct = 100u - (used_h * 100u) / sh;
+    }
+
+    if (crop_pct <= MAX_CROP_PCT) {
+        /* 填滿：目的地就是整個畫面，來源取中間一塊同比例的區域。 */
+        g_dw = GFX_W;
+        g_dh = GFX_H;
+        if (wider) {
+            *src_h = sh;
+            *src_w = (uint32_t)(((uint64_t)sh * GFX_W) / GFX_H);
+        } else {
+            *src_w = sw;
+            *src_h = (uint32_t)(((uint64_t)sw * GFX_H) / GFX_W);
+        }
+    } else {
+        /* 完整顯示：整張都要，某一邊會留黑邊。 */
+        *src_w = sw;
+        *src_h = sh;
+        if (wider) {
+            g_dw = GFX_W;
+            g_dh = (uint32_t)(((uint64_t)sh * GFX_W) / sw);
+        } else {
+            g_dh = GFX_H;
+            g_dw = (uint32_t)(((uint64_t)sw * GFX_H) / sh);
+        }
+    }
+
     if (g_dw == 0u) { g_dw = 1u; }
     if (g_dh == 0u) { g_dh = 1u; }
     if (g_dw > GFX_W) { g_dw = GFX_W; }
     if (g_dh > GFX_H) { g_dh = GFX_H; }
-
-    /* 實際用到的來源範圍。cover 時小於整張照片，差額從中間等量裁掉。 */
-    *src_w = (g_dw << 16) / scale;
-    *src_h = (g_dh << 16) / scale;
     if (*src_w > sw) { *src_w = sw; }
     if (*src_h > sh) { *src_h = sh; }
+
     *sox = (sw - *src_w) / 2u;
     *soy = (sh - *src_h) / 2u;
 
@@ -229,6 +310,11 @@ static void downscale(const uint8_t *src, uint32_t sw,
     uint32_t sx_step = (src_w << 16) / g_dw;
     uint32_t sy_step = (src_h << 16) / g_dh;
 
+    /* 縮圖最大就是整個畫面，理論上不會超過；真的超過寧可不畫也不要踩過界。 */
+    if ((size_t)g_dw * g_dh * 3u > SCALED_CAP) {
+        return;
+    }
+
     for (uint32_t dy = 0; dy < g_dh; dy++) {
         uint32_t sy0 = soy + ((dy * sy_step) >> 16);
         uint32_t sy1 = soy + (((dy + 1u) * sy_step) >> 16);
@@ -245,6 +331,9 @@ static void downscale(const uint8_t *src, uint32_t sw,
             if (sx1 <= sx0) { sx1 = sx0 + 1u; }
             if (sx1 > sox + src_w) { sx1 = sox + src_w; }
 
+            if (sy1 - 1u > g_dbg_maxsy) { g_dbg_maxsy = sy1 - 1u; }
+            if (sx1 - 1u > g_dbg_maxsx) { g_dbg_maxsx = sx1 - 1u; }
+
             for (uint32_t yy = sy0; yy < sy1; yy++) {
                 const uint8_t *p = src + ((size_t)yy * sw + sx0) * 3u;
                 for (uint32_t xx = sx0; xx < sx1; xx++) {
@@ -260,6 +349,10 @@ static void downscale(const uint8_t *src, uint32_t sw,
             dst[1] = (uint8_t)(g / n);
             dst[2] = (uint8_t)(b / n);
             dst += 3;
+            {
+                uint32_t off = (uint32_t)(dst - SCALED_BUF);
+                if (off > g_dbg_maxdst) { g_dbg_maxdst = off; }
+            }
         }
     }
 }
@@ -318,6 +411,13 @@ static void sharpen_dither_rotate(void)
             }
 
             {
+                uint32_t so = (uint32_t)((dn + xr * 3u + 2u) - SCALED_BUF);
+                uint32_t fo = (uint32_t)(GFX_W - 1u - (g_ox + x)) * PHYS_W
+                              + phys_col;
+                if (so > g_dbg_maxscl) { g_dbg_maxscl = so; }
+                if (fo > g_dbg_maxfb)  { g_dbg_maxfb  = fo; }
+            }
+            {
                 /* 抖動幅度取各通道 1 個量化階的一半左右。 */
                 int32_t r = (int32_t)out[0] + ((int32_t)*d >> 1) - 4;
                 int32_t g = (int32_t)out[1] + ((int32_t)*d >> 2) - 2;
@@ -360,21 +460,44 @@ photo_result_t photo_show(const char *path)
     if (HAL_JPEG_GetInfo(&g_hjpeg, &info) != HAL_OK) {
         return PHOTO_ERR_DECODE;
     }
-    if (info.ImageWidth == 0u || info.ImageHeight == 0u ||
-        (uint32_t)info.ImageWidth * info.ImageHeight > RGB_CAP_PIXELS) {
-        return PHOTO_ERR_TOO_BIG;
-    }
-    if (g_out_total == 0u) {
+    if (info.ImageWidth == 0u || info.ImageHeight == 0u) {
         return PHOTO_ERR_DECODE;
     }
 
-    /* 夾在這張影像實際需要的長度內。多餵一個位元組，轉換函式就會多轉一個
-     * MCU，往 RGB 緩衝區後面寫出去。 */
-    if (info.ChromaSubsampling == JPEG_420_SUBSAMPLING) {
-        uint32_t need = (((uint32_t)info.ImageWidth + 15u) / 16u) *
-                        (((uint32_t)info.ImageHeight + 15u) / 16u) * 384u;
-        if (g_out_total > need) {
-            g_out_total = need;
+    /* 容量與長度都要照「實際的色度取樣」計算 —— 之前把 css==0 當成 4:2:0，
+     * 但 HAL 的定義是 0=4:4:4、1=4:2:0、2=4:2:2。每種的 MCU 尺寸與資料量：
+     *   4:4:4  MCU 8x8   192 bytes（每像素 3.0）
+     *   4:2:2  MCU 16x8  256 bytes（每像素 2.0）
+     *   4:2:0  MCU 16x16 384 bytes（每像素 1.5）
+     * 高度也要補齊到 MCU 邊界，解碼器會多寫到補齊的部分。 */
+    {
+        uint32_t hf, vf, bs;
+        uint32_t nmcu, need_ycbcr, need_rgb, aligned_h;
+
+        if (info.ChromaSubsampling == JPEG_420_SUBSAMPLING) {
+            hf = 16u; vf = 16u; bs = 384u;
+        } else if (info.ChromaSubsampling == JPEG_422_SUBSAMPLING) {
+            hf = 16u; vf = 8u;  bs = 256u;
+        } else {                            /* JPEG_444_SUBSAMPLING = 0 */
+            hf = 8u;  vf = 8u;  bs = 192u;
+        }
+
+        nmcu = (((uint32_t)info.ImageWidth  + hf - 1u) / hf) *
+               (((uint32_t)info.ImageHeight + vf - 1u) / vf);
+        need_ycbcr = nmcu * bs;
+        aligned_h  = (((uint32_t)info.ImageHeight + vf - 1u) / vf) * vf;
+        need_rgb   = (uint32_t)info.ImageWidth * aligned_h * 3u;
+
+        g_dbg_need_rgb = need_rgb;
+        if (need_ycbcr > YCBCR_CAP || need_rgb > RGB_CAP) {
+            g_dbg_toobig++;
+            return PHOTO_ERR_TOO_BIG;
+        }
+
+        /* 解碼器可能多吐（HAL 對同一批資料重複回報），夾回實際需要的長度，
+         * 免得轉換函式多轉出去。 */
+        if (g_out_total > need_ycbcr) {
+            g_out_total = need_ycbcr;
         }
     }
 
@@ -393,8 +516,15 @@ photo_result_t photo_show(const char *path)
     g_dbg_css       = info.ChromaSubsampling;
     g_dbg_ms_decode = HAL_GetTick() - t0;
 
+    g_dbg_maxsy = 0; g_dbg_maxsx = 0; g_dbg_maxdst = 0;
+    g_dbg_maxfb = 0; g_dbg_maxscl = 0;
+
     plan_geometry(info.ImageWidth, info.ImageHeight,
                   &src_w, &src_h, &sox, &soy);
+
+    g_dbg_dw = g_dw; g_dbg_dh = g_dh; g_dbg_ox = g_ox; g_dbg_oy = g_oy;
+    g_dbg_srcw = src_w; g_dbg_srch = src_h;
+    g_dbg_sox = sox; g_dbg_soy = soy;
 
     /* 照片放不滿時邊框才乾淨。 */
     gfx_clear(0x0000);

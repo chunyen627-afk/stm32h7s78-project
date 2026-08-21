@@ -45,25 +45,32 @@ static DSTATUS sdbsp_initialize(BYTE lun)
 
     g_stat = STA_NOINIT;
 
-    /* 先強制 DeInit 再 Init。
+    /* 正常路徑直接 Init，失敗才 DeInit 重試。
      *
-     * 軟體重置不會切斷 SD 卡的電源，如果上一輪是在讀取途中被重置的，卡片會
-     * 停在資料傳輸狀態。這時直接 Init，HAL 會卡在 SD_InitCard 裡的
-     *   while (sd_rca == 0U)
-     * ——那個迴圈沒有逾時保護，卡片不回應就永遠出不來（實測開機後停在這裡，
-     * uwTick 照常在跑、故障暫存器全 0，就是單純在空轉）。
+     * 不要一開始就無條件 DeInit：它沒有解決原本想解決的問題（卡片停在資料
+     * 傳輸狀態導致 BSP_SD_Init 卡死）—— 實測卡死時 g_sd_stage 已經是 2，
+     * 代表 DeInit 跑完了 Init 照樣出不來。那個情況是靠看門狗兜住的。
      *
-     * DeInit 會把 SDMMC 斷電，等同讓卡片重新上電，狀態機回到 idle。 */
+     * 但 DeInit 拿來當「重試前先清乾淨」有意義：它會把 SDMMC 斷電、把偵測腳
+     * HAL_GPIO_DeInit 掉，讓下一次初始化從乾淨的狀態開始。 */
     g_sd_stage = 1;
-    (void)BSP_SD_DeInit(SD_INSTANCE);
-    HAL_Delay(100);
-
-    g_sd_stage = 2;
-    g_sd_init_res = BSP_SD_Init(SD_INSTANCE);
-    g_sd_stage = 3;
+    for (uint32_t attempt = 0; attempt < 4u; attempt++) {
+        if (attempt > 0u) {
+            (void)BSP_SD_DeInit(SD_INSTANCE);
+            HAL_Delay(200);             /* 讓偵測腳穩定下來再重設 */
+        }
+        g_sd_stage = 2;
+        g_sd_init_res = BSP_SD_Init(SD_INSTANCE);
+        g_sd_stage = 3;
+        if (g_sd_init_res == BSP_ERROR_NONE) {
+            break;
+        }
+        HAL_Delay(200);
+    }
     if (g_sd_init_res != BSP_ERROR_NONE) {
         return g_stat;
     }
+
     if (BSP_SD_IsDetected(SD_INSTANCE) != SD_PRESENT) {
         return g_stat;
     }
