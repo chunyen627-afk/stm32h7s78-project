@@ -198,7 +198,7 @@ def add_includes():
 
 
 def patch_main():
-    """把範本的 LED 閃爍主迴圈換成呼叫相簿。"""
+    """把範本的 LED 閃爍主迴圈換成呼叫影片播放。"""
     path = os.path.join(PROJ, "Appli", "Src", "main.c")
     s = io.open(path, encoding="utf-8").read()
 
@@ -216,14 +216,14 @@ def patch_main():
     s = s.replace(
         "/* USER CODE BEGIN 0 */\n\n/* USER CODE END 0 */",
         "/* USER CODE BEGIN 0 */\n"
-        "/* 相簿進入點，定義在 album_main.c，不會返回。 */\n"
-        "void album_run(void);\n"
+        "/* 影片進入點，定義在 video_main.c，不會返回。 */\n"
+        "void video_run(void);\n"
         "/* USER CODE END 0 */")
 
     s = s.replace(
         "  /* Initialize LD1 */\n  BSP_LED_Init(LD1);\n  /* USER CODE END 2 */",
         "  /* Initialize LD1 */\n  BSP_LED_Init(LD1);\n\n"
-        "  /* 交給相簿主迴圈，不會返回。 */\n  video_run();\n"
+        "  /* 交給影片主迴圈，不會返回。 */\n  video_run();\n"
         "  /* USER CODE END 2 */")
 
     io.open(path, "w", encoding="utf-8").write(s)

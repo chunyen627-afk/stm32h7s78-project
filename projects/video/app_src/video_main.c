@@ -255,6 +255,26 @@ static bool decode_frame(const uint8_t *jpg, uint32_t size)
             }
         }
     }
+    /* 診斷：每格之間完整重新初始化 JPEG。
+     *
+     * Abort 不足以解決「連續 N 格後永久 BUSY」（相簿 8 格、這裡 24 格），
+     * 所以改用最重的手段。如果這樣就不卡，代表是週邊或 HAL 的狀態累積，
+     * 而不是單次操作沒收乾淨 —— 那才知道要往哪裡找真正的原因。
+     * DeInit+Init 每格約幾十微秒，相對 62ms 的轉色可以忽略。 */
+    (void)HAL_JPEG_DeInit(&g_hjpeg);
+    g_hjpeg.Instance = JPEG;
+    (void)HAL_JPEG_Init(&g_hjpeg);
+
+    /* 每次解碼結束後強制收回 READY。
+     *
+     * 症狀：連續 N 次成功後 HAL_JPEG_Decode_DMA 永遠回傳 BUSY（相簿是 8 次、
+     * 這裡是 24 次），週邊再也回不來。假設是解碼結束時 HAL 會再呼叫一次
+     * DataReadyCallback，而我們在那裡又餵了一塊輸出緩衝區 —— HAL 因此認為
+     * 還有輸出要送，狀態沒有回到 READY，累積幾次之後就卡死。
+     *
+     * Abort 是最直接的驗證：如果加了就不再卡死，假設就成立。 */
+    (void)HAL_JPEG_Abort(&g_hjpeg);
+
     if (g_done != 1u) {
         g_dbg_lasterr   = -5;
         g_dbg_jerr      = HAL_JPEG_GetError(&g_hjpeg);
