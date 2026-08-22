@@ -36,3 +36,6 @@ projects/album/core/font_zh.h
 
 # PC 端測試台的產物（執行檔、原始影像、framebuffer、PNG）
 projects/*/test/out/
+
+# 測試用的第三方照片，不進版控
+projects/*/test/photos/
