@@ -41,21 +41,6 @@
  * 一次交出整塊會被默默截斷。必須分塊餵（board-notes 16.2）。 */
 #define CHUNK           (32u * 1024u)
 
-/* ---- 分帶轉色：YCbCr 中間層放內部 SRAM ---------------------------
- *
- * 瓶頸是 100MHz PSRAM 的頻寬不是運算（board-notes 16.11）。每格原本要
- * 讓 576KB 的 YCbCr 進出 PSRAM 兩趟（JPEG DMA 寫、DMA2D 讀），加上
- * DMA2D 寫 768KB 的 RGB565，合計 1,920KB/格。
- *
- * 整塊搬進內部 SRAM 是放不下的：562KB > 456KB（__RAM_SIZE = 0x72000）。
- * 所以分帶 —— SRAM 裡只放幾條 MCU 列，解出一帶就立刻轉進 framebuffer。
- *
- * 實測（影片專案同一份韌體 A/B、各 2184 格）：
- *   轉色 19.91 -> 13.72 ms、解碼 3.66 -> 2.06 ms、跟不上 156 -> 0 次。 */
-#define MCU_ROW_BYTES   ((PHYS_W / 16u) * 384u)     /* 19200，只對 4:2:0 成立 */
-#define BAND_MCU_ROWS   2u
-#define BAND_BYTES      (BAND_MCU_ROWS * MCU_ROW_BYTES)
-
 typedef struct {
     uint32_t magic, count, width, height, fps_x100, max_size;
 } hdr_t;
@@ -70,17 +55,6 @@ static bool      g_open;
 static bool      g_active;           /* 回呼要不要轉交到這裡 */
 static bool      g_dma2d_ready;
 static uint32_t  g_count;
-
-/* 這塊在內部 SRAM。CPU 從頭到尾不碰它 —— JPEG DMA 寫、DMA2D 讀，
- * 兩者都繞過 D-Cache，所以不需要任何快取維護。 */
-static uint8_t g_band[BAND_BYTES] __attribute__((aligned(32)));
-
-static volatile uint32_t g_band_len;     /* 非 0 = 有一帶等著轉 */
-static volatile uint8_t  g_band_paused;
-static uint32_t          g_band_y;       /* 下一帶要寫到第幾條掃描線 */
-static uint8_t          *g_band_fb;
-static bool              g_banding;      /* 這一格走分帶 */
-static bool              g_band_ok;      /* 格式對得上 */
 
 static volatile uint8_t  g_done;     /* 0=進行中 1=完成 2=錯誤 */
 static volatile uint32_t g_out_total;
@@ -109,22 +83,9 @@ bool video_jpeg_active(void) { return g_active; }
 
 void video_jpeg_data_ready(void *hjpeg, uint8_t *pDataOut, uint32_t len)
 {
-    uint32_t end;
+    uint32_t end = (uint32_t)(pDataOut - VID_YCBCR) + len;
     uint32_t left;
 
-    /* 分帶模式：不在這裡轉色。轉一帶要幾百微秒，在中斷裡忙等會把 SysTick
-     * 押後、HAL_GetTick 漏拍。這裡只記長度並叫 HAL 暫停輸出，轉色交給主迴圈。
-     * 一定要 Pause —— 不暫停的話 HAL 會拿同一塊緩衝區重啟輸出 DMA，
-     * 在我們還沒轉完的時候就蓋掉它。 */
-    if (g_banding) {
-        g_band_len    = len;
-        (void)HAL_JPEG_Pause((JPEG_HandleTypeDef *)hjpeg,
-                             JPEG_PAUSE_RESUME_OUTPUT);
-        g_band_paused = 1u;
-        return;
-    }
-
-    end = (uint32_t)(pDataOut - VID_YCBCR) + len;
     /* 取最大值不累加：HAL 對同一批資料可能回呼兩次（board-notes 11.3）。 */
     if (end > g_out_total) {
         g_out_total = end;
@@ -319,41 +280,6 @@ static void dma2d_convert(uint8_t *dst, uint32_t w, uint32_t h)
     __DSB();
 }
 
-/* 轉一帶：從 SRAM 讀 YCbCr，寫進 framebuffer 對應的那幾條掃描線。 */
-static void dma2d_band(uint8_t *dst, const uint8_t *src, uint32_t lines)
-{
-    DMA2D->FGMAR = (uint32_t)src;
-    DMA2D->OMAR  = (uint32_t)dst;
-    DMA2D->NLR   = (PHYS_W << DMA2D_NLR_PL_Pos) | lines;
-    DMA2D->IFCR  = DMA2D_IFCR_CTCIF | DMA2D_IFCR_CTEIF | DMA2D_IFCR_CCEIF;
-    DMA2D->CR   |= DMA2D_CR_START;
-
-    while ((DMA2D->CR & DMA2D_CR_START) != 0u) { }
-    __DSB();
-}
-
-/* 把等著的那一帶轉掉。主迴圈呼叫，不在中斷裡。 */
-static void band_drain(void)
-{
-    uint32_t len = g_band_len;
-    uint32_t lines;
-    uint32_t c0;
-
-    if (len == 0u) {
-        return;
-    }
-    /* 只處理整條 MCU 列。餘數代表對不上預期的版面，寧可丟掉那一小段也不要
-     * 拿錯的行數去寫 framebuffer —— 寫超過就踩到隔壁那塊緩衝區。 */
-    lines = (len / MCU_ROW_BYTES) * 16u;
-    if (lines != 0u && (g_band_y + lines) <= PHYS_H) {
-        c0 = cyc_start();
-        dma2d_band(g_band_fb + (size_t)g_band_y * PHYS_W * 2u, g_band, lines);
-        g_vdbg_us_cc += cyc_us(c0);
-        g_band_y     += lines;
-    }
-    g_band_len = 0u;
-}
-
 /* ------------------------------------------------------------------ */
 /* 檔案                                                                */
 /* ------------------------------------------------------------------ */
@@ -490,7 +416,6 @@ bool video_decode(uint32_t idx, uint8_t *dst)
 {
     JPEG_ConfTypeDef info;
     uint32_t len = 0, first, c0;
-    uint32_t cc0;
 
     if (!g_active || idx >= g_count) {
         return false;
@@ -504,29 +429,17 @@ bool video_decode(uint32_t idx, uint8_t *dst)
     }
     g_vdbg_us_read += cyc_us(c0);
 
-    cc0 = g_vdbg_us_cc;   /* 分帶時轉色發生在解碼期間，最後要扣掉 */
     c0 = cyc_start();
     g_out_total = 0;
     g_in_ptr    = VID_FRAME;
     g_in_left   = len;
     g_done      = 0u;
 
-    /* 只有格式確定對得上才分帶：MCU_ROW_BYTES 是照 4:2:0、寬 800 算死的。
-     * 第一格 g_dma2d_ready 還是 false，一定走整塊路徑，順便量出格式。 */
-    g_banding = g_dma2d_ready && g_band_ok;
-    if (g_banding) {
-        g_band_len    = 0u;
-        g_band_paused = 0u;
-        g_band_y      = 0u;
-        g_band_fb     = dst;
-    }
-
     /* HAL 在啟動時是**捨去**（len - len%4）、續傳時是**進位**，兩邊規則
      * 不一致。這裡先進位，小影格就一次餵完不會有第二次啟動。 */
     first = (len > CHUNK) ? CHUNK : ((len + 3u) & ~3u);
     if (HAL_JPEG_Decode_DMA(&g_hjpeg, VID_FRAME, first,
-                            g_banding ? g_band : VID_YCBCR,
-                            g_banding ? BAND_BYTES : CHUNK) != HAL_OK) {
+                            VID_YCBCR, CHUNK) != HAL_OK) {
         g_vdbg_lasterr = -11;
         g_vdbg_fail++;
         return false;
@@ -535,31 +448,15 @@ bool video_decode(uint32_t idx, uint8_t *dst)
         uint32_t t0 = HAL_GetTick();
 
         while (g_done == 0u) {
-            /* 分帶：回呼填滿一帶就暫停輸出，主迴圈轉掉再餵回同一塊、恢復。
-             * 轉色因此跟解碼交錯，而 YCbCr 從頭到尾只存在於內部 SRAM。 */
-            if (g_banding && g_band_len != 0u) {
-                band_drain();
-                if (g_band_paused != 0u) {
-                    g_band_paused = 0u;
-                    HAL_JPEG_ConfigOutputBuffer(&g_hjpeg, g_band, BAND_BYTES);
-                    (void)HAL_JPEG_Resume(&g_hjpeg, JPEG_PAUSE_RESUME_OUTPUT);
-                }
-            }
             if ((HAL_GetTick() - t0) > 2000u) {
                 g_vdbg_lasterr = -12;
                 /* 啟動了非同步硬體的失敗路徑一定要收乾淨，否則週邊停在忙碌
                  * 狀態，之後每次解碼都拿到 HAL_BUSY（board-notes 16.3）。 */
                 (void)HAL_JPEG_Abort(&g_hjpeg);
-                g_banding = false;
                 g_vdbg_fail++;
                 return false;
             }
         }
-    }
-    /* 解碼結束時 HAL 還會回呼一次，最後一帶留在這裡等著轉。 */
-    if (g_banding) {
-        band_drain();
-        g_band_paused = 0u;
     }
 
     /* 每格之間完整重新初始化。這是結論不是實驗：連續 N 格之後
@@ -574,7 +471,7 @@ bool video_decode(uint32_t idx, uint8_t *dst)
         g_vdbg_fail++;
         return false;
     }
-    g_vdbg_us_dec += cyc_us(c0) - (g_vdbg_us_cc - cc0);
+    g_vdbg_us_dec += cyc_us(c0);
 
     c0 = cyc_start();
     /* 取樣格式第一格才知道，這時候設定 DMA2D。 */
@@ -590,14 +487,10 @@ bool video_decode(uint32_t idx, uint8_t *dst)
             g_vdbg_fail++;
             return false;
         }
-        g_band_ok = (info.ChromaSubsampling == JPEG_420_SUBSAMPLING) &&
-                    (info.ImageWidth == PHYS_W) && (info.ImageHeight == PHYS_H);
     }
     /* DMA2D 讀 YCbCr、寫 framebuffer 都繞過 D-Cache，不必先失效快取。 */
-    if (!g_banding) {
-        dma2d_convert(dst, PHYS_W, PHYS_H);
-        g_vdbg_us_cc += cyc_us(c0);
-    }
+    dma2d_convert(dst, PHYS_W, PHYS_H);
+    g_vdbg_us_cc += cyc_us(c0);
 
     g_vdbg_decoded++;
     return true;

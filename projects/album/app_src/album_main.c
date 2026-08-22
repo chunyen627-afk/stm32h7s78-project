@@ -673,6 +673,7 @@ static void build_order(void)
  * 因為使用者的相簿本來就有目錄結構，影片沒有這個需求。 */
 static video_info_t g_vids[MAX_VIDEOS];
 static uint32_t     g_vid_count;
+volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
 
 static bool ends_with_bin(const char *name)
 {
@@ -1138,6 +1139,13 @@ static bool select_screen(void)
         watchdog_feed();
         if (!sd_present()) {
             return false;               /* 卡片被拔掉，交回上層處理 */
+        }
+        /* 除錯旗標也要在這裡看：選單這個迴圈在等觸控時不會回到主迴圈，
+         * 只在主迴圈檢查的話，SWD 設旗標永遠不會生效。 */
+        if (g_dbg_autovideo && g_vid_count > 0u) {
+            play_video(&g_vids[0]);
+            dirty = true;
+            continue;
         }
         if (!screen_poll()) {
             /* 螢幕關著時不吃觸控，否則會在看不見的情況下改到設定。 */
@@ -1935,6 +1943,13 @@ void album_run(void)
                     continue;
                 }
                 first = false;
+                /* 除錯用：SWD 寫 g_dbg_autovideo 非 0 就直接播第一部影片。
+                 * 影片問題只能靠點螢幕重現，這個旗標讓遠端也追得動。
+                 * 不寫就完全等於不存在（board-notes 16.3 的旗標觸發原則）。 */
+                if (g_dbg_autovideo && g_vid_count > 0u) {
+                    play_video(&g_vids[0]);
+                    continue;
+                }
                 if (select_screen()) {
                     slideshow();
                 }
