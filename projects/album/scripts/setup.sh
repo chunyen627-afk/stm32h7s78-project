@@ -34,8 +34,8 @@ if [ ! -d "$PROJ" ]; then
 fi
 
 echo "==> 複製元件設定檔"
-cp "$BSPEX/gt911_conf.h" "$BSPEX/mx66uw1g45g_conf.h" "$BSPEX/aps256xx_conf.h" \\
-   "$PROJ/Appli/Inc/"
+# 不要用續行：本 repo 的腳本在工作目錄是 CRLF，行末的 \ 會被  接走而失效，而且這裡原本是 \（雙反斜線），連 LF 也不會生效。
+cp "$BSPEX/gt911_conf.h" "$BSPEX/mx66uw1g45g_conf.h" "$BSPEX/aps256xx_conf.h" "$PROJ/Appli/Inc/"
 
 echo "==> 複製 FatFs 設定與 SD 磁碟介面"
 # 只拿設定檔。ST 的 fatfs.c 不用——它的 MX_FATFS_Process 含 f_mkfs（格式化）

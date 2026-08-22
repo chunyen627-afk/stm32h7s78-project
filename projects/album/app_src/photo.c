@@ -190,9 +190,25 @@ volatile uint32_t g_dbg_maxfb;      /* 寫到的最大 framebuffer 索引 */
 volatile uint32_t g_dbg_maxscl;     /* sharpen 讀到的最大縮圖位移 */
 char              g_dbg_path[160];
 
+/* 影片模式會把這兩個回呼接走（見 photo.h 的說明）。沒註冊時完全等於不存在，
+ * 照片路徑的行為跟加這段之前逐位元組相同。 */
+static void (*g_jpeg_hook_ready)(void *, uint8_t *, uint32_t);
+static void (*g_jpeg_hook_get)(void *, uint32_t);
+
+void photo_set_jpeg_hooks(void (*ready)(void *, uint8_t *, uint32_t),
+                          void (*get)(void *, uint32_t))
+{
+    g_jpeg_hook_ready = ready;
+    g_jpeg_hook_get   = get;
+}
+
 void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *hjpeg, uint8_t *pDataOut,
                                 uint32_t OutDataLength)
 {
+    if (g_jpeg_hook_ready != NULL) {
+        g_jpeg_hook_ready(hjpeg, pDataOut, OutDataLength);
+        return;
+    }
     /* 只記錄長度，「不要」在這裡呼叫 HAL_JPEG_ConfigOutputBuffer()。
      *
      * 這裡踩過一個很難查的坑：原本為了防止輸出緩衝區填滿時 HAL 從頭覆蓋，
@@ -218,6 +234,10 @@ void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *hjpeg, uint8_t *pDataOut,
 
 void HAL_JPEG_GetDataCallback(JPEG_HandleTypeDef *hjpeg, uint32_t NbDecodedData)
 {
+    if (g_jpeg_hook_get != NULL) {
+        g_jpeg_hook_get(hjpeg, NbDecodedData);
+        return;
+    }
     if (NbDecodedData >= g_in_left) {
         g_in_left = 0;
         return;

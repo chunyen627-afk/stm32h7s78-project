@@ -19,6 +19,7 @@
 #include "jpeg_utils.h"
 #include "ff.h"
 #include "ff_gen_drv.h"
+#include "stm32h7rsxx_hal_dts.h"
 
 #include <stdbool.h>
 #include <string.h>
@@ -142,6 +143,61 @@ static uint32_t       g_in_cb;           /* 這格呼叫了幾次 GetDataCallbac
 static uint32_t       g_out_cb;
 
 static uint32_t g_next_ms;               /* 下一格該顯示的時刻 */
+
+/* ---- 晶片接面溫度 ------------------------------------------------
+ *
+ * 板子上沒有外接溫度感測器，但 MCU 內建 DTS。量到的是**晶片接面溫度**，
+ * 不是 PCB、PSRAM 或面板的溫度 —— 接面通常是全板最熱的地方，所以拿它
+ * 當上限指標是合理的。
+ *
+ * 連續播放時 CPU、JPEG、DMA2D、LTDC、XSPI 全都在動，值得盯著。
+ * 每 60 格量一次就夠，量測本身要等取樣完成，不要每格都做。 */
+static DTS_HandleTypeDef g_hdts;
+static bool              g_dts_ready;
+
+volatile int32_t  g_dbg_temp_c;          /* 目前接面溫度（攝氏） */
+volatile int32_t  g_dbg_temp_max;        /* 開機以來的最高值 */
+volatile uint32_t g_dbg_temp_n;          /* 量測次數，確認它真的有在跑 */
+
+static void dts_init(void)
+{
+    __HAL_RCC_DTS_CLK_ENABLE();
+
+    g_hdts.Instance           = DTS;
+    g_hdts.Init.QuickMeasure  = DTS_QUICKMEAS_DISABLE;  /* 要校正過的值 */
+    g_hdts.Init.RefClock      = DTS_REFCLKSEL_PCLK;
+    g_hdts.Init.TriggerInput  = DTS_TRIGGER_HW_NONE;    /* 軟體觸發就好 */
+    g_hdts.Init.SamplingTime  = DTS_SMP_TIME_15_CYCLE;
+    g_hdts.Init.Divider       = 0;
+    g_hdts.Init.HighThreshold = 0;
+    g_hdts.Init.LowThreshold  = 0;
+
+    if (HAL_DTS_Init(&g_hdts) != HAL_OK) {
+        return;
+    }
+    if (HAL_DTS_Start(&g_hdts) != HAL_OK) {
+        return;
+    }
+    g_dts_ready = true;
+    g_dbg_temp_max = -100;
+}
+
+static void dts_sample(void)
+{
+    int32_t t;
+
+    if (!g_dts_ready) {
+        return;
+    }
+    if (HAL_DTS_GetTemperature(&g_hdts, &t) != HAL_OK) {
+        return;
+    }
+    g_dbg_temp_c = t;
+    if (t > g_dbg_temp_max) {
+        g_dbg_temp_max = t;
+    }
+    g_dbg_temp_n++;
+}
 
 static inline uint32_t cyc_start(void) { return DWT->CYCCNT; }
 static inline uint32_t cyc_us(uint32_t t0)
@@ -671,6 +727,7 @@ void video_run(void)
         for (;;) { }
     }
     JPEG_InitColorTables();
+    dts_init();
 
     /* 先試 SD，沒有就退回 Flash。 */
     g_dbg_stage = 2;
@@ -804,6 +861,7 @@ void video_run(void)
             if (ms > 0u) {
                 g_dbg_fps_x100 = (g_dbg_nframe * 100000u) / ms;
             }
+            dts_sample();
         }
         idx = (idx + 1u) % g_hdr.count;
     }

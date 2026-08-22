@@ -29,7 +29,7 @@ SRC = "PARENT-2-PROJECT_LOC"
 
 # 沒有這些模組，BSP 的 LCD/觸控/PSRAM/SD 都編不過。
 HAL_MODULES = ["LTDC", "I2C", "DMA2D", "XSPI", "LPTIM", "SDRAM",
-               "GFXTIM", "RAMCFG", "MDF", "CRC", "SD", "JPEG", "IWDG"]
+               "GFXTIM", "RAMCFG", "MDF", "CRC", "SD", "JPEG", "IWDG", "DTS"]
 
 HAL_SOURCES = [
     "stm32h7rsxx_hal_ltdc.c", "stm32h7rsxx_hal_ltdc_ex.c",
@@ -40,6 +40,8 @@ HAL_SOURCES = [
     # SD 卡：長片放不進 128MB 的外部 Flash，影格要從卡上讀。
     "stm32h7rsxx_hal_sd.c", "stm32h7rsxx_hal_sd_ex.c",
     "stm32h7rsxx_ll_sdmmc.c",
+    # 晶片接面溫度。板子沒有外接溫度感測器，連續播放時值得盯著。
+    "stm32h7rsxx_hal_dts.c",
 ]
 
 BSP_SOURCES = [

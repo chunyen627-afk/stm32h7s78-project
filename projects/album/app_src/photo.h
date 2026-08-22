@@ -19,6 +19,18 @@ typedef enum {
  * 回傳 true 就立刻放棄並回 PHOTO_ABORTED。 */
 void photo_set_abort_check(bool (*fn)(void));
 
+/* 把 JPEG 回呼轉交給別人。
+ *
+ * HAL_JPEG_*Callback 是全域符號，整個韌體只能有一份定義。照片走輪詢解碼、
+ * 影片走 DMA 分塊解碼，兩者需要的回呼行為完全不同 —— 影片模式開始時註冊
+ * 自己的處理函式，離開時傳 NULL 還原。
+ *
+ * 用函式指標而不是直接呼叫 video.c：PC 測試台是直接 #include photo.c 的
+ * （見 board-notes 15.1），多一個外部符號就連結不起來。
+ * 這也跟上面的 photo_set_abort_check() 是同一個模式。 */
+void photo_set_jpeg_hooks(void (*ready)(void *hjpeg, uint8_t *out, uint32_t len),
+                          void (*get)(void *hjpeg, uint32_t nb_decoded));
+
 /* 顯示方向。
  *
  * 面板實體 800x480，預設把邏輯 480x800 的直立畫布轉上去。切成橫向時畫布

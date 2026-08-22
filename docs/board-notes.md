@@ -699,6 +699,24 @@ GPIOG15 拉高（不用亮度調節的話維持一般輸出即可）。
   `No rule to make target`—— 這訊息**不含 error 字樣**，輸出過濾若只抓
   error/warning 會把失敗顯示成成功。把 Debug/ 刪掉重新產生，不要用 sed
   改（`grep -rl` 會把 .o 檔也列進去改壞）。
+- **行末的 `\` 會讓整條指令悄悄變成別的東西**。本 repo 的腳本在工作目錄是
+  CRLF，行末的 `\` 會被 `` 接走而失去續行作用；而 album 的 `setup.sh` 與
+  `build.sh` 裡原本是 **`\`（雙反斜線）**，那連 LF 也不會生效 —— bash 會把它
+  當成「一個字面反斜線引數」，下一行變成獨立指令。
+
+  後果非常難查：`build.sh` 的 CubeIDE 指令因此**在沒有 `-build` 參數的情況下
+  啟動**，IDE 匯入完專案就一直掛著，不編譯也不結束。症狀是「編譯永遠不會
+  回來」，而且看起來像 13.2 那個 workspace 復原掃描，我因此往錯的方向查了
+  很久（還去刪 workspace 的 .lock，反而把事情弄得更糟）。
+
+  **教訓：腳本「沒有輸出」跟「卡住」要先確認實際執行的指令長什麼樣。**
+  把 grep 拿掉直接看完整輸出，一次就看到 `Project: Album_Appli already exists
+  in the workspace!` 與 `Java was started but returned exit code=1`。
+  多行指令在 CRLF 的 repo 裡就不要用續行，併成一行最安全。
+- **headless 的 workspace 要跟 GUI 的分開**。共用會互相留下 `.lock` 與未存檔
+  狀態；而且 `-import` 撞到已存在的專案會直接中止（`already exists in the
+  workspace!`），只給 `-build` 又會說 `doesn't appear to be a CDT project`。
+  用一個專屬的 workspace 目錄，兩個問題一起消失。
 - **CubeIDE headless 被強制中止後**，workspace 留下 .lock 與未儲存狀態，
   下一次啟動會卡在復原掃描很久。能用 make 就用 make。
 

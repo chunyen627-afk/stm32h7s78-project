@@ -20,9 +20,11 @@
 
 #include "gfx.h"
 #include "photo.h"
+#include "video.h"
 
 #include <string.h>
 #include <stdbool.h>
+#include <stdio.h>
 
 extern const Diskio_drvTypeDef SD_BSP_Driver;
 
@@ -232,6 +234,10 @@ static void rnd_mix(uint32_t v);      /* 定義在下面的亂數區塊 */
 static void watchdog_feed(void);      /* 定義在下面的記憶卡狀態區塊 */
 static bool sd_present(void);
 static void show_scan_progress(void);
+static bool screen_poll(void);
+static void show_message(const char *line1, const char *line2);
+static void draw_name_clipped(int x, int y, const char *s, int limit,
+                              uint16_t color);
 
 /* 觸控座標換成直立座標。
  * gfx 把邏輯 (x,y) 映到實體 offset (GFX_W-1-x)*PHYS_W + y，
@@ -655,6 +661,314 @@ static void build_order(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* 影片                                                                */
+/* ------------------------------------------------------------------ */
+
+#define MAX_VIDEOS      16U
+
+/* 影片清單只掃根目錄。
+ *
+ * 影格包動輒上百 MB，放根目錄是自然的擺法；而遞迴掃描每個 .bin 都要開檔
+ * 讀檔頭，深層目錄裡如果有一堆無關的 .bin 會拖很久。照片那邊需要遞迴是
+ * 因為使用者的相簿本來就有目錄結構，影片沒有這個需求。 */
+static video_info_t g_vids[MAX_VIDEOS];
+static uint32_t     g_vid_count;
+
+static bool ends_with_bin(const char *name)
+{
+    size_t n = strlen(name);
+
+    if (n < 5u) {
+        return false;
+    }
+    return (name[n - 4] == '.') &&
+           (name[n - 3] == 'b' || name[n - 3] == 'B') &&
+           (name[n - 2] == 'i' || name[n - 2] == 'I') &&
+           (name[n - 1] == 'n' || name[n - 1] == 'N');
+}
+
+static void scan_videos(void)
+{
+    DIR     dir;
+    FILINFO fno;
+
+    g_vid_count = 0;
+    if (f_opendir(&dir, "0:") != FR_OK) {
+        return;
+    }
+    while (g_vid_count < MAX_VIDEOS) {
+        if (f_readdir(&dir, &fno) != FR_OK || fno.fname[0] == 0) {
+            break;
+        }
+        if ((fno.fattrib & AM_DIR) || !ends_with_bin(fno.fname)) {
+            continue;
+        }
+        watchdog_feed();
+
+        {
+            video_info_t *v = &g_vids[g_vid_count];
+            size_t        n = strlen(fno.fname);
+
+            /* 名字太長就跳過，不要讓 snprintf 默默截斷 —— 截斷後的路徑會
+             * 指到別的檔案或根本開不起來，症狀比「這部影片沒出現」難查得多。 */
+            if ((n + 4u) > VIDEO_PATH_MAX || (n + 1u) > VIDEO_NAME_MAX) {
+                continue;
+            }
+            /* 路徑要自己組："0:" 加斜線加檔名。 */
+            memcpy(v->path, "0:/", 3u);
+            memcpy(v->path + 3, fno.fname, n + 1u);
+            /* video_probe 只讀 24 bytes 的檔頭，不是有效的影格包就跳過 ——
+             * 卡上可能有各種無關的 .bin。 */
+            if (!video_probe(v->path, v)) {
+                continue;
+            }
+            /* 長度上面已經檢查過，memcpy 比 snprintf 直接（也不會讓
+             * 編譯器因為推不出上界而一直警告可能截斷）。 */
+            memcpy(v->name, fno.fname, n + 1u);
+            g_vid_count++;
+        }
+    }
+    (void)f_closedir(&dir);
+}
+
+/* ---- 播放中的疊加層 ---------------------------------------------- */
+
+#define OV_MS        3000U     /* 觸碰後疊加層顯示多久 */
+#define PB_X         40
+#define PB_W         400
+#define PB_Y         700
+#define PB_H         14
+#define PB_HIT       60        /* 進度條上下各留這麼多的觸控範圍 */
+#define BACK_X       20
+#define BACK_Y       36
+#define BACK_W       120
+#define BACK_H       56
+
+static void draw_time(int x, int y, uint32_t secs, uint16_t col)
+{
+    gfx_number(x, y, secs / 60u, col);
+    gfx_text(x + (secs / 60u >= 10u ? 24 : 12), y, ":", col);
+    {
+        uint32_t s = secs % 60u;
+        int      tx = x + (secs / 60u >= 10u ? 34 : 22);
+
+        if (s < 10u) {
+            gfx_number(tx, y, 0, col);
+            gfx_number(tx + 12, y, s, col);
+        } else {
+            gfx_number(tx, y, s, col);
+        }
+    }
+}
+
+/* 疊加層每格都要重畫 —— DMA2D 轉色會把整個 framebuffer 蓋掉。
+ * 所以只在使用者剛碰過螢幕的幾秒內畫，平常不花這個成本。 */
+static void draw_overlay(const video_info_t *v, uint32_t idx, bool paused)
+{
+    uint32_t done_w = (uint32_t)PB_W * idx / (v->count ? v->count : 1u);
+    uint32_t fps100 = v->fps_x100 ? v->fps_x100 : 2400u;
+
+    gfx_pill(BACK_X, BACK_Y, BACK_W, BACK_H, COL_PANEL);
+    gfx_text_center(BACK_X + BACK_W / 2, BACK_Y + 16, "返回", COL_TEXT);
+
+    if (paused) {
+        gfx_pill(GFX_W - 140, BACK_Y, BACK_W, BACK_H, COL_PANEL);
+        gfx_text_center(GFX_W - 140 + BACK_W / 2, BACK_Y + 16, "暫停", COL_ACCENT);
+    }
+
+    /* 進度條：底槽 + 已播進度 + 目前位置的把手。 */
+    gfx_fill_rect(PB_X, PB_Y, PB_W, PB_H, COL_LINE);
+    if (done_w) {
+        gfx_fill_rect(PB_X, PB_Y, (int)done_w, PB_H, COL_ACCENT);
+    }
+    gfx_fill_rect(PB_X + (int)done_w - 3, PB_Y - 8, 6, PB_H + 16, COL_TEXT);
+
+    draw_time(PB_X, PB_Y + 30, (uint32_t)((uint64_t)idx * 100u / fps100),
+              COL_TEXT);
+    draw_time(PB_X + PB_W - 60, PB_Y + 30,
+              (uint32_t)((uint64_t)v->count * 100u / fps100), COL_DIM);
+}
+
+/* 播放一部影片，無限循環，直到使用者按返回或卡片被拔掉。 */
+static void play_video(const video_info_t *v)
+{
+    uint32_t idx = 0, next_ms, acc = 0;
+    uint32_t frame_us, frame_ms, frame_frac;
+    uint32_t ov_until = 0;
+    bool     paused = false;
+
+    if (!video_open(v)) {
+        show_message("影片開啟失敗", v->name);
+        nap(1500);
+        return;
+    }
+
+    /* 疊加層用直立座標畫，跟選單一致 —— 影格本身已經在 PC 上轉成
+     * 「直立看正確」的方向，所以兩者的上下左右是同一套。 */
+    gfx_set_orientation(false);
+
+    frame_us   = 100000000u / (v->fps_x100 ? v->fps_x100 : 2400u);
+    frame_ms   = frame_us / 1000u;
+    frame_frac = frame_us % 1000u;
+    next_ms    = HAL_GetTick();
+
+    for (;;) {
+        int  x, y;
+        bool touched;
+
+        watchdog_feed();
+        if (!sd_present()) {
+            break;
+        }
+
+        if (!paused) {
+            uint8_t *back = (uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR);
+
+            if (video_decode(idx, back)) {
+                if (HAL_GetTick() < ov_until) {
+                    draw_overlay(v, idx, false);
+                }
+                present();
+            }
+            idx = (idx + 1u) % v->count;      /* 無限循環 */
+        }
+
+        touched = read_touch(&x, &y);
+        if (touched) {
+            if (HAL_GetTick() >= ov_until) {
+                /* 第一次碰只叫出疊加層，不會誤觸到底下的按鈕。 */
+                ov_until = HAL_GetTick() + OV_MS;
+            } else if (x >= BACK_X && x < BACK_X + BACK_W &&
+                       y >= BACK_Y && y < BACK_Y + BACK_H) {
+                wait_release();
+                break;
+            } else if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
+                /* 拖曳 seek。位移表讓任何一格都能直接定址，成本跟播下一格
+                 * 一模一樣 —— 這是打包成單一檔案順帶換到的好處。 */
+                int px = x - PB_X;
+
+                if (px < 0) { px = 0; }
+                if (px > PB_W) { px = PB_W; }
+                idx = (uint32_t)((uint64_t)px * v->count / PB_W);
+                if (idx >= v->count) { idx = v->count - 1u; }
+                ov_until = HAL_GetTick() + OV_MS;
+                next_ms  = HAL_GetTick();     /* 跳完重新對時 */
+                acc      = 0;
+            } else {
+                paused   = !paused;
+                ov_until = HAL_GetTick() + OV_MS;
+                wait_release();
+            }
+        }
+
+        if (paused) {
+            /* 暫停時仍要重畫，否則疊加層倒數結束後畫面不會更新。 */
+            uint8_t *back = (uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR);
+
+            if (video_decode(idx, back)) {
+                if (HAL_GetTick() < ov_until) {
+                    draw_overlay(v, idx, true);
+                }
+                present();
+            }
+            nap(60);
+            next_ms = HAL_GetTick();
+            continue;
+        }
+
+        /* 按素材的節奏放。小數毫秒累積到 1ms 就補一格，否則 24fps 的
+         * 41.67ms 無論取 41 還是 42 都會慢慢漂掉。 */
+        next_ms += frame_ms;
+        acc     += frame_frac;
+        if (acc >= 1000u) {
+            acc -= 1000u;
+            next_ms += 1u;
+        }
+        if ((int32_t)(next_ms - HAL_GetTick()) > 0) {
+            while ((int32_t)(next_ms - HAL_GetTick()) > 0) { }
+        } else {
+            next_ms = HAL_GetTick();          /* 跟不上就重新對時 */
+        }
+    }
+
+    /* **一定要走這裡。** DMA 解碼整合進相簿正式路徑曾經把週邊弄壞
+     * （board-notes 16.6），video_close() 會做完整拆除並把解碼器還給照片。 */
+    video_close();
+}
+
+/* 影片清單。沒有影片時不會走到這裡（選單上的按鈕會是暗的）。 */
+#define VROW_Y0      140
+#define VROW_H       64
+
+static void draw_video_list(void)
+{
+    gfx_set_orientation(false);
+    gfx_clear(COL_BG);
+    gfx_text_center(GFX_W / 2, 60, "選擇影片", COL_TEXT);
+
+    for (uint32_t i = 0; i < g_vid_count; i++) {
+        int y = VROW_Y0 + (int)i * VROW_H;
+
+        gfx_pill(20, y, GFX_W - 40, VROW_H - 10, COL_PANEL);
+        draw_name_clipped(38, y + 18, g_vids[i].name, GFX_W - 150, COL_TEXT);
+        {
+            uint32_t fps100 = g_vids[i].fps_x100 ? g_vids[i].fps_x100 : 2400u;
+
+            draw_time(GFX_W - 100, y + 18,
+                      (uint32_t)((uint64_t)g_vids[i].count * 100u / fps100),
+                      COL_DIM);
+        }
+    }
+    gfx_pill(16, 720, GFX_W - 32, 62, COL_PANEL);
+    gfx_text_center(GFX_W / 2, 732, "返回", COL_TEXT);
+}
+
+static void video_list_screen(void)
+{
+    bool dirty = true;
+
+    for (;;) {
+        int x, y;
+
+        if (dirty) {
+            for (int i = 0; i < 2; i++) {     /* 兩塊都要畫 */
+                draw_video_list();
+                present();
+            }
+            dirty = false;
+        }
+        watchdog_feed();
+        if (!sd_present()) {
+            return;
+        }
+        if (!screen_poll()) {
+            nap(30);
+            continue;
+        }
+        if (!read_touch(&x, &y)) {
+            nap(15);
+            continue;
+        }
+        (void)x;
+        if (y >= 720 && y < 782) {
+            wait_release();
+            return;
+        }
+        if (y >= VROW_Y0) {
+            uint32_t i = (uint32_t)(y - VROW_Y0) / VROW_H;
+
+            if (i < g_vid_count) {
+                wait_release();
+                play_video(&g_vids[i]);
+                dirty = true;
+                continue;
+            }
+        }
+        wait_release();
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* 選擇畫面                                                            */
 /* ------------------------------------------------------------------ */
 
@@ -677,6 +991,10 @@ static void build_order(void)
 #define IV_GAP       10
 #define BTN_GO_Y     720
 #define BTN_GO_H     62
+/* 有影片時底下那列拆成「開始播放」＋「影片」兩顆。 */
+#define BTN_GO_W     280
+#define BTN_VID_X    304
+#define BTN_VID_W    160
 
 static const char *const ORIENT_NAME[PHOTO_ORIENT_COUNT] = {
     "直立", "橫向", "自動"
@@ -770,15 +1088,27 @@ static void draw_select_screen(void)
     }
 
     {
-        uint32_t n = selected_photo_count();
-        gfx_pill(16, BTN_GO_Y, GFX_W - 32, BTN_GO_H,
-                 n ? COL_ACCENT : COL_PANEL);
+        uint32_t n  = selected_photo_count();
+        /* 卡上有影格包時，底下那一列拆成兩顆按鈕。沒有影片就維持原樣佔滿
+         * 整列 —— 大部分使用者不會放影片，不該為此犧牲照片按鈕的寬度。 */
+        int      gw = g_vid_count ? BTN_GO_W : (GFX_W - 32);
+
+        gfx_pill(16, BTN_GO_Y, gw, BTN_GO_H, n ? COL_ACCENT : COL_PANEL);
         if (n) {
-            gfx_text_center(GFX_W / 2, BTN_GO_Y + 12, "開始播放", COL_BG);
-            gfx_number_right(GFX_W - 40, BTN_GO_Y + 12, n, COL_BG);
+            gfx_text_center(16 + gw / 2, BTN_GO_Y + 12, "開始播放", COL_BG);
+            if (!g_vid_count) {
+                gfx_number_right(GFX_W - 40, BTN_GO_Y + 12, n, COL_BG);
+            }
         } else {
-            gfx_text_center(GFX_W / 2, BTN_GO_Y + 20,
-                            "沒有選取任何資料夾", COL_DIM);
+            gfx_text_center(16 + gw / 2, BTN_GO_Y + 20,
+                            g_vid_count ? "無照片" : "沒有選取任何資料夾",
+                            COL_DIM);
+        }
+
+        if (g_vid_count) {
+            gfx_pill(BTN_VID_X, BTN_GO_Y, BTN_VID_W, BTN_GO_H, COL_PANEL);
+            gfx_text_center(BTN_VID_X + BTN_VID_W / 2, BTN_GO_Y + 12,
+                            "影片", COL_ACCENT);
         }
     }
 }
@@ -854,7 +1184,14 @@ static bool select_screen(void)
                 }
             }
         } else if (y >= BTN_GO_Y && y < BTN_GO_Y + BTN_GO_H) {
-            if (selected_photo_count() > 0U) {
+            if (g_vid_count && x >= BTN_VID_X && x < BTN_VID_X + BTN_VID_W) {
+                wait_release();
+                video_list_screen();
+                dirty = true;
+                continue;
+            }
+            if ((!g_vid_count || x < BTN_GO_W + 16) &&
+                selected_photo_count() > 0U) {
                 build_order();
                 wait_release();
                 return true;
@@ -1340,7 +1677,13 @@ static bool mount_and_scan(void)
     scan(0);
     watchdog_feed();
 
-    if (g_photo_count == 0U) {
+    /* 影片只掃根目錄，很快。放在照片掃描之後，這樣選單畫出來時就知道
+     * 要不要顯示「影片」按鈕。 */
+    scan_videos();
+    watchdog_feed();
+
+    /* 只有影片沒有照片也算可用 —— 使用者可能就是拿它當影片播放器。 */
+    if (g_photo_count == 0U && g_vid_count == 0U) {
         show_message("卡片裡沒有找到照片", "支援 jpg 與 jpeg");
         return false;
     }

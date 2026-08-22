@@ -33,12 +33,13 @@ fi
 echo "==> 首次編譯（CubeIDE headless，順便產生 makefile）"
 # 注意：-data 與 -import 必須用 Windows 反斜線路徑，
 # 否則 Eclipse 會把磁碟機代號當成 URI scheme 而失敗。
-WS="${ALBUM_WS:-C:/STM32CubeIDE/workspace_2.0.0}"
+# headless 用自己的工作區，不要跟 GUI 的共用。
+# 共用的話兩邊會互相留下 .lock 與未存檔狀態，下一次啟動卡在
+# 「refreshing workspace to recover changes」很久，或是 -import 直接
+# 撞上「already exists in the workspace!」而中止（board-notes 13.2）。
+WS="${ALBUM_WS:-C:/STM32CubeIDE/ws_headless_album}"
 WSPATH=$(cygpath -w "$WS" 2>/dev/null || echo "$WS")
 IMPORT=$(cygpath -w "$PROJ/STM32CubeIDE/Appli" 2>/dev/null || echo "$PROJ\STM32CubeIDE\Appli")
 
-"$IDE" --launcher.suppressErrors -nosplash \\
-    -application org.eclipse.cdt.managedbuilder.core.headlessbuild \\
-    -data "$WSPATH" -import "$IMPORT" \\
-    -build 'Album_Appli/Debug' 2>&1 |\
-    grep -iE "error|warning|Build Finished|Build Failed|^ +[0-9]+ +[0-9]+" || true
+# 併成一行：本 repo 的腳本在工作目錄是 CRLF，行末的 \ 會被  接走，而且這裡原本是 \（雙反斜線）。續行失效的話 CubeIDE 會在**沒有 -build 參數**下啟動，匯入完就一直掛著不編譯也不結束 —— 症狀是「編譯永遠不會回來」。
+"$IDE" --launcher.suppressErrors -nosplash -application org.eclipse.cdt.managedbuilder.core.headlessbuild -data "$WSPATH" -import "$IMPORT" -build 'Album_Appli/Debug' 2>&1 | grep -iE "error|warning|Build Finished|Build Failed|^ +[0-9]+ +[0-9]+" || true
