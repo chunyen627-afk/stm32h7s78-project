@@ -1417,17 +1417,25 @@ static void flash_orient(void)
 #define OV_ORIENT_X  ((int)GFX_W / 2 - OV_PILL_W / 2)
 #define OV_PAUSE_X   ((int)GFX_W - 20 - OV_PILL_W)
 
-/* 下方只剩張數，沒有拉桿。
+/* 拉桿與翻書手勢是**互補**的，不是二選一：
  *
- * 原本照影片放了一條可拖曳的拉桿，但翻頁改成整片畫面都能拉之後它就只剩
- * 裝飾 —— 而且是會誤導人的裝飾（看起來可以拖，實際上跟旁邊沒兩樣）。
- * 張數留著：四千多張的時候，知道自己在哪還是有用的。 */
-#define OV_BOT_Y     712
-#define OV_BOT_H     40
+ *   拉桿（下方那一帶）  粗調 —— 一下跳到大概的位置
+ *   整片畫面左右拉      微調 —— 前一張／後一張
+ *
+ * 幾何沿用影片疊加層的常數，兩邊看起來才是同一套介面。 */
+#define PB_X         40
+#define PB_W         400
+#define PB_Y         700
+#define PB_H         14
+#define PB_HIT       60
+#define OV_BOT_Y     (PB_Y - 16)
+#define OV_BOT_H     96
 
+#define PAUSE_SEEK   5           /* 拉桿區域，拖曳定位 */
 #define SEEK_MIN_DX  50          /* 水平拉多少才算翻頁 */
 
 static uint32_t g_ov_index;      /* 疊加層要顯示的張數（由 pause_session 給） */
+static uint32_t g_seek_target;   /* 拖曳拉桿結束時停在哪一張 */
 
 /* 剛恢復播放的時刻。恢復之後短時間內不理會觸控 —— 否則同一次觸碰
  * （或放開瞬間的彈跳）會立刻又被播放迴圈判成「暫停」，症狀是
@@ -1461,22 +1469,27 @@ static void ctl_backup(bool restore)
     (void)strip_backup(OV_BOT_Y, OV_BOT_H, sv, restore);
 }
 
-/* 下方的張數指示。 */
-static void ov_draw_count(uint32_t idx)
+/* 只重畫下方的拉桿。拖曳時每十毫秒就要更新一次，不能整個疊加層重畫。 */
+static void ov_draw_bar(uint32_t idx)
 {
     uint16_t *back   = gfx_framebuffer();
     uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
     bool      was_ls = gfx_is_landscape();
     uint32_t  total  = g_order_count ? g_order_count : 1u;
-    int       cx     = (int)GFX_W / 2;
+    uint32_t  done_w = (uint32_t)PB_W * idx / total;
 
     gfx_set_orientation(false);
     gfx_set_framebuffer(front);
 
     gfx_fill_rect(0, OV_BOT_Y, (int)GFX_W, OV_BOT_H, COL_BG);
-    gfx_number_right(cx - 8, OV_BOT_Y + 8, idx + 1u, COL_TEXT);
-    gfx_text_center(cx, OV_BOT_Y + 8, "/", COL_DIM);
-    gfx_number(cx + 12, OV_BOT_Y + 8, total, COL_DIM);
+    gfx_fill_rect(PB_X, PB_Y, PB_W, PB_H, COL_LINE);
+    if (done_w != 0u) {
+        gfx_fill_rect(PB_X, PB_Y, (int)done_w, PB_H, COL_ACCENT);
+    }
+    gfx_fill_rect(PB_X + (int)done_w - 3, PB_Y - 8, 6, PB_H + 16, COL_TEXT);
+
+    gfx_number(PB_X, PB_Y + 30, idx + 1u, COL_TEXT);
+    gfx_number_right(PB_X + PB_W, PB_Y + 30, total, COL_DIM);
 
     gfx_set_framebuffer(back);
     gfx_set_orientation(was_ls);
@@ -1506,7 +1519,7 @@ static void ctl_draw(void)
     gfx_set_framebuffer(back);
     gfx_set_orientation(was_ls);
 
-    ov_draw_count(g_ov_index);
+    ov_draw_bar(g_ov_index);
 }
 
 /* 回傳動作代碼；-1 = 疊加層以外（＝繼續播放）。
@@ -1520,6 +1533,9 @@ static int ctl_hit(int x, int y)
         if (x >= OV_ORIENT_X && x < OV_ORIENT_X + OV_PILL_W) {
             return PAUSE_ROTATE;
         }
+    }
+    if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
+        return PAUSE_SEEK;
     }
     return -1;
 }
@@ -1676,6 +1692,41 @@ static int paused_loop_inner(void)
             g_dbg_ty  = y0;
             g_dbg_hit = hit;
 
+            if (hit == PAUSE_SEEK) {
+                /* 拖曳定位。手指還在畫面上時只更新把手與張數（很便宜），
+                 * 放開才真的去解那一張 —— 每張要 1.5 秒，邊拖邊解會卡死。
+                 *
+                 * 一個像素約等於十張（4254 張攤在 400px 上），所以這是
+                 * 粗調；要精準前後一張請用整片畫面的左右拉。 */
+                uint32_t total = g_order_count ? g_order_count : 1u;
+                uint32_t tgt   = g_ov_index;
+                uint32_t seen  = HAL_GetTick();
+                int      lastx = x0, x, y, px;
+
+                for (;;) {
+                    watchdog_feed();
+                    if (read_touch(&x, &y)) {
+                        lastx = x;
+                        seen  = HAL_GetTick();
+                    } else if ((HAL_GetTick() - seen) > SWIPE_GAP_MS) {
+                        break;              /* 真的放開了 */
+                    }
+                    px = lastx - PB_X;
+                    if (px < 0)    { px = 0; }
+                    if (px > PB_W) { px = PB_W; }
+                    tgt = (uint32_t)(((uint64_t)px * total) / PB_W);
+                    if (tgt >= total) { tgt = total - 1u; }
+                    if (tgt != g_ov_index) {
+                        g_ov_index = tgt;
+                        ov_draw_bar(tgt);
+                    }
+                    nap(10);
+                }
+                g_seek_target     = tgt;
+                g_dbg_last_action = PAUSE_SEEK;
+                return PAUSE_SEEK;
+            }
+
             if (hit >= 0) {
                 /* 按下就回報，不等手指離開。切方向要留在暫停，
                  * 讓使用者當場看到結果。 */
@@ -1802,6 +1853,19 @@ static int pause_session(int32_t *cur)
         if (a == PAUSE_RESUME) {
             g_resume_ms = HAL_GetTick();
             return 0;
+        }
+        if (a == PAUSE_SEEK) {
+            /* 放開才解那一張。停在暫停，讓使用者可以接著再拖或翻頁。 */
+            uint32_t t = g_seek_target;
+
+            if (t < g_order_count &&
+                photo_show(PLAYLIST_BASE + g_order[t] * PATH_MAX)
+                    == PHOTO_OK) {
+                present();
+                *cur = (int32_t)t;
+                g_decode_ok++;
+            }
+            continue;
         }
 
         if (a == PAUSE_ROTATE) {
