@@ -1426,10 +1426,10 @@ static void flash_orient(void)
 #define OV_BOT_Y     (PB_Y - 16)
 #define OV_BOT_H     96
 
-#define PAUSE_SEEK   5           /* 拖曳拉桿翻頁 */
+#define PAUSE_SEEK   5           /* 拉桿區域（內部用，不會回報出去） */
+#define SEEK_MIN_DX  50          /* 拉多少才算數 */
 
 static uint32_t g_ov_index;      /* 疊加層要顯示的張數（由 pause_session 給） */
-static uint32_t g_seek_target;   /* 拖曳結束時停在哪一張 */
 
 /* 剛恢復播放的時刻。恢復之後短時間內不理會觸控 —— 否則同一次觸碰
  * （或放開瞬間的彈跳）會立刻又被播放迴圈判成「暫停」，症狀是
@@ -1629,13 +1629,16 @@ static int paused_loop_inner(void)
         if (read_touch(&x0, &y0)) {
             int hit;
 
-            /* 收起來的時候點一下只是把它叫回來，不會直接觸發動作 ——
-             * 否則使用者看不到按鈕在哪就先按到東西（影片也是這樣）。 */
+            /* 疊加層收起來之後，點一下就是繼續播放。
+             *
+             * 原本是「先把疊加層叫回來」（照影片那套），但暫停中的疊加層
+             * 三秒就收起，使用者等一下再點就一定要點兩下才播得起來 ——
+             * 回報的「要慢點兩下」正是這個。點一下切換播放/暫停優先。 */
             if (!g_ov_shown) {
-                ov_show();
-                ov_until = HAL_GetTick() + OV_MS;
                 wait_release();
-                continue;
+                g_paused          = 0u;
+                g_dbg_last_action = PAUSE_RESUME;
+                return PAUSE_RESUME;
             }
             ov_until = HAL_GetTick() + OV_MS;   /* 有互動就延長 */
             hit = ctl_hit(x0, y0);
@@ -1646,36 +1649,45 @@ static int paused_loop_inner(void)
             g_dbg_hit = hit;
 
             if (hit == PAUSE_SEEK) {
-                /* 拖曳翻頁。手指還在畫面上時只更新拉桿與張數（很便宜），
-                 * 放開才真的去解那一張 —— 每張要 1.5 秒，邊拖邊解會卡死。 */
-                uint32_t total = g_order_count ? g_order_count : 1u;
-                uint32_t tgt   = g_ov_index;
-                uint32_t seen  = HAL_GetTick();
-                int      lastx = x0;
-                int      x, y, px;
+                /* 拉桿改成**相對手勢**：往左拉＝上一張、往右拉＝下一張。
+                 *
+                 * 不做「拖到哪就是第幾張」的絕對定位 —— 四千多張照片攤在
+                 * 400px 上，一個像素就是十張，手指根本停不到想要的那張；
+                 * 而且每張要解 1.5 秒，絕對定位很容易一路解過去。
+                 *
+                 * 取整段過程中的**最大位移**而不是放開瞬間的位置，並容忍
+                 * 中途漏報 —— 快速滑動時控制器會掉幾筆座標
+                 * （board-notes 14.7）。 */
+                uint32_t seen = HAL_GetTick();
+                int      dx = 0, x, y;
 
                 for (;;) {
                     watchdog_feed();
                     if (read_touch(&x, &y)) {
-                        lastx = x;
-                        seen  = HAL_GetTick();
+                        int d = x - x0;
+
+                        if (((d < 0) ? -d : d) > ((dx < 0) ? -dx : dx)) {
+                            dx = d;
+                        }
+                        seen = HAL_GetTick();
                     } else if ((HAL_GetTick() - seen) > SWIPE_GAP_MS) {
-                        break;          /* 真的放開了 */
-                    }
-                    px = lastx - PB_X;
-                    if (px < 0)    { px = 0; }
-                    if (px > PB_W) { px = PB_W; }
-                    tgt = (uint32_t)(((uint64_t)px * total) / PB_W);
-                    if (tgt >= total) { tgt = total - 1u; }
-                    if (tgt != g_ov_index) {
-                        g_ov_index = tgt;
-                        ov_draw_bar(tgt);
+                        break;              /* 真的放開了 */
                     }
                     nap(10);
                 }
-                g_seek_target     = tgt;
-                g_dbg_last_action = PAUSE_SEEK;
-                return PAUSE_SEEK;
+                if (dx <= -SEEK_MIN_DX) {
+                    g_paused          = 0u;
+                    g_dbg_last_action = PAUSE_PREV;
+                    return PAUSE_PREV;
+                }
+                if (dx >= SEEK_MIN_DX) {
+                    g_paused          = 0u;
+                    g_dbg_last_action = PAUSE_NEXT;
+                    return PAUSE_NEXT;
+                }
+                /* 拉得不夠：當成沒按到，留在暫停。 */
+                ov_until = HAL_GetTick() + OV_MS;
+                continue;
             }
 
             if (hit >= 0) {
@@ -1793,19 +1805,7 @@ static int pause_session(int32_t *cur)
             g_resume_ms = HAL_GetTick();
             return 0;
         }
-        if (a == PAUSE_SEEK) {
-            /* 拖曳結束才真的去解那一張。停在暫停，讓使用者可以再拖。 */
-            uint32_t t = g_seek_target;
 
-            if (t < g_order_count &&
-                photo_show(PLAYLIST_BASE + g_order[t] * PATH_MAX)
-                    == PHOTO_OK) {
-                present();
-                *cur = (int32_t)t;
-                g_decode_ok++;
-            }
-            continue;
-        }
         if (a == PAUSE_ROTATE) {
             /* 自動 <-> 固定，不再三段循環。離開自動時凍結在**目前這張的
              * 方向** —— 使用者看到什麼就固定什麼，畫面不會按一下就翻掉。 */
