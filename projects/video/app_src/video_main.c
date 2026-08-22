@@ -76,6 +76,28 @@ volatile uint32_t g_dbg_sum_dec, g_dbg_sum_cc, g_dbg_sum_out, g_dbg_sum_all;
 volatile uint32_t g_dbg_fps_x100;        /* 實測格率 x100 */
 volatile uint32_t g_dbg_late;            /* 跟不上素材格率的次數 */
 
+/* 診斷開關，SWD 可寫：
+ *   g_dbg_freeze  非 0 = 一直顯示第 0 格。真正靜止的畫面還在閃的話，
+ *                 問題在 PSRAM/LTDC 層級；不閃就是格與格之間的問題。
+ *   g_dbg_nopresent 非 0 = 不換頁，只解碼轉色。用來分離「顯示」與「產生內容」。 */
+/* LTDC 的 FIFO 供不上（underrun）與傳輸錯誤。
+ *
+ * DMA2D 現在會突發地猛寫 PSRAM，而 LTDC 同時要每秒 60 次從同一塊 PSRAM
+ * 讀完整個畫面 —— 相簿從來沒用過 DMA2D，這是全新的匯流排競爭。
+ * 「整個畫面快速亮滅」正是 underrun 的典型症狀。
+ *
+ * 這些旗標是黏著的，開機瞬間發生過一次就會一直是 1，所以每格讀完就清掉、
+ * 用計數跟格數對比才有意義（board-notes 10.5 那個假線索）。 */
+/* 直接數「轉色寫進哪一塊」與「present 被呼叫幾次」。
+ * OMAR 永遠是 FB1、g_front 卻會變 1，兩者矛盾 —— 不再靠推理。 */
+volatile uint32_t g_dbg_to_fb0, g_dbg_to_fb1, g_dbg_present;
+
+volatile uint32_t g_dbg_ltdc_fu;         /* FIFO underrun 次數 */
+volatile uint32_t g_dbg_ltdc_te;         /* 傳輸錯誤次數 */
+
+volatile uint32_t g_dbg_freeze;
+volatile uint32_t g_dbg_nopresent;
+
 static uint32_t g_next_ms;               /* 下一格該顯示的時刻 */
 
 static inline uint32_t cyc_start(void) { return DWT->CYCCNT; }
@@ -229,13 +251,30 @@ static bool dma2d_setup(uint32_t jpeg_css)
     return true;
 }
 
+/* 每格直接寫暫存器啟動，不走 HAL_DMA2D_Start。
+ *
+ * 為什麼：HAL_DMA2D_Start() 會把 hdma2d.State 設成 BUSY，而負責設回 READY 的
+ * 是 HAL_DMA2D_PollForTransfer()。但那個函式的等待迴圈包在 if (CR & START) 裡，
+ * 傳輸太快時整個等待會被跳過（board-notes 3.3），所以我們改成自己輪詢 START。
+ * 代價是 State 永遠停在 BUSY —— **第二次之後 HAL_DMA2D_Start 直接回傳
+ * HAL_BUSY 什麼都不做**。
+ *
+ * 症狀非常具人欺騙性：程式邏輯正確地輪流指定兩塊 framebuffer（實測
+ * to_fb0=255、to_fb1=259），但硬體的 OMAR 永遠停在第一次那個位址，
+ * 另一塊從頭到尾是黑的 —— 畫面就在第一格與全黑之間交替閃爍。
+ * 回傳值被 (void) 丟掉，所以完全沒有錯誤跡象。
+ *
+ * 相簿的 dma2d.c 早就是直接寫暫存器（board-notes 3.3），這裡照做。
+ * Init/ConfigLayer 仍用 HAL，那是一次性的、不涉及狀態機。 */
 static void dma2d_convert(uint8_t *dst, uint32_t w, uint32_t h)
 {
-    (void)HAL_DMA2D_Start(&g_hdma2d, (uint32_t)YCBCR_BUF, (uint32_t)dst, w, h);
+    DMA2D->FGMAR = (uint32_t)YCBCR_BUF;
+    DMA2D->OMAR  = (uint32_t)dst;
+    DMA2D->NLR   = (w << DMA2D_NLR_PL_Pos) | h;
+    DMA2D->IFCR  = DMA2D_IFCR_CTCIF | DMA2D_IFCR_CTEIF | DMA2D_IFCR_CCEIF;
+    DMA2D->CR   |= DMA2D_CR_START;
 
-    /* 看 START 位不要看旗標：HAL_DMA2D_PollForTransfer 的等待迴圈包在
-     * if (CR & START) 裡，小傳輸常在走到 poll 之前就結束、整個等待被跳過
-     * （board-notes 3.3）。 */
+    /* 看 START 位不要看旗標。 */
     while ((DMA2D->CR & DMA2D_CR_START) != 0u) { }
     __DSB();
 }
@@ -294,6 +333,15 @@ static void present(void)
     /* g_front 是「目前顯示中」的索引，所以剛畫好的是另一塊。
      * 這裡顯示剛畫好的那塊，然後翻面 —— 繪製目標與這裡必須永遠相反，
      * 寫反的話每格都在顯示沒畫過的緩衝區，靜止畫面也會閃（board-notes 2.3）。 */
+    {
+        uint32_t isr = LTDC->ISR;
+
+        if ((isr & LTDC_ISR_FUIF) != 0u) { g_dbg_ltdc_fu++; }
+        if ((isr & LTDC_ISR_TERRIF) != 0u) { g_dbg_ltdc_te++; }
+        LTDC->ICR = LTDC_ICR_CFUIF | LTDC_ICR_CTERRIF;
+    }
+
+    g_dbg_present++;
     LTDC_Layer1->CFBAR = g_front ? FB0_ADDR : FB1_ADDR;
     LTDC->SRCR = LTDC_SRCR_VBR;
     for (uint32_t g = 0; g < 2000000u; g++) {
@@ -405,8 +453,9 @@ void video_run(void)
     g_next_ms = t_run;
 
     for (;;) {
-        const uint8_t *jpg = FRAMES_BASE + tbl[idx * 2u];
-        uint32_t       len = tbl[idx * 2u + 1u];
+        uint32_t       use = g_dbg_freeze ? 0u : idx;
+        const uint8_t *jpg = FRAMES_BASE + tbl[use * 2u];
+        uint32_t       len = tbl[use * 2u + 1u];
         uint32_t       c_all = cyc_start();
         uint32_t       c0;
 
@@ -432,6 +481,7 @@ void video_run(void)
         }
 
         c0 = cyc_start();
+        if (g_front) { g_dbg_to_fb0++; } else { g_dbg_to_fb1++; }
         if (g_dma2d_ready) {
             /* DMA2D 讀寫都繞過 D-Cache，不必先失效快取。 */
             dma2d_convert((uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR),
@@ -447,7 +497,9 @@ void video_run(void)
         g_dbg_sum_cc += cyc_us(c0);
 
         c0 = cyc_start();
-        present();
+        if (!g_dbg_nopresent) {
+            present();
+        }
         g_dbg_sum_out += cyc_us(c0);
 
         /* 按素材的節奏放。用「下一格的目標時刻」而不是「每格睡固定時間」，
