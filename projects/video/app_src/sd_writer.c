@@ -59,6 +59,8 @@ volatile uint32_t g_sdw_state;          /* 走到哪一步，卡住時看這個 
 volatile uint32_t g_sdw_written;        /* 累計已寫入的位元組 */
 volatile uint32_t g_sdw_total_kb;       /* 卡片容量 KB */
 volatile uint32_t g_sdw_free_kb;        /* 剩餘空間 KB */
+volatile uint32_t g_sdw_oldsize;        /* 覆寫前原本的檔案大小 */
+volatile uint32_t g_sdw_trunc;          /* 0=沒截斷 1=進行中 2=成功 3=失敗 */
 volatile uint32_t g_sdw_cap = SDW_CAP;  /* 讓主機讀得到緩衝區大小 */
 volatile uint32_t g_sdw_buf_addr = (uint32_t)SDW_BUF;
 
@@ -71,6 +73,22 @@ bool sd_writer_requested(void)
     return g_sdw_go == SDW_GO_MAGIC;
 }
 
+/* **原地覆寫，不要截斷。**
+ *
+ * 第一版用 FA_CREATE_ALWAYS，它會先把舊檔的整條簇鏈釋放掉。釋放 122MB 的
+ * 簇鏈等於連續打出上百次**單磁區**的 FAT 寫入，實測約 130 次之後卡片就不再
+ * 回應指令（HAL_SD_ERROR_CMD_RSP_TIMEOUT），整個覆寫在 f_open 就失敗了。
+ *
+ * 關鍵對比：**建立新檔完全沒問題**（實測連續寫入 4.58MB 一次過）。
+ * 配置簇鏈與釋放簇鏈走的是不同的路，出事的只有釋放那條。
+ *
+ * 而我們根本不需要截斷 —— 覆寫的目的就是把整個檔案換掉。用 OPEN_ALWAYS
+ * 開啟（不存在就建立、存在就保留內容與簇鏈），從位移 0 開始蓋過去：
+ *   - 新檔比舊檔大 -> 超出的部分照常配置新簇（那條路是好的）
+ *   - 新檔比舊檔小 -> 關檔前用 f_truncate 砍掉尾巴
+ *
+ * 後者仍然會釋放簇鏈，但只釋放「多出來的尾巴」而不是整條，而且是在資料
+ * **全部寫完之後**才做 —— 就算那一步失敗，檔案內容已經是完整的。 */
 static FRESULT sdw_open(void)
 {
     FRESULT r;
@@ -79,14 +97,19 @@ static FRESULT sdw_open(void)
         (void)f_close(&g_sdw_fil);
         g_sdw_open = false;
     }
-    /* CREATE_ALWAYS：不存在就建立，存在就清成 0 長度。
-     * 只會動到 SDW_PATH 這一個檔案。 */
-    r = f_open(&g_sdw_fil, SDW_PATH, FA_WRITE | FA_CREATE_ALWAYS);
-    if (r == FR_OK) {
-        g_sdw_open   = true;
-        g_sdw_written = 0;
+    r = f_open(&g_sdw_fil, SDW_PATH, FA_WRITE | FA_OPEN_ALWAYS);
+    if (r != FR_OK) {
+        return r;
     }
-    return r;
+    g_sdw_oldsize = (uint32_t)f_size(&g_sdw_fil);
+    r = f_lseek(&g_sdw_fil, 0);
+    if (r != FR_OK) {
+        (void)f_close(&g_sdw_fil);
+        return r;
+    }
+    g_sdw_open    = true;
+    g_sdw_written = 0;
+    return FR_OK;
 }
 
 static FRESULT sdw_write(uint32_t len)
@@ -145,7 +168,21 @@ static FRESULT sdw_close(void)
     FRESULT r = FR_OK;
 
     if (g_sdw_open) {
-        r = f_close(&g_sdw_fil);
+        /* 新檔比舊檔小的話，尾巴要砍掉，否則檔案後面會留著上一份的殘骸。
+         * 放在資料全部寫完之後才做：這一步是唯一會釋放簇鏈的動作，
+         * 就算它失敗，前面的內容已經完整寫進去了。 */
+        if (g_sdw_written < g_sdw_oldsize) {
+            g_sdw_trunc = 1u;
+            r = f_truncate(&g_sdw_fil);
+            g_sdw_trunc = (r == FR_OK) ? 2u : 3u;
+        }
+        {
+            FRESULT rc = f_close(&g_sdw_fil);
+
+            if (r == FR_OK) {
+                r = rc;
+            }
+        }
         g_sdw_open = false;
     }
     return r;
