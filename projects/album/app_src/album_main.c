@@ -1555,6 +1555,35 @@ static void ov_hide(void)
     }
 }
 
+/* 量一次拖曳：等到手指離開，回傳整段過程中的**最大水平位移**。
+ *
+ * 取最大位移而不是放開瞬間的位置，而且容忍中途漏報 —— 快速滑動時觸控
+ * 控制器會掉幾筆座標，一讀不到就結束的話位移只算到中斷點為止
+ * （board-notes 14.7）。
+ *
+ * 順帶：它回來時手指一定已經離開，所以呼叫端不必再 wait_release()。 */
+static int measure_drag(int x0)
+{
+    uint32_t seen = HAL_GetTick();
+    int      dx = 0, x, y;
+
+    for (;;) {
+        watchdog_feed();
+        if (read_touch(&x, &y)) {
+            int d = x - x0;
+
+            if (((d < 0) ? -d : d) > ((dx < 0) ? -dx : dx)) {
+                dx = d;
+            }
+            seen = HAL_GetTick();
+        } else if ((HAL_GetTick() - seen) > SWIPE_GAP_MS) {
+            break;                      /* 真的放開了 */
+        }
+        nap(10);
+    }
+    return dx;
+}
+
 static int paused_loop_inner(void);
 
 /* 只有「剛進暫停」才閃那顆圖示（目前已經不閃了，保留旗標備用）。 */
@@ -1635,8 +1664,17 @@ static int paused_loop_inner(void)
              * 三秒就收起，使用者等一下再點就一定要點兩下才播得起來 ——
              * 回報的「要慢點兩下」正是這個。點一下切換播放/暫停優先。 */
             if (!g_ov_shown) {
-                wait_release();
-                g_paused          = 0u;
+                int dx = measure_drag(x0);
+
+                g_paused = 0u;
+                if (dx <= -SEEK_MIN_DX) {
+                    g_dbg_last_action = PAUSE_PREV;
+                    return PAUSE_PREV;
+                }
+                if (dx >= SEEK_MIN_DX) {
+                    g_dbg_last_action = PAUSE_NEXT;
+                    return PAUSE_NEXT;
+                }
                 g_dbg_last_action = PAUSE_RESUME;
                 return PAUSE_RESUME;
             }
@@ -1649,32 +1687,8 @@ static int paused_loop_inner(void)
             g_dbg_hit = hit;
 
             if (hit == PAUSE_SEEK) {
-                /* 拉桿改成**相對手勢**：往左拉＝上一張、往右拉＝下一張。
-                 *
-                 * 不做「拖到哪就是第幾張」的絕對定位 —— 四千多張照片攤在
-                 * 400px 上，一個像素就是十張，手指根本停不到想要的那張；
-                 * 而且每張要解 1.5 秒，絕對定位很容易一路解過去。
-                 *
-                 * 取整段過程中的**最大位移**而不是放開瞬間的位置，並容忍
-                 * 中途漏報 —— 快速滑動時控制器會掉幾筆座標
-                 * （board-notes 14.7）。 */
-                uint32_t seen = HAL_GetTick();
-                int      dx = 0, x, y;
+                int dx = measure_drag(x0);
 
-                for (;;) {
-                    watchdog_feed();
-                    if (read_touch(&x, &y)) {
-                        int d = x - x0;
-
-                        if (((d < 0) ? -d : d) > ((dx < 0) ? -dx : dx)) {
-                            dx = d;
-                        }
-                        seen = HAL_GetTick();
-                    } else if ((HAL_GetTick() - seen) > SWIPE_GAP_MS) {
-                        break;              /* 真的放開了 */
-                    }
-                    nap(10);
-                }
                 if (dx <= -SEEK_MIN_DX) {
                     g_paused          = 0u;
                     g_dbg_last_action = PAUSE_PREV;
@@ -1700,16 +1714,28 @@ static int paused_loop_inner(void)
                 return hit;
             }
 
-            /* 疊加層以外 = 繼續播放。
+            /* 控制以外的整片畫面：拖曳＝翻頁（翻書那種感覺），
+             * 單純點一下＝繼續播放。
              *
-             * 這條**一定要等手指離開才回報**：恢復播放之後播放迴圈也在看
-             * 觸控，同一次觸碰會立刻又被判成「暫停」—— 使用者看到的就是
-             * 「點一下播放不了」。翻頁那幾條不會有這個問題，因為後面接著
-             * 1.5 秒的解碼，手指早就離開了。 */
-            wait_release();
-            g_paused          = 0u;
-            g_dbg_last_action = PAUSE_RESUME;
-            return PAUSE_RESUME;
+             * measure_drag() 回來時手指一定已經離開，所以「繼續」這條也
+             * 順便滿足了「要等手指離開才回報」—— 不然恢復播放之後，
+             * 播放迴圈的「點畫面暫停」會把同一次觸碰再吃一次，
+             * 症狀就是「點一下播放不了」。 */
+            {
+                int dx = measure_drag(x0);
+
+                g_paused = 0u;
+                if (dx <= -SEEK_MIN_DX) {
+                    g_dbg_last_action = PAUSE_PREV;
+                    return PAUSE_PREV;
+                }
+                if (dx >= SEEK_MIN_DX) {
+                    g_dbg_last_action = PAUSE_NEXT;
+                    return PAUSE_NEXT;
+                }
+                g_dbg_last_action = PAUSE_RESUME;
+                return PAUSE_RESUME;
+            }
         }
         nap(8);
     }
