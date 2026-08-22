@@ -76,6 +76,15 @@ static uint32_t g_cur_top;
 static uint32_t g_front;
 static uint32_t g_interval_s = 2;      /* 預設 2 秒，可調 2~5 */
 
+/* 開機掃描完就直接開播，不停在選單。
+ *
+ * 資料夾預設全選，所以插卡上電就會動 —— 相框本來就該是這個行為。
+ * 想改設定的話，播放中往下滑就回到選單，之後走正常流程。
+ * 設 0 可以退回「每次都要手動選」。 */
+#ifndef AUTO_PLAY
+#define AUTO_PLAY 1
+#endif
+
 /* 診斷用，SWD 讀得到。 */
 volatile uint32_t g_stage;
 volatile int32_t  g_err;
@@ -1483,9 +1492,25 @@ void album_run(void)
         }
 #else
         g_stage = 5;
-        while (sd_present()) {
-            if (select_screen()) {
-                slideshow();
+        {
+            bool first = true;
+
+            while (sd_present()) {
+                /* 自動開播：掃描完直接播，不必手動勾資料夾按開始。
+                 *
+                 * 資料夾本來就預設全選（見掃描那段），所以自動開播等於
+                 * 「什麼都不做就會動」。從播放往下滑回到選單之後，
+                 * 後續就走正常的手動流程 —— 想改設定隨時進得去。 */
+                if (AUTO_PLAY && first && selected_photo_count() > 0u) {
+                    first = false;
+                    build_order();
+                    slideshow();
+                    continue;
+                }
+                first = false;
+                if (select_screen()) {
+                    slideshow();
+                }
             }
         }
 #endif

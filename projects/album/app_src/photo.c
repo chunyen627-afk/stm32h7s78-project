@@ -304,6 +304,39 @@ volatile uint32_t g_dbg_bench_jerr;     /* 1=Huffman 2=量化 4=DMA傳輸 8=逾�
 volatile uint32_t g_dbg_bench_derr_in;
 volatile uint32_t g_dbg_bench_derr_out;
 
+/* 正確性驗證：輪詢與 DMA 解同一張，逐位元組比對。
+ * 速度已經量過了，缺的是「解出來的東西一不一樣」—— 上次直接切換正式路徑
+ * 就是跳過這一步，結果畫面有殘影（輸出沒填滿）才發現。 */
+volatile uint32_t g_dbg_cmp_len_poll;   /* 輪詢版的輸出長度 */
+volatile uint32_t g_dbg_cmp_len_dma;    /* DMA 版的輸出長度 */
+volatile int32_t  g_dbg_cmp_diff;       /* -1=長度不同 0=完全相同 >0=第一個不同的位移 */
+volatile uint32_t g_dbg_cmp_sum_poll;   /* 校驗和，長度相同時用來快速判斷 */
+volatile uint32_t g_dbg_cmp_sum_dma;
+
+/* 連續解碼壓力測試：正式路徑是在第 8 張之後開始失敗，要在隔離模式重現。 */
+/* 正式路徑用 DMA，失敗就退回輪詢。
+ *
+ * 隔離測試證明分塊 DMA 的輸出與輪詢逐位元組相同、連續 40 次穩定，但先前
+ * 直接切換正式路徑時會在幾張之後開始失敗 —— 差別在於正式路徑的解碼之間
+ * 夾了 SD 讀檔、轉色、顯示。與其再猜一輪，不如讓它自己退回並記錄下來：
+ * 相簿最差就是退回原本的速度，而失敗的頻率與時機會直接顯示在計數器上。 */
+volatile uint32_t g_dbg_dma_ok;         /* DMA 成功幾張 */
+volatile uint32_t g_dbg_dma_fallback;   /* 退回輪詢幾張 */
+volatile int32_t  g_dbg_dma_lasterr;    /* 最後一次退回時的錯誤碼 */
+
+volatile uint32_t g_dbg_soak_ok;        /* 連續成功幾次 */
+volatile int32_t  g_dbg_soak_err;       /* 第一次失敗時的錯誤碼 */
+
+static uint32_t buf_sum(const uint8_t *p, uint32_t n)
+{
+    uint32_t h = 2166136261u;           /* FNV-1a，夠用而且快 */
+
+    for (uint32_t i = 0; i < n; i++) {
+        h = (h ^ p[i]) * 16777619u;
+    }
+    return h;
+}
+
 static DMA_HandleTypeDef g_bdma_in;
 static DMA_HandleTypeDef g_bdma_out;
 static volatile uint8_t  g_bench_done;  /* 0=進行中 1=完成 2=錯誤 */
@@ -446,14 +479,62 @@ static void run_bench(uint32_t size, uint32_t w, uint32_t h)
 
     g_dbg_bench_kpx = (w * h) / 1000u;
 
+    /* DMA 通道要先建立，後面每一項測試都用得到。
+     * 上一版把測試插在這行之前，結果 hdmain/hdmaout 還是 NULL，
+     * HAL_JPEG_Decode_DMA 直接拒絕 —— 純粹是順序錯，不是 DMA 有問題。 */
+    if (!bench_dma_setup()) {
+        g_dbg_bench_err = -6;
+        return;
+    }
+
+    /* --- 一、正確性：兩條路徑解同一張，比對輸出 --- */
+    if (bench_decode(size, false)) {
+        uint32_t n = g_out_total;
+
+        if (n > RGB_CAP) { n = RGB_CAP; }
+        SCB_InvalidateDCache_by_Addr((uint32_t *)YCBCR_BUF, (int32_t)n);
+        memcpy(RGB_BUF, YCBCR_BUF, n);          /* 收好輪詢版的結果 */
+        g_dbg_cmp_len_poll = n;
+        g_dbg_cmp_sum_poll = buf_sum(RGB_BUF, n);
+
+        if (bench_decode(size, true)) {
+            uint32_t m = g_out_total;
+
+            SCB_InvalidateDCache_by_Addr((uint32_t *)YCBCR_BUF, (int32_t)m);
+            g_dbg_cmp_len_dma = m;
+            g_dbg_cmp_sum_dma = buf_sum(YCBCR_BUF, (m > RGB_CAP) ? RGB_CAP : m);
+
+            if (m != n) {
+                g_dbg_cmp_diff = -1;            /* 長度就不一樣 */
+            } else {
+                g_dbg_cmp_diff = 0;
+                for (uint32_t i = 0; i < n; i++) {
+                    if (RGB_BUF[i] != YCBCR_BUF[i]) {
+                        g_dbg_cmp_diff = (int32_t)i + 1;   /* +1 免得跟「相同」混淆 */
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    /* --- 二、壓力測試：連續解到失敗為止，看撐幾次 --- */
+    g_dbg_bench_err = 0;
+    for (i = 0; i < 40u; i++) {
+        if (!bench_decode(size, true)) {
+            g_dbg_soak_err = g_dbg_bench_err;
+            break;
+        }
+        g_dbg_soak_ok = i + 1u;
+    }
+    g_dbg_bench_err = 0;
+
     /* 輪詢版先跑，這時候還沒碰任何 DMA 或中斷。 */
     c0 = cyc_start();
     for (i = 0; i < N; i++) {
         if (!bench_decode(size, false)) { g_dbg_bench_err = -1; goto done; }
     }
     g_dbg_bench_poll_us = cyc_us(c0) / N;
-
-    if (!bench_dma_setup()) { g_dbg_bench_err = -6; goto done; }
 
     c0 = cyc_start();
     for (i = 0; i < N; i++) {
@@ -1122,6 +1203,15 @@ photo_result_t photo_show(const char *path)
 
     /* 輪詢版解碼。相簿一次只處理一張，不需要 DMA 的非同步性，
      * 少掉回呼與中斷設定，出錯的地方也少。 */
+    /* 正式路徑維持輪詢版。
+     *
+     * DMA 在隔離模式下完全正確（輸出與輪詞逐位元組相同、連續 40 次穩定），
+     * 但整合進正式路徑後：第一張成功，之後 HAL_JPEG_Decode_DMA 永遠回傳
+     * BUSY，而且連 HAL_JPEG_Abort() 都救不回來，退回輪詢也一起失敗。
+     *
+     * 差異在於正式路徑的兩次解碼之間夾了 SD 讀檔、轉色、縮放、顯示與等待，
+     * 而隔離測試是背對背連續呼叫。真正的原因還沒找到，所以先不切換 ——
+     * 相簿的可用性優先於 14% 的速度。基準測試留著，隨時可以再查。 */
     if (HAL_JPEG_Decode(&g_hjpeg, JPEG_FILE_BUF, size,
                         YCBCR_BUF, YCBCR_CAP, 10000u) != HAL_OK) {
         return PHOTO_ERR_DECODE;
@@ -1138,9 +1228,9 @@ photo_result_t photo_show(const char *path)
         } else {
             g_dbg_bench_err = -7;
         }
-        /* 還原成正常流程預期的狀態：重新解一次這張。 */
         (void)bench_decode(size, false);
     }
+
     if (HAL_JPEG_GetInfo(&g_hjpeg, &info) != HAL_OK) {
         return PHOTO_ERR_DECODE;
     }
