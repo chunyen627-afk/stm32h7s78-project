@@ -42,11 +42,18 @@
  * 一次交出整塊會被默默截斷或直接變成 0，所以必須分塊餵（board-notes 16.2）。 */
 #define CHUNK           (32u * 1024u)
 
+/* 素材的格率。解碼加轉色只花 2.6ms，全速跑會變成面板上限的 60fps ——
+ * 比素材快 2.5 倍，看起來就是「亂閃跳」。要按素材的節奏放。 */
+#define SRC_FPS         24u
+#define FRAME_MS        (1000u / SRC_FPS)
+
 typedef struct {
     uint32_t magic, count, width, height;
 } frames_hdr_t;
 
-static JPEG_HandleTypeDef g_hjpeg;
+static JPEG_HandleTypeDef  g_hjpeg;
+static DMA2D_HandleTypeDef g_hdma2d;
+static bool                g_dma2d_ready;
 static DMA_HandleTypeDef  g_dma_in;
 static DMA_HandleTypeDef  g_dma_out;
 static uint32_t           g_front;
@@ -67,6 +74,9 @@ volatile uint32_t g_dbg_hdr_magic, g_dbg_hdr_count, g_dbg_hdr_w, g_dbg_hdr_h;
 /* 每一段的累計微秒與影格數，算平均用。單格數字會跳，看平均才準。 */
 volatile uint32_t g_dbg_sum_dec, g_dbg_sum_cc, g_dbg_sum_out, g_dbg_sum_all;
 volatile uint32_t g_dbg_fps_x100;        /* 實測格率 x100 */
+volatile uint32_t g_dbg_late;            /* 跟不上素材格率的次數 */
+
+static uint32_t g_next_ms;               /* 下一格該顯示的時刻 */
 
 static inline uint32_t cyc_start(void) { return DWT->CYCCNT; }
 static inline uint32_t cyc_us(uint32_t t0)
@@ -170,6 +180,67 @@ void HAL_JPEG_MspInit(JPEG_HandleTypeDef *hjpeg)
 }
 
 /* ------------------------------------------------------------------ */
+/* DMA2D 轉色                                                          */
+/* ------------------------------------------------------------------ */
+
+/* YCbCr -> RGB565 交給硬體。
+ *
+ * 實測 CPU 轉色佔每格 91%（64ms / 70ms），解碼只佔 3.6% —— 這是唯一值得
+ * 動的地方。DMA2D 支援 YCbCr 輸入（DMA2D_INPUT_YCBCR + 三種色度取樣），
+ * 而 JPEG 解碼器吐出來的正是它要的 MCU 區塊排列，兩者直接接得上。
+ *
+ * 附帶好處：DMA2D 讀 YCbCr、寫 framebuffer 都繞過 D-Cache，所以轉色前
+ * 那次 SCB_InvalidateDCache_by_Addr（CPU 要讀才需要）可以省掉。
+ *
+ * css 用 JPEG 回報的取樣格式對應過去：HAL 的 0=4:4:4、1=4:2:0、2=4:2:2，
+ * 而 DMA2D 是 NO_CSS / CSS_420 / CSS_422 —— 兩邊的編號不一樣，
+ * 照抄會錯得很難查（board-notes 11.1 那個 4:4:4 誤認的同一類陷阱）。 */
+static bool dma2d_setup(uint32_t jpeg_css)
+{
+    uint32_t css;
+
+    if (jpeg_css == JPEG_420_SUBSAMPLING) {
+        css = DMA2D_CSS_420;
+    } else if (jpeg_css == JPEG_422_SUBSAMPLING) {
+        css = DMA2D_CSS_422;
+    } else {
+        css = DMA2D_NO_CSS;
+    }
+
+    __HAL_RCC_DMA2D_CLK_ENABLE();
+
+    g_hdma2d.Instance                 = DMA2D;
+    g_hdma2d.Init.Mode                = DMA2D_M2M_PFC;   /* 搬運 + 格式轉換 */
+    g_hdma2d.Init.ColorMode           = DMA2D_OUTPUT_RGB565;
+    g_hdma2d.Init.OutputOffset        = 0;               /* 影格就是整個畫面 */
+
+    g_hdma2d.LayerCfg[1].InputOffset        = 0;
+    g_hdma2d.LayerCfg[1].InputColorMode     = DMA2D_INPUT_YCBCR;
+    g_hdma2d.LayerCfg[1].ChromaSubSampling  = css;
+    g_hdma2d.LayerCfg[1].AlphaMode          = DMA2D_NO_MODIF_ALPHA;
+    g_hdma2d.LayerCfg[1].InputAlpha         = 0xFFu;
+
+    if (HAL_DMA2D_Init(&g_hdma2d) != HAL_OK) {
+        return false;
+    }
+    if (HAL_DMA2D_ConfigLayer(&g_hdma2d, 1) != HAL_OK) {
+        return false;
+    }
+    return true;
+}
+
+static void dma2d_convert(uint8_t *dst, uint32_t w, uint32_t h)
+{
+    (void)HAL_DMA2D_Start(&g_hdma2d, (uint32_t)YCBCR_BUF, (uint32_t)dst, w, h);
+
+    /* 看 START 位不要看旗標：HAL_DMA2D_PollForTransfer 的等待迴圈包在
+     * if (CR & START) 裡，小傳輸常在走到 poll 之前就結束、整個等待被跳過
+     * （board-notes 3.3）。 */
+    while ((DMA2D->CR & DMA2D_CR_START) != 0u) { }
+    __DSB();
+}
+
+/* ------------------------------------------------------------------ */
 /* 初始化                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -220,6 +291,9 @@ static void present(void)
 {
     /* 只寫 CFBAR：它是 shadow register，等垂直消隱重載時整批原子切換。
      * 用 BSP_LCD_SetLayerAddress 會重寫整組圖層暫存器而撕裂（board-notes 2.2）。 */
+    /* g_front 是「目前顯示中」的索引，所以剛畫好的是另一塊。
+     * 這裡顯示剛畫好的那塊，然後翻面 —— 繪製目標與這裡必須永遠相反，
+     * 寫反的話每格都在顯示沒畫過的緩衝區，靜止畫面也會閃（board-notes 2.3）。 */
     LTDC_Layer1->CFBAR = g_front ? FB0_ADDR : FB1_ADDR;
     LTDC->SRCR = LTDC_SRCR_VBR;
     for (uint32_t g = 0; g < 2000000u; g++) {
@@ -255,6 +329,14 @@ static bool decode_frame(const uint8_t *jpg, uint32_t size)
             }
         }
     }
+    /* 錯誤碼一定要在 DeInit 之前擷取 —— 重新初始化會把 ErrorCode 清成 0，
+     * 先前 jerr/derr 全是 0 就是這個順序寫錯造成的假象。 */
+    if (g_done != 1u) {
+        g_dbg_jerr     = HAL_JPEG_GetError(&g_hjpeg);
+        g_dbg_derr_in  = HAL_DMA_GetError(&g_dma_in);
+        g_dbg_derr_out = HAL_DMA_GetError(&g_dma_out);
+    }
+
     /* 診斷：每格之間完整重新初始化 JPEG。
      *
      * Abort 不足以解決「連續 N 格後永久 BUSY」（相簿 8 格、這裡 24 格），
@@ -277,9 +359,6 @@ static bool decode_frame(const uint8_t *jpg, uint32_t size)
 
     if (g_done != 1u) {
         g_dbg_lasterr   = -5;
-        g_dbg_jerr      = HAL_JPEG_GetError(&g_hjpeg);
-        g_dbg_derr_in   = HAL_DMA_GetError(&g_dma_in);
-        g_dbg_derr_out  = HAL_DMA_GetError(&g_dma_out);
         /* 啟動了非同步硬體的失敗路徑一定要收乾淨，否則週邊停在忙碌狀態，
          * 之後每次解碼都拿到 HAL_BUSY（board-notes 16.3）。 */
         (void)HAL_JPEG_Abort(&g_hjpeg);
@@ -322,7 +401,8 @@ void video_run(void)
     }
 
     g_dbg_stage = 5;
-    t_run = HAL_GetTick();
+    t_run     = HAL_GetTick();
+    g_next_ms = t_run;
 
     for (;;) {
         const uint8_t *jpg = FRAMES_BASE + tbl[idx * 2u];
@@ -345,21 +425,45 @@ void video_run(void)
             continue;
         }
 
-        /* JPEG 的 DMA 繞過 D-Cache 直接寫 PSRAM，CPU 讀之前要先失效，
-         * 否則讀到上一格的殘留（board-notes 3.1）。 */
-        SCB_InvalidateDCache_by_Addr((uint32_t *)YCBCR_BUF, (int32_t)g_out_total);
+        /* 第一格才知道取樣格式，這時候設定 DMA2D。 */
+        if (!g_dma2d_ready) {
+            g_dma2d_ready = dma2d_setup(info.ChromaSubsampling);
+            g_dbg_stage = g_dma2d_ready ? 6u : 92u;
+        }
 
-        /* 影格已經是面板尺寸，不需要縮放也不需要旋轉 —— 轉色直接寫進
-         * 背景 framebuffer。這是整條路徑最短的形式。 */
         c0 = cyc_start();
-        (void)convert(YCBCR_BUF,
-                      (uint8_t *)(g_front ? FB1_ADDR : FB0_ADDR),
-                      0, g_out_total, &converted);
+        if (g_dma2d_ready) {
+            /* DMA2D 讀寫都繞過 D-Cache，不必先失效快取。 */
+            dma2d_convert((uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR),
+                          info.ImageWidth, info.ImageHeight);
+        } else {
+            /* 退回 CPU 轉色。這條路徑實測 64ms/格，只當保險用。 */
+            SCB_InvalidateDCache_by_Addr((uint32_t *)YCBCR_BUF,
+                                         (int32_t)g_out_total);
+            (void)convert(YCBCR_BUF,
+                          (uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR),
+                          0, g_out_total, &converted);
+        }
         g_dbg_sum_cc += cyc_us(c0);
 
         c0 = cyc_start();
         present();
         g_dbg_sum_out += cyc_us(c0);
+
+        /* 按素材的節奏放。用「下一格的目標時刻」而不是「每格睡固定時間」，
+         * 否則解碼時間的抖動會累積成愈跑愈慢。 */
+        g_next_ms += FRAME_MS;
+        {
+            uint32_t now = HAL_GetTick();
+
+            if ((int32_t)(g_next_ms - now) > 0) {
+                while ((int32_t)(g_next_ms - HAL_GetTick()) > 0) { }
+            } else {
+                /* 跟不上就重新對時，不要一直追欠下的時間。 */
+                g_next_ms = now;
+                g_dbg_late++;
+            }
+        }
 
         g_dbg_sum_all += cyc_us(c_all);
         g_dbg_nframe++;
