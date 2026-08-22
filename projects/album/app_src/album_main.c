@@ -1332,7 +1332,7 @@ static void flash_icon(bool paused)
     }
 
     gfx_set_framebuffer(back);
-    nap(1000);
+    nap(400);
     icon_backup(true);
 }
 
@@ -1364,7 +1364,7 @@ static void flash_orient(void)
                     COL_TEXT);
 
     gfx_set_framebuffer(back);
-    nap(1000);
+    nap(400);
     icon_backup(true);
 }
 
@@ -1474,9 +1474,15 @@ static void ctl_draw(void)
     for (int i = 0; i < CTL_COUNT; i++) {
         int bx = ctl_btn_x(i);
 
+        /* 方向那一顆直接顯示目前模式（自動／直立／橫向），比固定寫「方向」
+         * 有用 —— 按下去之前就知道現在是什麼狀態。 */
+        const char *name = (CTL_ACT[i] == PAUSE_ROTATE)
+                           ? ORIENT_NAME[photo_get_orientation()]
+                           : CTL_NAME[i];
+
         gfx_pill(bx, y0 + 12, bw, CTL_BTN_H, COL_PANEL);
         gfx_text_center(bx + bw / 2, y0 + 12 + (CTL_BTN_H - 24) / 2,
-                        CTL_NAME[i], COL_TEXT);
+                        name, COL_TEXT);
     }
     gfx_set_framebuffer(back);
     gfx_set_orientation(was_ls);
@@ -1500,6 +1506,10 @@ static int ctl_hit(int x, int y)
 
 static int paused_loop_inner(void);
 
+/* 只有「剛進暫停」才閃那顆圖示。按翻頁鍵之後會再進來一次，那時候再閃一秒
+ * 等於每按一次就卡一秒 —— 使用者感覺到的「反應慢」大半來自這裡。 */
+static bool g_pause_flash;
+
 /* 進暫停就畫控制列，離開時還原底下的畫面。所有出口都會經過這裡，
  * 不會有「某條路徑忘了還原」的問題（board-notes 14.5 那個對稱性教訓）。 */
 static int paused_loop(void)
@@ -1517,7 +1527,13 @@ static int paused_loop_inner(void)
 {
     g_paused    = 1u;
     g_req_pause = 0u;               /* 消化掉進來的那一次 */
-    flash_icon(true);
+    if (g_pause_flash) {
+        flash_icon(true);
+        g_pause_flash = false;
+    }
+    /* 把上一個動作殘留的觸碰吃掉。放在**進來的時候**而不是「按下去之後」——
+     * 按鈕要按下就有反應，不能等手指離開才動作。 */
+    wait_release();
 
     for (;;) {
         int x0, y0;
@@ -1546,17 +1562,21 @@ static int paused_loop_inner(void)
             int hit = ctl_hit(x0, y0);
 
             g_dbg_touch_hit++;
-            wait_release();
             if (hit >= 0) {
-                /* 切方向要留在暫停，讓使用者當場看到結果。 */
+                /* **按下就回報**，不等手指離開 —— 殘留的觸碰由下一次進來
+                 * 時的 wait_release() 吃掉。切方向要留在暫停，讓使用者
+                 * 當場看到結果。 */
                 if (hit != PAUSE_ROTATE) {
                     g_paused = 0u;
                 }
                 return hit;
             }
-            /* 控制列以外、或列上的空白處：什麼都不做。 */
+            if (hit != -1) {
+                wait_release();     /* 點在控制列的空白處：吃掉這次觸碰 */
+            }
+            /* 控制列以外：什麼都不做。 */
         }
-        nap(30);
+        nap(8);
     }
 }
 
@@ -1629,6 +1649,7 @@ static int wait_interval(uint32_t already_ms)
  * 回傳 0 = 繼續播放，1 = 回選單。 */
 static int pause_session(int32_t *cur)
 {
+    g_pause_flash = true;           /* 這一輪只閃一次圖示 */
     for (;;) {
         int a = paused_loop();
         int dir;
@@ -1642,8 +1663,15 @@ static int pause_session(int32_t *cur)
             return 0;
         }
         if (a == PAUSE_ROTATE) {
-            photo_set_orientation((photo_orient_t)
-                (((uint32_t)photo_get_orientation() + 1u) % PHOTO_ORIENT_COUNT));
+            /* 自動 <-> 固定，不再三段循環。離開自動時凍結在**目前這張的
+             * 方向** —— 使用者看到什麼就固定什麼，畫面不會按一下就翻掉。 */
+            if (photo_get_orientation() == PHOTO_ORIENT_AUTO) {
+                photo_set_orientation(gfx_is_landscape()
+                                      ? PHOTO_ORIENT_LANDSCAPE
+                                      : PHOTO_ORIENT_PORTRAIT);
+            } else {
+                photo_set_orientation(PHOTO_ORIENT_AUTO);
+            }
             /* 重畫目前這張，讓使用者當場看到新方向的結果。 */
             if (*cur >= 0 &&
                 photo_show(PLAYLIST_BASE + g_order[*cur] * PATH_MAX)
