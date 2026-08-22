@@ -190,15 +190,6 @@ volatile uint32_t g_dbg_maxfb;      /* 寫到的最大 framebuffer 索引 */
 volatile uint32_t g_dbg_maxscl;     /* sharpen 讀到的最大縮圖位移 */
 char              g_dbg_path[160];
 
-/* HPDMA 的區塊大小欄位 DMA_CBR1_BNDT 只有 16 位元（上限 65535），而 HAL 是
- * 直接 (SrcDataSize & 0xFFFF) 遮掉、**完全不檢查**。傳 10MB 進去會變成 0，
- * 硬體立刻回報 USE（使用者設定錯誤）。所以 DMA 模式必須分塊餵，靠回呼接續。
- * 取 32KB：安全地低於上限，又夠大到不會讓回呼太頻繁。 */
-#define BENCH_CHUNK  (32u * 1024u)
-
-static volatile bool     g_dma_mode;    /* true = 回呼要走分塊接續的邏輯 */
-static volatile uint32_t g_dma_out_off; /* 已經寫到 YCbCr 緩衝區的哪裡 */
-
 void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *hjpeg, uint8_t *pDataOut,
                                 uint32_t OutDataLength)
 {
@@ -223,20 +214,6 @@ void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *hjpeg, uint8_t *pDataOut,
     if (end > g_out_total) {
         g_out_total = end;
     }
-
-    /* DMA 模式才需要接續餵緩衝區。上面那段警告針對的是「一開始就把整塊交出去」
-     * 的輪詢用法 —— 在那種用法下於回呼裡餵新緩衝區會反覆觸發。
-     * 分塊模式下接續是**本來就該做的事**，ST 的 DMA 範例正是這樣寫。 */
-    if (g_dma_mode) {
-        uint32_t next = end;
-        uint32_t left = (next < YCBCR_CAP) ? (YCBCR_CAP - next) : 0u;
-
-        g_dma_out_off = next;
-        if (left > BENCH_CHUNK) { left = BENCH_CHUNK; }
-        if (left >= 4u) {
-            (void)HAL_JPEG_ConfigOutputBuffer(hjpeg, YCBCR_BUF + next, left);
-        }
-    }
 }
 
 void HAL_JPEG_GetDataCallback(JPEG_HandleTypeDef *hjpeg, uint32_t NbDecodedData)
@@ -247,14 +224,7 @@ void HAL_JPEG_GetDataCallback(JPEG_HandleTypeDef *hjpeg, uint32_t NbDecodedData)
     }
     g_in_ptr  += NbDecodedData;
     g_in_left -= NbDecodedData;
-    {
-        uint32_t n = g_in_left;
-
-        /* 同一個 16 位元上限，輸入端也要分塊 —— 這裡不會報錯只會默默截斷，
-         * 更難查。 */
-        if (g_dma_mode && n > BENCH_CHUNK) { n = BENCH_CHUNK; }
-        HAL_JPEG_ConfigInputBuffer(hjpeg, (uint8_t *)g_in_ptr, n);
-    }
+    HAL_JPEG_ConfigInputBuffer(hjpeg, (uint8_t *)g_in_ptr, g_in_left);
 }
 
 /* HAL 的 __weak 版本什麼都不做，JPEG 的時脈不開就跑不起來。 */
@@ -278,277 +248,6 @@ static inline uint32_t cyc_us(uint32_t t0)
     return (DWT->CYCCNT - t0) / (SystemCoreClock / 1000000u);
 }
 
-
-/* ------------------------------------------------------------------ */
-/* JPEG 解碼路徑基準測試（隔離式）                                      */
-/* ------------------------------------------------------------------ */
-
-/* 目的：量「硬體 JPEG 編解碼器用 DMA 解一張要多久」。這個數字決定影片
- * 可不可行 —— 20 fps 是每格 50 ms 的預算，而管線化之後 SD 讀檔（約 8ms）、
- * DMA2D 轉色（估 20~30ms）、換頁（寫一個暫存器）都在預算內，只有解碼未知。
- *
- * **刻意做成隔離式**，上一次的教訓：我把 DMA 設定和中斷放進 HAL_JPEG_MspInit，
- * 那是照片路徑每次都會走的初始化 —— 結果輪詢版解碼被干擾，93 次失敗、
- * 相簿整個不能用，而且重燒也救不回來（因為壞的是每次都會執行的程式碼）。
- *
- * 現在的規矩：MspInit 一個字都不動；DMA 的時脈、通道、中斷、拆除全部關在
- * 這個函式裡；而且只有 g_dbg_bench_go 被外部寫成非 0 才會執行。不觸發就
- * 完全等於不存在，觸發後若出事，重置一次就恢復（旗標不持久）。 */
-volatile uint32_t g_dbg_bench_go;       /* 由 SWD 寫 1 觸發 */
-volatile uint32_t g_dbg_bench_n;
-volatile uint32_t g_dbg_bench_poll_us;
-volatile uint32_t g_dbg_bench_dma_us;
-volatile uint32_t g_dbg_bench_kpx;
-volatile int32_t  g_dbg_bench_err;
-volatile uint32_t g_dbg_bench_jerr;     /* 1=Huffman 2=量化 4=DMA傳輸 8=逾時 */
-volatile uint32_t g_dbg_bench_derr_in;
-volatile uint32_t g_dbg_bench_derr_out;
-
-/* 正確性驗證：輪詢與 DMA 解同一張，逐位元組比對。
- * 速度已經量過了，缺的是「解出來的東西一不一樣」—— 上次直接切換正式路徑
- * 就是跳過這一步，結果畫面有殘影（輸出沒填滿）才發現。 */
-volatile uint32_t g_dbg_cmp_len_poll;   /* 輪詢版的輸出長度 */
-volatile uint32_t g_dbg_cmp_len_dma;    /* DMA 版的輸出長度 */
-volatile int32_t  g_dbg_cmp_diff;       /* -1=長度不同 0=完全相同 >0=第一個不同的位移 */
-volatile uint32_t g_dbg_cmp_sum_poll;   /* 校驗和，長度相同時用來快速判斷 */
-volatile uint32_t g_dbg_cmp_sum_dma;
-
-/* 連續解碼壓力測試：正式路徑是在第 8 張之後開始失敗，要在隔離模式重現。 */
-/* 正式路徑用 DMA，失敗就退回輪詢。
- *
- * 隔離測試證明分塊 DMA 的輸出與輪詢逐位元組相同、連續 40 次穩定，但先前
- * 直接切換正式路徑時會在幾張之後開始失敗 —— 差別在於正式路徑的解碼之間
- * 夾了 SD 讀檔、轉色、顯示。與其再猜一輪，不如讓它自己退回並記錄下來：
- * 相簿最差就是退回原本的速度，而失敗的頻率與時機會直接顯示在計數器上。 */
-volatile uint32_t g_dbg_dma_ok;         /* DMA 成功幾張 */
-volatile uint32_t g_dbg_dma_fallback;   /* 退回輪詢幾張 */
-volatile int32_t  g_dbg_dma_lasterr;    /* 最後一次退回時的錯誤碼 */
-
-volatile uint32_t g_dbg_soak_ok;        /* 連續成功幾次 */
-volatile int32_t  g_dbg_soak_err;       /* 第一次失敗時的錯誤碼 */
-
-static uint32_t buf_sum(const uint8_t *p, uint32_t n)
-{
-    uint32_t h = 2166136261u;           /* FNV-1a，夠用而且快 */
-
-    for (uint32_t i = 0; i < n; i++) {
-        h = (h ^ p[i]) * 16777619u;
-    }
-    return h;
-}
-
-static DMA_HandleTypeDef g_bdma_in;
-static DMA_HandleTypeDef g_bdma_out;
-static volatile uint8_t  g_bench_done;  /* 0=進行中 1=完成 2=錯誤 */
-
-void HAL_JPEG_DecodeCpltCallback(JPEG_HandleTypeDef *hjpeg)
-{
-    (void)hjpeg;
-    g_bench_done = 1u;
-}
-
-void HAL_JPEG_ErrorCallback(JPEG_HandleTypeDef *hjpeg)
-{
-    (void)hjpeg;
-    g_bench_done = 2u;
-}
-
-void HPDMA1_Channel0_IRQHandler(void) { HAL_DMA_IRQHandler(&g_bdma_in); }
-void HPDMA1_Channel1_IRQHandler(void) { HAL_DMA_IRQHandler(&g_bdma_out); }
-void JPEG_IRQHandler(void)            { HAL_JPEG_IRQHandler(&g_hjpeg); }
-
-/* 通道設定照 ST 的 JPEG_DecodingFromXSPI_DMA 範例。
- * 時脈那行 ST 放在獨立的 MX_HPDMA1_Init()，很容易漏 —— 漏了的話
- * HAL_DMA_Init() 照樣回傳 HAL_OK，但傳輸永遠不會開始。 */
-static bool bench_dma_setup(void)
-{
-    __HAL_RCC_HPDMA1_CLK_ENABLE();
-
-    g_bdma_out.Instance                  = HPDMA1_Channel1;
-    g_bdma_out.Init.Request              = HPDMA1_REQUEST_JPEG_TX;
-    g_bdma_out.Init.BlkHWRequest         = DMA_BREQ_SINGLE_BURST;
-    g_bdma_out.Init.Direction            = DMA_PERIPH_TO_MEMORY;
-    g_bdma_out.Init.SrcInc               = DMA_SINC_FIXED;
-    g_bdma_out.Init.DestInc              = DMA_DINC_INCREMENTED;
-    g_bdma_out.Init.SrcDataWidth         = DMA_SRC_DATAWIDTH_WORD;
-    g_bdma_out.Init.DestDataWidth        = DMA_DEST_DATAWIDTH_WORD;
-    g_bdma_out.Init.Priority             = DMA_LOW_PRIORITY_LOW_WEIGHT;
-    g_bdma_out.Init.SrcBurstLength       = 8;
-    g_bdma_out.Init.DestBurstLength      = 8;
-    g_bdma_out.Init.TransferAllocatedPort =
-        DMA_SRC_ALLOCATED_PORT1 | DMA_DEST_ALLOCATED_PORT0;
-    g_bdma_out.Init.TransferEventMode    = DMA_TCEM_BLOCK_TRANSFER;
-    g_bdma_out.Init.Mode                 = DMA_NORMAL;
-    if (HAL_DMA_Init(&g_bdma_out) != HAL_OK) { return false; }
-    __HAL_LINKDMA(&g_hjpeg, hdmaout, g_bdma_out);
-
-    g_bdma_in.Instance                   = HPDMA1_Channel0;
-    g_bdma_in.Init.Request               = HPDMA1_REQUEST_JPEG_RX;
-    g_bdma_in.Init.BlkHWRequest          = DMA_BREQ_SINGLE_BURST;
-    g_bdma_in.Init.Direction             = DMA_MEMORY_TO_PERIPH;
-    g_bdma_in.Init.SrcInc                = DMA_SINC_INCREMENTED;
-    g_bdma_in.Init.DestInc               = DMA_DINC_FIXED;
-    g_bdma_in.Init.SrcDataWidth          = DMA_SRC_DATAWIDTH_WORD;
-    g_bdma_in.Init.DestDataWidth         = DMA_DEST_DATAWIDTH_WORD;
-    g_bdma_in.Init.Priority              = DMA_LOW_PRIORITY_LOW_WEIGHT;
-    g_bdma_in.Init.SrcBurstLength        = 8;
-    g_bdma_in.Init.DestBurstLength       = 8;
-    g_bdma_in.Init.TransferAllocatedPort =
-        DMA_SRC_ALLOCATED_PORT0 | DMA_DEST_ALLOCATED_PORT1;
-    g_bdma_in.Init.TransferEventMode     = DMA_TCEM_BLOCK_TRANSFER;
-    g_bdma_in.Init.Mode                  = DMA_NORMAL;
-    if (HAL_DMA_Init(&g_bdma_in) != HAL_OK) { return false; }
-    __HAL_LINKDMA(&g_hjpeg, hdmain, g_bdma_in);
-
-    HAL_NVIC_SetPriority(HPDMA1_Channel0_IRQn, 6, 0);
-    HAL_NVIC_EnableIRQ(HPDMA1_Channel0_IRQn);
-    HAL_NVIC_SetPriority(HPDMA1_Channel1_IRQn, 6, 0);
-    HAL_NVIC_EnableIRQ(HPDMA1_Channel1_IRQn);
-    HAL_NVIC_SetPriority(JPEG_IRQn, 6, 0);
-    HAL_NVIC_EnableIRQ(JPEG_IRQn);
-    return true;
-}
-
-/* 把一切還原成「相簿原本的樣子」：中斷關掉、通道拆掉、連結解開，
- * 最後重新初始化 JPEG。少做任何一步，之後的輪詢解碼都可能被影響。 */
-static void bench_dma_teardown(void)
-{
-    HAL_NVIC_DisableIRQ(JPEG_IRQn);
-    HAL_NVIC_DisableIRQ(HPDMA1_Channel0_IRQn);
-    HAL_NVIC_DisableIRQ(HPDMA1_Channel1_IRQn);
-
-    (void)HAL_JPEG_Abort(&g_hjpeg);
-    (void)HAL_DMA_DeInit(&g_bdma_in);
-    (void)HAL_DMA_DeInit(&g_bdma_out);
-    g_hjpeg.hdmain  = NULL;
-    g_hjpeg.hdmaout = NULL;
-
-    (void)HAL_JPEG_DeInit(&g_hjpeg);
-    g_hjpeg.Instance = JPEG;
-    (void)HAL_JPEG_Init(&g_hjpeg);
-    JPEG_InitColorTables();
-}
-
-static bool bench_decode(uint32_t size, bool use_dma)
-{
-    g_out_total = 0;
-    g_in_ptr    = JPEG_FILE_BUF;
-    g_in_left   = size;
-
-    if (!use_dma) {
-        return HAL_JPEG_Decode(&g_hjpeg, JPEG_FILE_BUF, size,
-                               YCBCR_BUF, YCBCR_CAP, 10000u) == HAL_OK;
-    }
-
-    g_bench_done  = 0u;
-    g_dma_mode    = true;
-    g_dma_out_off = 0u;
-    if (HAL_JPEG_Decode_DMA(&g_hjpeg, JPEG_FILE_BUF,
-                            (size > BENCH_CHUNK) ? BENCH_CHUNK : size,
-                            YCBCR_BUF, BENCH_CHUNK) != HAL_OK) {
-        g_dma_mode = false;
-        g_dbg_bench_err = -3;
-        return false;
-    }
-    {
-        uint32_t t0 = HAL_GetTick();
-        while (g_bench_done == 0u) {
-            if ((HAL_GetTick() - t0) > 3000u) {
-                g_dbg_bench_err = -4;
-                g_dma_mode = false;
-                return false;
-            }
-        }
-    }
-    g_dma_mode = false;
-    if (g_bench_done != 1u) {
-        g_dbg_bench_err      = -5;
-        g_dbg_bench_jerr     = HAL_JPEG_GetError(&g_hjpeg);
-        g_dbg_bench_derr_in  = HAL_DMA_GetError(&g_bdma_in);
-        g_dbg_bench_derr_out = HAL_DMA_GetError(&g_bdma_out);
-        return false;
-    }
-    return true;
-}
-
-/* size 是目前 JPEG_FILE_BUF 裡那張照片的位元組數。 */
-static void run_bench(uint32_t size, uint32_t w, uint32_t h)
-{
-    const uint32_t N = 8u;
-    uint32_t c0, i;
-
-    g_dbg_bench_kpx = (w * h) / 1000u;
-
-    /* DMA 通道要先建立，後面每一項測試都用得到。
-     * 上一版把測試插在這行之前，結果 hdmain/hdmaout 還是 NULL，
-     * HAL_JPEG_Decode_DMA 直接拒絕 —— 純粹是順序錯，不是 DMA 有問題。 */
-    if (!bench_dma_setup()) {
-        g_dbg_bench_err = -6;
-        return;
-    }
-
-    /* --- 一、正確性：兩條路徑解同一張，比對輸出 --- */
-    if (bench_decode(size, false)) {
-        uint32_t n = g_out_total;
-
-        if (n > RGB_CAP) { n = RGB_CAP; }
-        SCB_InvalidateDCache_by_Addr((uint32_t *)YCBCR_BUF, (int32_t)n);
-        memcpy(RGB_BUF, YCBCR_BUF, n);          /* 收好輪詢版的結果 */
-        g_dbg_cmp_len_poll = n;
-        g_dbg_cmp_sum_poll = buf_sum(RGB_BUF, n);
-
-        if (bench_decode(size, true)) {
-            uint32_t m = g_out_total;
-
-            SCB_InvalidateDCache_by_Addr((uint32_t *)YCBCR_BUF, (int32_t)m);
-            g_dbg_cmp_len_dma = m;
-            g_dbg_cmp_sum_dma = buf_sum(YCBCR_BUF, (m > RGB_CAP) ? RGB_CAP : m);
-
-            if (m != n) {
-                g_dbg_cmp_diff = -1;            /* 長度就不一樣 */
-            } else {
-                g_dbg_cmp_diff = 0;
-                for (uint32_t i = 0; i < n; i++) {
-                    if (RGB_BUF[i] != YCBCR_BUF[i]) {
-                        g_dbg_cmp_diff = (int32_t)i + 1;   /* +1 免得跟「相同」混淆 */
-                        break;
-                    }
-                }
-            }
-        }
-    }
-
-    /* --- 二、壓力測試：連續解到失敗為止，看撐幾次 --- */
-    g_dbg_bench_err = 0;
-    for (i = 0; i < 40u; i++) {
-        if (!bench_decode(size, true)) {
-            g_dbg_soak_err = g_dbg_bench_err;
-            break;
-        }
-        g_dbg_soak_ok = i + 1u;
-    }
-    g_dbg_bench_err = 0;
-
-    /* 輪詢版先跑，這時候還沒碰任何 DMA 或中斷。 */
-    c0 = cyc_start();
-    for (i = 0; i < N; i++) {
-        if (!bench_decode(size, false)) { g_dbg_bench_err = -1; goto done; }
-    }
-    g_dbg_bench_poll_us = cyc_us(c0) / N;
-
-    c0 = cyc_start();
-    for (i = 0; i < N; i++) {
-        if (!bench_decode(size, true)) {
-            if (g_dbg_bench_err == 0) { g_dbg_bench_err = -2; }
-            goto done;
-        }
-    }
-    g_dbg_bench_dma_us = cyc_us(c0) / N;
-    g_dbg_bench_n = N;
-
-done:
-    bench_dma_teardown();
-}
 
 bool photo_init(void)
 {
@@ -1203,33 +902,16 @@ photo_result_t photo_show(const char *path)
 
     /* 輪詢版解碼。相簿一次只處理一張，不需要 DMA 的非同步性，
      * 少掉回呼與中斷設定，出錯的地方也少。 */
-    /* 正式路徑維持輪詢版。
+    /* 輪詢版解碼。相簿一次只處理一張，不需要 DMA 的非同步性。
      *
-     * DMA 在隔離模式下完全正確（輸出與輪詞逐位元組相同、連續 40 次穩定），
-     * 但整合進正式路徑後：第一張成功，之後 HAL_JPEG_Decode_DMA 永遠回傳
-     * BUSY，而且連 HAL_JPEG_Abort() 都救不回來，退回輪詢也一起失敗。
-     *
-     * 差異在於正式路徑的兩次解碼之間夾了 SD 讀檔、轉色、縮放、顯示與等待，
-     * 而隔離測試是背對背連續呼叫。真正的原因還沒找到，所以先不切換 ——
-     * 相簿的可用性優先於 14% 的速度。基準測試留著，隨時可以再查。 */
+     * 註：DMA 版實測快 4.8 倍（141.5 -> 30.7 ms/Mpx），輸出逐位元組相同，
+     * 但整合進這條路徑會在第一張之後把週邊卡死，原因未明（board-notes 16.6）。
+     * 那個題目連同影片播放一起搬到獨立專案處理，這裡維持已驗證的輪詢版。 */
     if (HAL_JPEG_Decode(&g_hjpeg, JPEG_FILE_BUF, size,
                         YCBCR_BUF, YCBCR_CAP, 10000u) != HAL_OK) {
         return PHOTO_ERR_DECODE;
     }
     g_dbg_us_jpeg = cyc_us(c0);
-
-    /* 只有外部（SWD）把旗標寫成非 0 才會執行。跑完自己清掉，只跑一次。 */
-    if (g_dbg_bench_go != 0u) {
-        JPEG_ConfTypeDef bi;
-
-        g_dbg_bench_go = 0u;
-        if (HAL_JPEG_GetInfo(&g_hjpeg, &bi) == HAL_OK) {
-            run_bench(size, bi.ImageWidth, bi.ImageHeight);
-        } else {
-            g_dbg_bench_err = -7;
-        }
-        (void)bench_decode(size, false);
-    }
 
     if (HAL_JPEG_GetInfo(&g_hjpeg, &info) != HAL_OK) {
         return PHOTO_ERR_DECODE;
