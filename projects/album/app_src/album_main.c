@@ -1406,16 +1406,23 @@ static void flash_orient(void)
 #define CTL_BTN_H    72
 #define CTL_X0       8
 #define CTL_GAP      8
-#define CTL_COUNT    5
+#define CTL_COUNT    4
 /* 上限取直立時算出來的寬度：文字最寬是「上一張」三個字 = 72px，
  * 104 留得下邊距又不會空蕩。橫向不再把它撐成 150px。 */
 #define CTL_BTN_MAX  104
 
+/* 沒有「繼續」這一顆 —— 點控制列以外的任何地方就是繼續，跟影片播放器一樣。
+ *
+ * 原本有那顆按鈕時，同一次觸碰會被兩個地方吃到：paused_loop 把它判成
+ * 「繼續」而恢復播放，接著播放中的「點畫面暫停」又把同一次觸碰算進去，
+ * 於是放一張就立刻回到暫停 —— 使用者看到的是「按繼續沒用」。
+ * 實測：每按一次 decode_ok 都有 +1（確實恢復了），但 pause_entries 也 +1。
+ * 用 SWD 注入同一個動作（沒有手指）則會連續播下去，兩相對照就定案了。 */
 static const char *const CTL_NAME[CTL_COUNT] = {
-    "上一張", "繼續", "下一張", "方向", "返回"
+    "上一張", "下一張", "方向", "返回"
 };
 static const int CTL_ACT[CTL_COUNT] = {
-    PAUSE_PREV, PAUSE_RESUME, PAUSE_NEXT, PAUSE_ROTATE, PAUSE_MENU
+    PAUSE_PREV, PAUSE_NEXT, PAUSE_ROTATE, PAUSE_MENU
 };
 
 /* 版面跟著方向走：直立畫布是 480x800、橫向是 800x480，寫死座標會跑掉。 */
@@ -1607,10 +1614,19 @@ static int paused_loop_inner(void)
                 g_dbg_last_action = hit;
                 return hit;
             }
-            if (hit != -1) {
-                wait_release();     /* 點在控制列的空白處：吃掉這次觸碰 */
+            if (hit == -1) {
+                /* 點在控制列以外 = 繼續播放。
+                 *
+                 * 這裡**要等手指離開才回報**（其他按鈕不用）：恢復播放之後
+                 * 播放迴圈也在看觸控，同一次觸碰會立刻又被判成「暫停」。
+                 * 翻頁那幾顆不會有這個問題，因為它們後面接著 1.5 秒的解碼，
+                 * 手指早就離開了。 */
+                wait_release();
+                g_paused = 0u;
+                g_dbg_last_action = PAUSE_RESUME;
+                return PAUSE_RESUME;
             }
-            /* 控制列以外：什麼都不做。 */
+            wait_release();         /* 控制列上的空白處：吃掉這次觸碰 */
         }
         nap(8);
     }
