@@ -98,6 +98,30 @@ volatile uint32_t g_dbg_ltdc_te;         /* 傳輸錯誤次數 */
 volatile uint32_t g_dbg_freeze;
 volatile uint32_t g_dbg_nopresent;
 
+/* ---- 解碼失敗的診斷（26% 的影格 jerr=ERROR_DMA）----------------------
+ *
+ * 已知的事實：失敗率兩次取樣都是 26.7%，除以圈數剛好是 120 格裡固定 32 格 ——
+ * 也就是**確定性的、跟影格內容相關**，不是隨機競爭。所以要問的不是「什麼時候
+ * 壞」而是「哪 32 格、它們有什麼共同點」。
+ *
+ * failmap/okmap 用位元記錄每個索引的結果（120 格 = 4 個字），這樣一次 SWD
+ * 讀取就拿到完整的失敗集合，不必反覆試。
+ *
+ * snap[] 凍結在**第一次**失敗的當下，記錄 HAL 與 DMA 通道的實際設定。
+ * USE（user setting error）是硬體在啟動時對設定的抱怨 —— 位址對齊、
+ * 區塊長度與資料寬度不相容都會觸發，把 CSAR/CBR1 讀出來就知道是哪一個，
+ * 不用在幾種可能之間猜（board-notes 16.4 就是靠這招一次定位的）。 */
+volatile uint32_t g_dbg_failmap[4];
+volatile uint32_t g_dbg_okmap[4];
+volatile uint32_t g_dbg_snap[24];
+volatile uint32_t g_dbg_snap_done;
+
+static uint32_t       g_cur_idx;         /* 正在解的影格索引 */
+static uint32_t       g_cur_size;
+static const uint8_t *g_cur_jpg;
+static uint32_t       g_in_cb;           /* 這格呼叫了幾次 GetDataCallback */
+static uint32_t       g_out_cb;
+
 static uint32_t g_next_ms;               /* 下一格該顯示的時刻 */
 
 static inline uint32_t cyc_start(void) { return DWT->CYCCNT; }
@@ -116,6 +140,7 @@ void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *hjpeg, uint8_t *pDataOut,
     uint32_t end = (uint32_t)(pDataOut - YCBCR_BUF) + OutDataLength;
     uint32_t left;
 
+    g_out_cb++;
     if (end > g_out_total) {
         g_out_total = end;      /* 取最大值不累加：HAL 可能對同一批回呼兩次 */
     }
@@ -130,18 +155,76 @@ void HAL_JPEG_GetDataCallback(JPEG_HandleTypeDef *hjpeg, uint32_t NbDecodedData)
 {
     uint32_t n;
 
+    g_in_cb++;
     if (NbDecodedData >= g_in_left) {
         g_in_left = 0;
+        /* 沒有資料了要**明講**。HAL 的說明寫得很清楚：輸入結束時要用
+         * InDataLength = 0 呼叫一次。直接 return 的話 pJpegInBuffPtr 與
+         * InDataLength 都留著上一次的值，而 JPEG_DMAInCpltCallback 只檢查
+         * 「InDataLength > 0」就重啟 DMA —— 等於把同一塊資料再送一次。 */
+        HAL_JPEG_ConfigInputBuffer(hjpeg, (uint8_t *)g_in_ptr, 0u);
         return;
     }
     g_in_ptr  += NbDecodedData;
     g_in_left -= NbDecodedData;
     n = (g_in_left > CHUNK) ? CHUNK : g_in_left;
+
+    /* 長度一定要是 4 的倍數。
+     *
+     * HPDMA 的來源／目的資料寬度都設成 word，BNDT 不是 4 的倍數硬體就報
+     * USE（user setting error）。HAL 只在長度 >= 4 時幫忙進位，剩 1~3 個
+     * 位元組時那條分支是「Nothing to do」，把 2 原封不動送進 DMA。
+     *
+     * 這就是 26% 影格解碼失敗的全部原因：JPEG 核心消耗的量永遠是 4 的倍數，
+     * 所以整包一次餵完的小影格會在最後剩下 size%4 個位元組。實測 48 張單塊
+     * 影格裡 size%4!=0 的 32 張**每一次都失敗**、size%4==0 的 16 張全過，
+     * 72 張要分塊的大影格因為尾段夠長（HAL 會進位）也全過 —— 32/120 = 26.7%。
+     *
+     * 往上取整是安全的：packframes.py 把每格補齊到 4 位元組邊界，多讀到的
+     * 是補的 0，而且落在 EOI 之後，解碼器不會理它。 */
+    n = (n + 3u) & ~3u;
     HAL_JPEG_ConfigInputBuffer(hjpeg, (uint8_t *)g_in_ptr, n);
 }
 
 void HAL_JPEG_DecodeCpltCallback(JPEG_HandleTypeDef *hjpeg) { (void)hjpeg; g_done = 1u; }
-void HAL_JPEG_ErrorCallback(JPEG_HandleTypeDef *hjpeg)      { (void)hjpeg; g_done = 2u; }
+
+void HAL_JPEG_ErrorCallback(JPEG_HandleTypeDef *hjpeg)
+{
+    g_done = 2u;
+
+    /* 只留第一次的現場。之後的失敗會覆蓋掉最有價值的那一筆，而且
+     * 錯誤碼在後續的 DeInit/Init 會被清成 0（board-notes 已經吃過這個虧）。 */
+    if (g_dbg_snap_done != 0u) {
+        return;
+    }
+    g_dbg_snap[0]  = g_cur_idx;
+    g_dbg_snap[1]  = g_cur_size;
+    g_dbg_snap[2]  = g_in_cb;
+    g_dbg_snap[3]  = g_out_cb;
+    g_dbg_snap[4]  = (uint32_t)(g_in_ptr - g_cur_jpg);   /* 輸入消耗到哪 */
+    g_dbg_snap[5]  = g_in_left;
+    g_dbg_snap[6]  = g_out_total;
+    g_dbg_snap[7]  = hjpeg->InDataLength;
+    g_dbg_snap[8]  = (uint32_t)hjpeg->pJpegInBuffPtr;
+    g_dbg_snap[9]  = hjpeg->OutDataLength;
+    g_dbg_snap[10] = (uint32_t)hjpeg->pJpegOutBuffPtr;
+    g_dbg_snap[11] = hjpeg->ErrorCode;
+    g_dbg_snap[12] = (uint32_t)hjpeg->State;
+    g_dbg_snap[13] = hjpeg->Context;
+    /* 輸入通道（HPDMA1_Channel0）的實際設定：USE 就是硬體對這幾個值的抱怨 */
+    g_dbg_snap[14] = HPDMA1_Channel0->CSAR;
+    g_dbg_snap[15] = HPDMA1_Channel0->CDAR;
+    g_dbg_snap[16] = HPDMA1_Channel0->CBR1;
+    g_dbg_snap[17] = HPDMA1_Channel0->CTR1;
+    g_dbg_snap[18] = HPDMA1_Channel0->CSR;
+    /* 輸出通道（HPDMA1_Channel1） */
+    g_dbg_snap[19] = HPDMA1_Channel1->CDAR;
+    g_dbg_snap[20] = HPDMA1_Channel1->CBR1;
+    g_dbg_snap[21] = HPDMA1_Channel1->CSR;
+    g_dbg_snap[22] = g_dma_in.ErrorCode;
+    g_dbg_snap[23] = g_dma_out.ErrorCode;
+    g_dbg_snap_done = 1u;
+}
 
 void HPDMA1_Channel0_IRQHandler(void) { HAL_DMA_IRQHandler(&g_dma_in); }
 void HPDMA1_Channel1_IRQHandler(void) { HAL_DMA_IRQHandler(&g_dma_out); }
@@ -356,13 +439,23 @@ static void present(void)
 
 static bool decode_frame(const uint8_t *jpg, uint32_t size)
 {
+    uint32_t first;
+
     g_out_total = 0;
     g_in_ptr    = jpg;
     g_in_left   = size;
     g_done      = 0u;
+    g_cur_jpg   = jpg;
+    g_cur_size  = size;
+    g_in_cb     = 0u;
+    g_out_cb    = 0u;
 
-    if (HAL_JPEG_Decode_DMA(&g_hjpeg, (uint8_t *)jpg,
-                            (size > CHUNK) ? CHUNK : size,
+    /* 第一塊也要是 4 的倍數。HAL 在啟動時的處理是**捨去**
+     * （`InDataLength - InDataLength % 4`），續傳時卻是**進位** —— 兩邊規則
+     * 不一致。捨去會把尾巴留給下一次，而那個尾巴正好是 1~3 個位元組時就
+     * 觸發 USE。這裡先進位，小影格就一次餵完，不會有第二次啟動。 */
+    first = (size > CHUNK) ? CHUNK : ((size + 3u) & ~3u);
+    if (HAL_JPEG_Decode_DMA(&g_hjpeg, (uint8_t *)jpg, first,
                             YCBCR_BUF, CHUNK) != HAL_OK) {
         g_dbg_lasterr = -3;
         return false;
@@ -385,24 +478,21 @@ static bool decode_frame(const uint8_t *jpg, uint32_t size)
         g_dbg_derr_out = HAL_DMA_GetError(&g_dma_out);
     }
 
-    /* 診斷：每格之間完整重新初始化 JPEG。
+    /* 每格之間完整重新初始化 JPEG。這是結論不是實驗（board-notes 16.8）。
      *
-     * Abort 不足以解決「連續 N 格後永久 BUSY」（相簿 8 格、這裡 24 格），
-     * 所以改用最重的手段。如果這樣就不卡，代表是週邊或 HAL 的狀態累積，
-     * 而不是單次操作沒收乾淨 —— 那才知道要往哪裡找真正的原因。
-     * DeInit+Init 每格約幾十微秒，相對 62ms 的轉色可以忽略。 */
+     * 症狀：連續 N 格之後 HAL_JPEG_Decode_DMA 永遠回傳 BUSY（相簿是第 8 張、
+     * 這裡是第 24 格），而且 HAL_JPEG_Abort() 救不回來 —— 兩邊都試過。
+     * 所以累積的是週邊/HAL 的狀態，不是單次操作沒收乾淨。
+     * 加上這段之後可以連續播放上千格不停。
+     * 成本每格幾十微秒，相對整格 31ms 可以忽略。 */
     (void)HAL_JPEG_DeInit(&g_hjpeg);
     g_hjpeg.Instance = JPEG;
     (void)HAL_JPEG_Init(&g_hjpeg);
 
-    /* 每次解碼結束後強制收回 READY。
-     *
-     * 症狀：連續 N 次成功後 HAL_JPEG_Decode_DMA 永遠回傳 BUSY（相簿是 8 次、
-     * 這裡是 24 次），週邊再也回不來。假設是解碼結束時 HAL 會再呼叫一次
-     * DataReadyCallback，而我們在那裡又餵了一塊輸出緩衝區 —— HAL 因此認為
-     * 還有輸出要送，狀態沒有回到 READY，累積幾次之後就卡死。
-     *
-     * Abort 是最直接的驗證：如果加了就不再卡死，假設就成立。 */
+    /* 這個 Abort 是當初驗證「永久 BUSY」假設時加的，上面的 DeInit+Init 才是
+     * 真正的解法，它其實已經是多餘的（而且會把 g_dma_* 的 ErrorCode 弄髒成
+     * NO_XFER，干擾之後的診斷）。先留著不動：目前這條路徑實測 1940 格 0 失敗，
+     * 要拿掉應該單獨改、單獨量，不要跟修正混在同一次。 */
     (void)HAL_JPEG_Abort(&g_hjpeg);
 
     if (g_done != 1u) {
@@ -459,12 +549,15 @@ void video_run(void)
         uint32_t       c_all = cyc_start();
         uint32_t       c0;
 
+        g_cur_idx = use;
         c0 = cyc_start();
         if (!decode_frame(jpg, len)) {
             g_dbg_fail++;
+            g_dbg_failmap[use >> 5] |= 1u << (use & 31u);
             idx = (idx + 1u) % hdr->count;
             continue;
         }
+        g_dbg_okmap[use >> 5] |= 1u << (use & 31u);
         g_dbg_sum_dec += cyc_us(c0);
 
         if (HAL_JPEG_GetInfo(&g_hjpeg, &info) != HAL_OK ||
