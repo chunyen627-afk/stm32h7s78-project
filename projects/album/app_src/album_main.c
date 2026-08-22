@@ -687,7 +687,8 @@ static video_info_t g_vids[MAX_VIDEOS];
 static uint32_t     g_vid_count;
 volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
 volatile uint32_t   g_dbg_autoplay;    /* SWD 可寫，直接開始放照片 */
-volatile uint32_t   g_dbg_fakedirs;    /* SWD 可寫，測試清單捲動用 */
+volatile uint32_t   g_dbg_fakedirs;    /* SWD 可寫，測試資料夾清單捲動 */
+volatile uint32_t   g_dbg_fakevids;    /* SWD 可寫，測試影片清單捲動 */
 
 static bool ends_with_bin(const char *name)
 {
@@ -912,8 +913,20 @@ static void play_video(const video_info_t *v)
 }
 
 /* 影片清單。沒有影片時不會走到這裡（選單上的按鈕會是暗的）。 */
-#define VROW_Y0      140
-#define VROW_H       64
+#define VROW_Y0        140
+#define VROW_H         64
+/* 可見列數要夾制。原本是有幾部就畫幾部，第 10 部開始會壓到下方的「返回」鈕、
+ * 第 11 部以後直接畫到畫面外 —— 而且沒有捲動，等於永遠選不到。 */
+#define VROWS_VISIBLE  8
+#define VBTN_BACK_Y    720
+#define VBTN_BACK_H    62
+
+static uint32_t g_vscroll;
+
+static uint32_t max_vscroll(void)
+{
+    return (g_vid_count > VROWS_VISIBLE) ? (g_vid_count - VROWS_VISIBLE) : 0u;
+}
 
 static void draw_video_list(void)
 {
@@ -921,21 +934,32 @@ static void draw_video_list(void)
     gfx_clear(COL_BG);
     gfx_text_center(GFX_W / 2, 60, "選擇影片", COL_TEXT);
 
-    for (uint32_t i = 0; i < g_vid_count; i++) {
-        int y = VROW_Y0 + (int)i * VROW_H;
+    {
+        uint32_t shown = g_vid_count - g_vscroll;
 
-        gfx_pill(20, y, GFX_W - 40, VROW_H - 10, COL_PANEL);
-        draw_name_clipped(38, y + 18, g_vids[i].name, GFX_W - 150, COL_TEXT);
-        {
-            uint32_t fps100 = g_vids[i].fps_x100 ? g_vids[i].fps_x100 : 2400u;
+        if (shown > VROWS_VISIBLE) {
+            shown = VROWS_VISIBLE;
+        }
+        for (uint32_t i = 0; i < shown; i++) {
+            uint32_t idx = g_vscroll + i;
+            int      y   = VROW_Y0 + (int)i * VROW_H;
+            uint32_t fps100 = g_vids[idx].fps_x100 ? g_vids[idx].fps_x100
+                                                   : 2400u;
 
+            gfx_pill(20, y, GFX_W - 40, VROW_H - 10, COL_PANEL);
+            draw_name_clipped(38, y + 18, g_vids[idx].name,
+                              GFX_W - 150, COL_TEXT);
             draw_time(GFX_W - 100, y + 18,
-                      (uint32_t)((uint64_t)g_vids[i].count * 100u / fps100),
+                      (uint32_t)((uint64_t)g_vids[idx].count * 100u / fps100),
                       COL_DIM);
         }
+        if (g_vid_count > VROWS_VISIBLE) {
+            gfx_text_center(GFX_W / 2, VROW_Y0 + VROWS_VISIBLE * VROW_H + 4,
+                            "上下滑動看更多", COL_DIM);
+        }
     }
-    gfx_pill(16, 720, GFX_W - 32, 62, COL_PANEL);
-    gfx_text_center(GFX_W / 2, 732, "返回", COL_TEXT);
+    gfx_pill(16, VBTN_BACK_Y, GFX_W - 32, VBTN_BACK_H, COL_PANEL);
+    gfx_text_center(GFX_W / 2, VBTN_BACK_Y + 12, "返回", COL_TEXT);
 }
 
 static void video_list_screen(void)
@@ -965,19 +989,56 @@ static void video_list_screen(void)
             continue;
         }
         (void)x;
-        if (y >= 720 && y < 782) {
+        if (y >= VBTN_BACK_Y && y < VBTN_BACK_Y + VBTN_BACK_H) {
             wait_release();
             return;
         }
-        if (y >= VROW_Y0) {
-            uint32_t i = (uint32_t)(y - VROW_Y0) / VROW_H;
+        if (y >= VROW_Y0 && y < VROW_Y0 + VROWS_VISIBLE * VROW_H) {
+            /* 跟資料夾清單同一套：上下拖曳捲動，單純點一下才是選片。 */
+            uint32_t seen = HAL_GetTick();
+            int      dy = 0, tx, ty;
 
-            if (i < g_vid_count) {
-                wait_release();
-                play_video(&g_vids[i]);
-                dirty = true;
+            for (;;) {
+                watchdog_feed();
+                if (read_touch(&tx, &ty)) {
+                    int d = ty - y;
+
+                    if (((d < 0) ? -d : d) > ((dy < 0) ? -dy : dy)) {
+                        dy = d;
+                    }
+                    seen = HAL_GetTick();
+                } else if ((HAL_GetTick() - seen) > SWIPE_GAP_MS) {
+                    break;
+                }
+                nap(10);
+            }
+
+            if (dy <= -SCROLL_MIN_DY || dy >= SCROLL_MIN_DY) {
+                int32_t rows = (int32_t)(-dy / VROW_H);
+                int32_t ns;
+
+                if (rows == 0) {
+                    rows = (dy < 0) ? 1 : -1;
+                }
+                ns = (int32_t)g_vscroll + rows;
+                if (ns < 0) { ns = 0; }
+                if (ns > (int32_t)max_vscroll()) { ns = (int32_t)max_vscroll(); }
+                if ((uint32_t)ns != g_vscroll) {
+                    g_vscroll = (uint32_t)ns;
+                    dirty = true;
+                }
                 continue;
             }
+            {
+                uint32_t i = g_vscroll + (uint32_t)(y - VROW_Y0) / VROW_H;
+
+                if (i < g_vid_count) {
+                    play_video(&g_vids[i]);
+                    dirty = true;
+                    continue;
+                }
+            }
+            continue;
         }
         wait_release();
     }
@@ -2112,6 +2173,19 @@ static bool mount_and_scan(void)
     /* 影片只掃根目錄，很快。放在照片掃描之後，這樣選單畫出來時就知道
      * 要不要顯示「影片」按鈕。 */
     scan_videos();
+
+    /* 測試影片清單捲動用。跟 g_dbg_fakedirs 一樣**只存在記憶體**，
+     * 假的那幾部 count = 0，點下去 video_open() 會被檔頭檢查擋掉。 */
+    if (g_dbg_fakevids > g_vid_count && g_dbg_fakevids <= MAX_VIDEOS) {
+        for (uint32_t i = g_vid_count; i < g_dbg_fakevids; i++) {
+            (void)snprintf(g_vids[i].name, VIDEO_NAME_MAX, "測試影片 %u",
+                           (unsigned)(i + 1u));
+            g_vids[i].path[0]  = 0;
+            g_vids[i].count    = 0;
+            g_vids[i].fps_x100 = 2400u;
+        }
+        g_vid_count = g_dbg_fakevids;
+    }
     watchdog_feed();
 
     /* 只有影片沒有照片也算可用 —— 使用者可能就是拿它當影片播放器。 */
