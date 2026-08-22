@@ -1401,6 +1401,9 @@ static void flash_orient(void)
 #define CTL_X0       8
 #define CTL_GAP      8
 #define CTL_COUNT    5
+/* 上限取直立時算出來的寬度：文字最寬是「上一張」三個字 = 72px，
+ * 104 留得下邊距又不會空蕩。橫向不再把它撐成 150px。 */
+#define CTL_BTN_MAX  104
 
 static const char *const CTL_NAME[CTL_COUNT] = {
     "上一張", "繼續", "下一張", "方向", "返回"
@@ -1411,11 +1414,24 @@ static const int CTL_ACT[CTL_COUNT] = {
 
 /* 版面跟著方向走：直立畫布是 480x800、橫向是 800x480，寫死座標會跑掉。 */
 static int ctl_y(void)     { return gfx_height() - CTL_H - 12; }
+
+/* 按鈕寬度有上限，整排置中。
+ *
+ * 原本是「把可用寬度平均分成五份」，直立（畫布 480）算出來 86px 剛好，
+ * 但橫向的畫布寬 800，同一條算式會把每顆撐到 150px —— 文字才 72px，
+ * 按鈕整個攤開變形。位置維持在畫布下方不動，只是不再跟著寬度長大。 */
 static int ctl_btn_w(void)
 {
-    return (gfx_width() - 2 * CTL_X0 - (CTL_COUNT - 1) * CTL_GAP) / CTL_COUNT;
+    int w = (gfx_width() - 2 * CTL_X0 - (CTL_COUNT - 1) * CTL_GAP) / CTL_COUNT;
+
+    return (w > CTL_BTN_MAX) ? CTL_BTN_MAX : w;
 }
-static int ctl_btn_x(int i) { return CTL_X0 + i * (ctl_btn_w() + CTL_GAP); }
+static int ctl_btn_x(int i)
+{
+    int total = CTL_COUNT * ctl_btn_w() + (CTL_COUNT - 1) * CTL_GAP;
+
+    return (gfx_width() - total) / 2 + i * (ctl_btn_w() + CTL_GAP);
+}
 
 static void ctl_backup(bool restore)
 {
