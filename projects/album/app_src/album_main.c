@@ -1417,17 +1417,15 @@ static void flash_orient(void)
 #define OV_ORIENT_X  ((int)GFX_W / 2 - OV_PILL_W / 2)
 #define OV_PAUSE_X   ((int)GFX_W - 20 - OV_PILL_W)
 
-/* 拉桿的幾何直接沿用影片疊加層的常數。 */
-#define PB_X         40
-#define PB_W         400
-#define PB_Y         700
-#define PB_H         14
-#define PB_HIT       60
-#define OV_BOT_Y     (PB_Y - 16)
-#define OV_BOT_H     96
+/* 下方只剩張數，沒有拉桿。
+ *
+ * 原本照影片放了一條可拖曳的拉桿，但翻頁改成整片畫面都能拉之後它就只剩
+ * 裝飾 —— 而且是會誤導人的裝飾（看起來可以拖，實際上跟旁邊沒兩樣）。
+ * 張數留著：四千多張的時候，知道自己在哪還是有用的。 */
+#define OV_BOT_Y     712
+#define OV_BOT_H     40
 
-#define PAUSE_SEEK   5           /* 拉桿區域（內部用，不會回報出去） */
-#define SEEK_MIN_DX  50          /* 拉多少才算數 */
+#define SEEK_MIN_DX  50          /* 水平拉多少才算翻頁 */
 
 static uint32_t g_ov_index;      /* 疊加層要顯示的張數（由 pause_session 給） */
 
@@ -1463,27 +1461,22 @@ static void ctl_backup(bool restore)
     (void)strip_backup(OV_BOT_Y, OV_BOT_H, sv, restore);
 }
 
-/* 只重畫下方的拉桿。拖曳時每幾毫秒就要更新一次，不能整個疊加層重畫。 */
-static void ov_draw_bar(uint32_t idx)
+/* 下方的張數指示。 */
+static void ov_draw_count(uint32_t idx)
 {
     uint16_t *back   = gfx_framebuffer();
     uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
     bool      was_ls = gfx_is_landscape();
     uint32_t  total  = g_order_count ? g_order_count : 1u;
-    uint32_t  done_w = (uint32_t)PB_W * idx / total;
+    int       cx     = (int)GFX_W / 2;
 
     gfx_set_orientation(false);
     gfx_set_framebuffer(front);
 
     gfx_fill_rect(0, OV_BOT_Y, (int)GFX_W, OV_BOT_H, COL_BG);
-    gfx_fill_rect(PB_X, PB_Y, PB_W, PB_H, COL_LINE);
-    if (done_w != 0u) {
-        gfx_fill_rect(PB_X, PB_Y, (int)done_w, PB_H, COL_ACCENT);
-    }
-    gfx_fill_rect(PB_X + (int)done_w - 3, PB_Y - 8, 6, PB_H + 16, COL_TEXT);
-
-    gfx_number(PB_X, PB_Y + 30, idx + 1u, COL_TEXT);
-    gfx_number_right(PB_X + PB_W, PB_Y + 30, total, COL_DIM);
+    gfx_number_right(cx - 8, OV_BOT_Y + 8, idx + 1u, COL_TEXT);
+    gfx_text_center(cx, OV_BOT_Y + 8, "/", COL_DIM);
+    gfx_number(cx + 12, OV_BOT_Y + 8, total, COL_DIM);
 
     gfx_set_framebuffer(back);
     gfx_set_orientation(was_ls);
@@ -1513,7 +1506,7 @@ static void ctl_draw(void)
     gfx_set_framebuffer(back);
     gfx_set_orientation(was_ls);
 
-    ov_draw_bar(g_ov_index);
+    ov_draw_count(g_ov_index);
 }
 
 /* 回傳動作代碼；-1 = 疊加層以外（＝繼續播放）。
@@ -1527,9 +1520,6 @@ static int ctl_hit(int x, int y)
         if (x >= OV_ORIENT_X && x < OV_ORIENT_X + OV_PILL_W) {
             return PAUSE_ROTATE;
         }
-    }
-    if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
-        return PAUSE_SEEK;
     }
     return -1;
 }
@@ -1685,24 +1675,6 @@ static int paused_loop_inner(void)
             g_dbg_tx  = x0;
             g_dbg_ty  = y0;
             g_dbg_hit = hit;
-
-            if (hit == PAUSE_SEEK) {
-                int dx = measure_drag(x0);
-
-                if (dx <= -SEEK_MIN_DX) {
-                    g_paused          = 0u;
-                    g_dbg_last_action = PAUSE_PREV;
-                    return PAUSE_PREV;
-                }
-                if (dx >= SEEK_MIN_DX) {
-                    g_paused          = 0u;
-                    g_dbg_last_action = PAUSE_NEXT;
-                    return PAUSE_NEXT;
-                }
-                /* 拉得不夠：當成沒按到，留在暫停。 */
-                ov_until = HAL_GetTick() + OV_MS;
-                continue;
-            }
 
             if (hit >= 0) {
                 /* 按下就回報，不等手指離開。切方向要留在暫停，
