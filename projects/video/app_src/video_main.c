@@ -90,6 +90,29 @@
 #define MCU_ROW_BYTES   ((PHYS_W / 16u) * 384u)     /* 19200，只對 4:2:0 成立 */
 #define BAND_MCU_ROWS   2u
 #define BAND_BYTES      (BAND_MCU_ROWS * MCU_ROW_BYTES)
+#define TOTAL_MCU_ROWS  (PHYS_H / 16u)              /* 30 */
+
+/* ---- 為什麼分帶預設關閉 ----------------------------------------
+ *
+ * 分帶確實有效（實測轉色 19.91 -> 13.72ms、能力上限 29.1 -> 36.9 fps），
+ * 但這個幾何**沒有合法的分帶大小**，兩個條件互相打架：
+ *
+ *  1. **一帶不能超過 65,535 bytes** —— HPDMA 的 BNDT 只有 16 位元，而 HAL 是
+ *     `size & 0xFFFF` 遮掉、不檢查（board-notes 16.2）。更糟的是遮掉之後
+ *     `JPEG_GET_DMA_REMAIN_DATA` 仍然用「原本的 OutDataLength 減 BNDT 餘量」
+ *     回報長度 —— 也就是**回報 76,800、實際只寫了 11,264**，解碼不會報錯，
+ *     畫面卻是大半舊資料。所以最多 3 條 MCU 列（57,600）。
+ *
+ *  2. **一帶的列數不能整除總列數** —— 整除時最後一塊輸出填滿的瞬間正好也是
+ *     解碼結束，HAL 的收尾走不下去，解碼永遠不回報完成（board-notes 16.13）。
+ *
+ * 800x480 的 4:2:0 是 30 條 MCU 列，而 1、2、3 全都整除 30。無解。
+ *
+ * 先前 2 條列跑了 2184 格沒事是**僥倖**：那是個競爭，換一份影格檔（讀檔延遲
+ * 不同）就現形 —— 實測換檔之後每格都在第 29 帶失敗（15 帶裡差最後一帶）。
+ *
+ * 所以預設關閉，程式碼保留給以後幾何不同時用（例如 720p 是 45 條，
+ * 2 條一帶 = 38,400 bytes 又不整除，就成立）。 */
 
 typedef struct {
     uint32_t magic, count, width, height, fps_x100, max_size;
@@ -183,7 +206,16 @@ static bool              g_band_ok;      /* 格式對得上，可以分帶 */
 
 /* SWD 可寫，用來 A/B：寫 0 就退回原本「整塊 YCbCr 放 PSRAM」的路徑，
  * 不用重編就能比較兩者的每格耗時。 */
-volatile uint32_t g_dbg_useband = 1u;
+/* 預設 0：見上面「為什麼分帶預設關閉」。設 1 只在幾何允許時才有意義。 */
+volatile uint32_t g_dbg_useband;
+/* 非 0 = 跳過 SD、直接用外部 Flash 的影格包。
+ * PSRAM 時脈實驗要用：200MHz 下 PSRAM 讀取會出錯，而 SD 來源要把影格讀進
+ * PSRAM 再解碼，輸入被弄壞就量不到速度。Flash 是記憶體映射、就地解碼，
+ * 完全不經 PSRAM。 */
+volatile uint32_t g_dbg_force_flash;
+/* 非 0 = 不按素材格率對時，全速跑。量「能力上限」用 —— 對時開著的時候
+ * 「等垂直消隱」那一欄是被對時相位決定的，不能拿來推算上限。 */
+volatile uint32_t g_dbg_nopace;
 volatile uint32_t g_dbg_bands;           /* 累計轉過幾帶 */
 volatile uint32_t g_dbg_band_short;      /* 長度不是整條 MCU 列的次數 */
 
@@ -861,9 +893,16 @@ void video_run(void)
     JPEG_InitColorTables();
     dts_init();
 
-    /* 先試 SD，沒有就退回 Flash。 */
+    /* 先試 SD，沒有就退回 Flash。
+     *
+     * g_dbg_force_flash 是給 PSRAM 時脈實驗用的：200MHz 下 PSRAM 讀取會出錯，
+     * 而 SD 來源要把影格讀進 PSRAM 再解碼 —— 輸入被弄壞，量到的就不是速度
+     * 而是失敗。改走 Flash（記憶體映射、就地解碼、完全不經 PSRAM）之後，
+     * 只剩 framebuffer 的寫入會壞：畫面是雜訊，但時間量測仍然有效。 */
     g_dbg_stage = 2;
-    if (src_open_sd()) {
+    if (g_dbg_force_flash) {
+        g_dbg_src = src_open_flash() ? 2u : 0u;
+    } else if (src_open_sd()) {
         g_dbg_src = 1;
     } else if (src_open_flash()) {
         g_dbg_src = 2;
@@ -985,7 +1024,9 @@ void video_run(void)
         {
             uint32_t now = HAL_GetTick();
 
-            if ((int32_t)(g_next_ms - now) > 0) {
+            if (g_dbg_nopace) {
+                g_next_ms = now;    /* 不對時：量真實的能力上限 */
+            } else if ((int32_t)(g_next_ms - now) > 0) {
                 while ((int32_t)(g_next_ms - HAL_GetTick()) > 0) { }
             } else {
                 /* 跟不上就重新對時，不要一直追欠下的時間。 */
