@@ -24,6 +24,18 @@ cube/                 ST 韌體包 STM32CubeH7RS（gitignore，所有專案共�
 `cube/` 有 540MB，只放一份。任何專案的 `scripts/setup.sh` 都會抓進來，
 已經有了就跳過。
 
+## 換新板子：直接燒預編譯檔
+
+不想裝 540MB 的韌體包與 CubeIDE 的話，[firmware/](firmware) 裡有可以直上的
+燒錄檔：
+
+```bash
+./firmware/flash.sh --boot     # 新板子第一次：bootloader + 相簿
+./firmware/flash.sh            # 之後只更新相簿
+```
+
+硬體前提、PSRAM 時脈要不要改回 200MHz，見 [firmware/README.md](firmware/README.md)。
+
 ## 建置
 
 ```bash
