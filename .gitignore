@@ -33,3 +33,6 @@ projects/album/core/font_zh.h
 
 # 韌體包位置（舊版 album 用過，已不需要）
 .cube_path
+
+# PC 端測試台的產物（執行檔、原始影像、framebuffer、PNG）
+projects/*/test/out/
