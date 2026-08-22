@@ -278,9 +278,9 @@ static void wait_release(void)
         } else {
             clean++;
         }
-        nap(25);
+        nap(10);
     }
-    nap(120);
+    nap(40);
 }
 
 
@@ -674,6 +674,7 @@ static void build_order(void)
 static video_info_t g_vids[MAX_VIDEOS];
 static uint32_t     g_vid_count;
 volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
+volatile uint32_t   g_dbg_autoplay;    /* SWD 可寫，直接開始放照片 */
 
 static bool ends_with_bin(const char *name)
 {
@@ -1147,6 +1148,11 @@ static bool select_screen(void)
             dirty = true;
             continue;
         }
+        /* 除錯：直接開始放照片，讓遠端也追得動暫停/繼續的流程。 */
+        if (g_dbg_autoplay && selected_photo_count() > 0u) {
+            build_order();
+            return true;
+        }
         if (!screen_poll()) {
             /* 螢幕關著時不吃觸控，否則會在看不見的情況下改到設定。 */
             nap(30);
@@ -1510,6 +1516,19 @@ static int paused_loop_inner(void);
  * 等於每按一次就卡一秒 —— 使用者感覺到的「反應慢」大半來自這裡。 */
 static bool g_pause_flash;
 
+/* 除錯：SWD 寫入 PAUSE_*（0=繼續 1=返回 2=上一張 3=下一張 4=方向）就當成
+ * 按了那一顆。觸控沒辦法遠端重現，沒有這個鉤子就只能靠使用者回報。
+ * 不寫（維持 -1）就完全等於不存在。 */
+volatile int32_t  g_dbg_inject = -1;
+volatile uint32_t g_dbg_pause_entries;   /* 進了幾次暫停迴圈 */
+volatile int32_t  g_dbg_last_action;     /* 上一次回報的動作 */
+
+/* 暫停中最後一次觸控讀到什麼、判成哪一顆。按鈕按不到時，這三個數字直接
+ * 說明是座標不對還是判定不對 —— 不必猜。
+ * hit: >=0 是動作代碼，-1 = 不在控制列上，-1000 = 在列上但沒中按鈕。 */
+volatile int32_t  g_dbg_tx, g_dbg_ty, g_dbg_hit;
+volatile int32_t  g_dbg_ctl_y, g_dbg_ctl_bw;
+
 /* 進暫停就畫控制列，離開時還原底下的畫面。所有出口都會經過這裡，
  * 不會有「某條路徑忘了還原」的問題（board-notes 14.5 那個對稱性教訓）。 */
 static int paused_loop(void)
@@ -1527,18 +1546,29 @@ static int paused_loop_inner(void)
 {
     g_paused    = 1u;
     g_req_pause = 0u;               /* 消化掉進來的那一次 */
-    if (g_pause_flash) {
-        flash_icon(true);
-        g_pause_flash = false;
-    }
+    /* 不再閃暫停圖示。控制列跳出來本身就是最清楚的回饋，而那個圖示要停
+     * 幾百毫秒，等於每次進暫停都先卡一下。 */
+    g_pause_flash = false;
     /* 把上一個動作殘留的觸碰吃掉。放在**進來的時候**而不是「按下去之後」——
      * 按鈕要按下就有反應，不能等手指離開才動作。 */
     wait_release();
+
+    g_dbg_pause_entries++;
 
     for (;;) {
         int x0, y0;
 
         watchdog_feed();
+        if (g_dbg_inject >= 0) {
+            int hit = g_dbg_inject;
+
+            g_dbg_inject = -1;
+            if (hit != PAUSE_ROTATE) {
+                g_paused = 0u;
+            }
+            g_dbg_last_action = hit;
+            return hit;
+        }
         if (!sd_present()) {
             g_req_pause = 0u;
             g_paused    = 0u;
@@ -1562,6 +1592,11 @@ static int paused_loop_inner(void)
             int hit = ctl_hit(x0, y0);
 
             g_dbg_touch_hit++;
+            g_dbg_tx     = x0;
+            g_dbg_ty     = y0;
+            g_dbg_hit    = hit;
+            g_dbg_ctl_y  = ctl_y();
+            g_dbg_ctl_bw = ctl_btn_w();
             if (hit >= 0) {
                 /* **按下就回報**，不等手指離開 —— 殘留的觸碰由下一次進來
                  * 時的 wait_release() 吃掉。切方向要留在暫停，讓使用者
@@ -1569,6 +1604,7 @@ static int paused_loop_inner(void)
                 if (hit != PAUSE_ROTATE) {
                     g_paused = 0u;
                 }
+                g_dbg_last_action = hit;
                 return hit;
             }
             if (hit != -1) {
@@ -1627,7 +1663,8 @@ static int wait_interval(uint32_t already_ms)
 
             if (read_touch(&tx, &ty)) {
                 (void)tx; (void)ty;
-                wait_release();
+                /* 不在這裡等放開 —— paused_loop_inner 進來就會吃掉殘留的
+                 * 觸碰。在這裡等等於讓「點一下叫出控制列」多花兩百毫秒。 */
                 return 3;
             }
         }
