@@ -78,6 +78,14 @@ static uint32_t g_cur_top;
 static uint32_t g_front;
 static uint32_t g_interval_s = 2;      /* 預設 2 秒，可調 2~5 */
 
+/* 播放順序。預設隨機 —— 相框是隨手看的，固定順序會一直看到同幾張。
+ * 想照資料夾原本的順序（通常等於時間順序）就切成循序。 */
+static bool g_shuffle = true;
+static const char *const SEQ_NAME[2] = { "隨機", "循序" };
+
+#define SCROLL_MIN_DY 24        /* 選單清單：拉多少才算捲動而不是點選 */
+#define SWIPE_GAP_MS  150u      /* 容忍觸控中途漏報多久（board-notes 14.7）*/
+
 /* 開機掃描完是否直接開播。
  *
  * 預設 0 = 停在選單，讓使用者確認要播哪些資料夾再開始（資料夾本來就
@@ -650,6 +658,10 @@ static void build_order(void)
         }
     }
 
+    if (!g_shuffle) {
+        return;                     /* 循序：維持掃描到的順序 */
+    }
+
     /* Fisher-Yates。每次進播放都重洗，播完一輪也重洗，
      * 所以同一批照片不會每輪都同一個順序。 */
     for (uint32_t i = g_order_count; i > 1U; i--) {
@@ -675,6 +687,7 @@ static video_info_t g_vids[MAX_VIDEOS];
 static uint32_t     g_vid_count;
 volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
 volatile uint32_t   g_dbg_autoplay;    /* SWD 可寫，直接開始放照片 */
+volatile uint32_t   g_dbg_fakedirs;    /* SWD 可寫，測試清單捲動用 */
 
 static bool ends_with_bin(const char *name)
 {
@@ -978,20 +991,22 @@ static void video_list_screen(void)
 #define ROW_H        58
 /* 可見列數從 7 減成 6，騰出的 58px 給「方向」那一列。資料夾清單本來就
  * 可以上下滑，少一列的代價比擠不下設定小。 */
-#define ROWS_VISIBLE 6
-#define BTN_ALL_Y    516
+#define ROWS_VISIBLE 5
+#define BTN_ALL_Y    440
 #define BTN_ALL_H    48
-#define OR_Y         584
+#define OR_Y         506
 #define OR_H         48
 #define OR_X0        110
 #define OR_W         100
 #define OR_GAP       10
-#define IV_Y         652
+#define SEQ_Y        574
+#define SEQ_H        48
+#define IV_Y         642
 #define IV_H         48
 #define IV_X0        110
 #define IV_W         74
 #define IV_GAP       10
-#define BTN_GO_Y     720
+#define BTN_GO_Y     708
 #define BTN_GO_H     62
 /* 有影片時底下那列拆成「開始播放」＋「影片」兩顆。 */
 #define BTN_GO_W     280
@@ -1003,6 +1018,11 @@ static const char *const ORIENT_NAME[PHOTO_ORIENT_COUNT] = {
 };
 
 static uint32_t g_scroll;
+
+static uint32_t max_scroll(void)
+{
+    return (g_top_count > ROWS_VISIBLE) ? (g_top_count - ROWS_VISIBLE) : 0u;
+}
 
 static void draw_checkbox(int x, int y, bool on)
 {
@@ -1077,6 +1097,16 @@ static void draw_select_screen(void)
         bool on = ((uint32_t)photo_get_orientation() == o);
         gfx_pill(x, OR_Y, OR_W, OR_H, on ? COL_ACCENT : COL_PANEL);
         gfx_text_center(x + OR_W / 2, OR_Y + 14, ORIENT_NAME[o],
+                        on ? COL_BG : COL_TEXT);
+    }
+
+    gfx_text(20, SEQ_Y + 14, "順序", COL_DIM);
+    for (uint32_t k = 0; k < 2u; k++) {
+        int  x  = OR_X0 + (int)k * (OR_W + OR_GAP);
+        bool on = (g_shuffle == (k == 0u));
+
+        gfx_pill(x, SEQ_Y, OR_W, SEQ_H, on ? COL_ACCENT : COL_PANEL);
+        gfx_text_center(x + OR_W / 2, SEQ_Y + 14, SEQ_NAME[k],
                         on ? COL_BG : COL_TEXT);
     }
 
@@ -1165,10 +1195,52 @@ static bool select_screen(void)
         }
 
         if (y >= ROW_Y0 && y < ROW_Y0 + ROWS_VISIBLE * ROW_H) {
-            uint32_t i = g_scroll + (uint32_t)(y - ROW_Y0) / ROW_H;
-            if (i < g_top_count) {
-                g_top[i].selected = !g_top[i].selected;
-                dirty = true;
+            /* 上下拖曳捲動、單純點一下才是勾選。
+             *
+             * 這個捲動先前**根本沒做** —— g_scroll 只有被讀、從來沒被寫過，
+             * 所以第六個以後的資料夾看不到也選不到，而畫面上還寫著
+             * 「上下滑動看更多」。用位移量分辨拖曳與點選，兩者不會互搶。 */
+            uint32_t seen = HAL_GetTick();
+            int      dy = 0, tx, ty;
+
+            for (;;) {
+                watchdog_feed();
+                if (read_touch(&tx, &ty)) {
+                    int d = ty - y;
+
+                    if (((d < 0) ? -d : d) > ((dy < 0) ? -dy : dy)) {
+                        dy = d;
+                    }
+                    seen = HAL_GetTick();
+                } else if ((HAL_GetTick() - seen) > SWIPE_GAP_MS) {
+                    break;
+                }
+                nap(10);
+            }
+
+            if (dy <= -SCROLL_MIN_DY || dy >= SCROLL_MIN_DY) {
+                /* 往上拉（dy < 0）= 往清單後面看。不足一列也要動一列，
+                 * 否則短拉會完全沒反應，使用者會以為壞掉。 */
+                int32_t rows = (int32_t)(-dy / ROW_H);
+                int32_t ns;
+
+                if (rows == 0) {
+                    rows = (dy < 0) ? 1 : -1;
+                }
+                ns = (int32_t)g_scroll + rows;
+                if (ns < 0) { ns = 0; }
+                if (ns > (int32_t)max_scroll()) { ns = (int32_t)max_scroll(); }
+                if ((uint32_t)ns != g_scroll) {
+                    g_scroll = (uint32_t)ns;
+                    dirty = true;
+                }
+            } else {
+                uint32_t i = g_scroll + (uint32_t)(y - ROW_Y0) / ROW_H;
+
+                if (i < g_top_count) {
+                    g_top[i].selected = !g_top[i].selected;
+                    dirty = true;
+                }
             }
         } else if (y >= BTN_ALL_Y && y < BTN_ALL_Y + BTN_ALL_H) {
             bool any = false;
@@ -1186,6 +1258,15 @@ static bool select_screen(void)
                 int bx = OR_X0 + (int)o * (OR_W + OR_GAP);
                 if (x >= bx && x < bx + OR_W) {
                     photo_set_orientation((photo_orient_t)o);
+                    dirty = true;
+                }
+            }
+        } else if (y >= SEQ_Y && y < SEQ_Y + SEQ_H) {
+            for (uint32_t k = 0; k < 2u; k++) {
+                int bx = OR_X0 + (int)k * (OR_W + OR_GAP);
+
+                if (x >= bx && x < bx + OR_W) {
+                    g_shuffle = (k == 0u);
                     dirty = true;
                 }
             }
@@ -1379,7 +1460,6 @@ static void flash_orient(void)
  * 縱向門檻設得比橫向大，因為畫面高是寬的 1.67 倍，手滑起來也比較長。 */
 #define SWIPE_MIN_X  60
 #define SWIPE_MIN_Y  120
-#define SWIPE_GAP_MS 150u   /* 容忍觸控中途漏報多久 */
 
 /* 暫停：畫面停在目前這張。按鍵控制暫停/選單，滑動翻頁。 */
 #define PAUSE_RESUME 0
@@ -2016,6 +2096,18 @@ static bool mount_and_scan(void)
     g_cur_top = MAX_TOP;
     scan(0);
     watchdog_feed();
+
+    /* 測試捲動用：假裝有這麼多資料夾。**只存在記憶體**，不會動到卡片，
+     * 重開機就沒了。不寫（維持 0）就完全等於不存在。 */
+    if (g_dbg_fakedirs > g_top_count && g_dbg_fakedirs <= MAX_TOP) {
+        for (uint32_t i = g_top_count; i < g_dbg_fakedirs; i++) {
+            (void)snprintf(g_top[i].name, NAME_MAX, "測試資料夾 %u",
+                           (unsigned)(i + 1u));
+            g_top[i].photos   = 0;
+            g_top[i].selected = false;
+        }
+        g_top_count = g_dbg_fakedirs;
+    }
 
     /* 影片只掃根目錄，很快。放在照片掃描之後，這樣選單畫出來時就知道
      * 要不要顯示「影片」按鈕。 */
