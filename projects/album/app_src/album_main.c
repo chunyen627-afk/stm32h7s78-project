@@ -1390,15 +1390,15 @@ static void flash_orient(void)
 
 #define CTL_H        96
 #define CTL_BTN_H    72
-#define CTL_X0       14
-#define CTL_GAP      12
-#define CTL_COUNT    4
+#define CTL_X0       8
+#define CTL_GAP      8
+#define CTL_COUNT    5
 
 static const char *const CTL_NAME[CTL_COUNT] = {
-    "上一張", "繼續", "下一張", "返回"
+    "上一張", "繼續", "下一張", "方向", "返回"
 };
 static const int CTL_ACT[CTL_COUNT] = {
-    PAUSE_PREV, PAUSE_RESUME, PAUSE_NEXT, PAUSE_MENU
+    PAUSE_PREV, PAUSE_RESUME, PAUSE_NEXT, PAUSE_ROTATE, PAUSE_MENU
 };
 
 /* 版面跟著方向走：直立畫布是 480x800、橫向是 800x480，寫死座標會跑掉。 */
@@ -1509,91 +1509,26 @@ static int paused_loop_inner(void)
             return PAUSE_RESUME;
         }
 
-        /* 暫停中用滑動操作。
-         *
-         * 這塊板子只有一顆 USER 鍵，三段手勢已經吃掉亮度/暫停/選單，再塞
-         * 翻頁只會變成沒人記得住的組合技。滑動是相簿的通用手勢，判定區是
-         * 整個螢幕 —— 比先前那排小按鈕好按得多。
-         *
-         *   往左滑  下一張      往右滑  上一張      往下滑  回選單
-         *
-         * 取「位移較大的那個軸」判斷方向，避免斜著滑時兩種動作互搶。 */
+        /* 暫停中只吃控制列上的按鈕。
+
+         * 原本這裡是全螢幕的滑動手勢（左右翻頁、下滑回選單、上滑切方向）。
+         * 手勢好用但**看不見** —— 第一次拿到相框的人不會知道有這回事，
+         * 而且斜著滑還要處理兩種動作互搶、快速滑動還會漏報座標
+         * （board-notes 14.7）。控制列把同一組動作攤在畫面上之後，
+         * 手勢就只剩「多一條容易誤觸的路徑」，所以整個拿掉。 */
         if (read_touch(&x0, &y0)) {
-            int      x, y, dx = 0, dy = 0;
-            uint32_t t0   = HAL_GetTick();
-            uint32_t seen = t0;
+            int hit = ctl_hit(x0, y0);
 
             g_dbg_touch_hit++;
-
-            /* 先看是不是按在控制列上。要在滑動判定**之前**攔截，否則按鈕
-             * 上的一點點手指位移會被當成滑動，變成「按下一張卻翻了兩張」。 */
-            {
-                int hit = ctl_hit(x0, y0);
-
-                if (hit != -1) {
-                    wait_release();
-                    if (hit < 0) {
-                        continue;       /* 點在列上但沒中按鈕 */
-                    }
-                    if (hit != PAUSE_ROTATE) {
-                        g_paused = 0u;
-                    }
-                    return hit;
-                }
-            }
-
-            /* 取「整段過程中的最大位移」，而不是放開瞬間的位置。
-             *
-             * 而且要容忍中途漏報：觸控控制器在手指快速移動時會掉幾筆，
-             * 一讀不到就結束的話，位移只算到中斷點為止 —— 橫向滑動通常
-             * 比較快，所以特別容易被截斷（實測往下滑慢而長就沒事）。 */
-            for (;;) {
-                uint32_t now = HAL_GetTick();
-
-                watchdog_feed();
-                if (read_touch(&x, &y)) {
-                    int cx = x - x0;
-                    int cy = y - y0;
-
-                    seen = now;
-                    if (((cx < 0) ? -cx : cx) > ((dx < 0) ? -dx : dx)) {
-                        dx = cx;
-                    }
-                    if (((cy < 0) ? -cy : cy) > ((dy < 0) ? -dy : dy)) {
-                        dy = cy;
-                    }
-                } else if (now - seen > SWIPE_GAP_MS) {
-                    break;              /* 真的放開了 */
-                }
-                if (now - t0 > 2000u) {
-                    break;              /* 按著不放就不算滑動 */
-                }
-                nap(10);
-            }
-
-            g_dbg_swipe_dx = dx;
-            g_dbg_swipe_dy = dy;
-
-            /* 取位移較大的那個軸，避免斜著滑時兩種動作互搶。 */
-            {
-                int ax = (dx < 0) ? -dx : dx;
-                int ay = (dy < 0) ? -dy : dy;
-
-                if (ay >= SWIPE_MIN_Y && ay > ax && dy > 0) {
+            wait_release();
+            if (hit >= 0) {
+                /* 切方向要留在暫停，讓使用者當場看到結果。 */
+                if (hit != PAUSE_ROTATE) {
                     g_paused = 0u;
-                    return PAUSE_MENU;      /* 往下滑：回選單 */
                 }
-                if (ay >= SWIPE_MIN_Y && ay > ax && dy < 0) {
-                    /* 往上滑：方向循環（直立 -> 橫向 -> 自動）。
-                     * 按鍵已經被短按/長按佔滿，再加第三種時間長度手指
-                     * 拿捏不出來（board-notes 14.4），所以走手勢。 */
-                    return PAUSE_ROTATE;
-                }
-                if (ax >= SWIPE_MIN_X && ax > ay) {
-                    g_paused = 0u;
-                    return (dx < 0) ? PAUSE_NEXT : PAUSE_PREV;
-                }
+                return hit;
             }
+            /* 控制列以外、或列上的空白處：什麼都不做。 */
         }
         nap(30);
     }

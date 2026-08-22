@@ -111,8 +111,10 @@ static bool aborted(void)
     return (g_abort_fn != NULL) && g_abort_fn();
 }
 
-/* 顯示方向。預設直立 = 原本的行為，使用者在選單或暫停時上滑切換。 */
-static photo_orient_t g_orient = PHOTO_ORIENT_PORTRAIT;
+/* 顯示方向。預設 AUTO：依每張照片的長寬比自動選，直式照片用直立畫布、
+ * 橫式照片用橫向畫布，兩種都能填滿而不是各有一半躺著。
+ * 使用者仍可在選單或暫停中的控制列固定成直立／橫向。 */
+static photo_orient_t g_orient = PHOTO_ORIENT_AUTO;
 
 void photo_set_orientation(photo_orient_t o)
 {
