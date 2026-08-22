@@ -17,14 +17,24 @@
 #include "main.h"
 #include "stm32h7s78_discovery_lcd.h"
 #include "jpeg_utils.h"
+#include "ff.h"
+#include "ff_gen_drv.h"
 
 #include <stdbool.h>
 #include <string.h>
 
-/* 影格包燒在外部 Flash 的空白區。app 只用到約 1.5MB，128MB 綽綽有餘。
- * 外部 Flash 是記憶體映射的，所以這裡直接就地讀，不必複製到 RAM。 */
+/* 影格包有兩個來源，開機時自動判斷：
+ *
+ *   SD 卡 0:/video.bin  —— 長片走這裡。128MB 的外部 Flash 放不下五分鐘的
+ *                          MJPEG（實測約 137MB），而 SD 卡沒有這個限制。
+ *   外部 Flash 0x71000000 —— 短片走這裡。記憶體映射，可以就地讀、零複製，
+ *                          是最快也最單純的路徑，拿來驗證管線很好用。
+ *
+ * 先試 SD，沒有卡或沒有檔案就自動退回 Flash。兩條路都保留的理由跟相簿
+ * 那個「DMA 失敗就退回輪詢」一樣：讓一條路壞掉變成「換一條」而不是「不能用」。 */
 #define FRAMES_BASE     ((const uint8_t *)0x71000000u)
-#define FRAMES_MAGIC    0x4D524656u          /* 'VFRM' 小端序 */
+#define FRAMES_MAGIC    0x32524656u          /* 'VFR2' 小端序 */
+#define SD_VIDEO_PATH   "0:/video.bin"
 
 /* 面板實體尺寸。影片專案不畫任何 UI，所以不引入繪圖層 —— 它會拉進
  * 中文字型表，對一個只顯示影格的韌體是純粹的負擔。 */
@@ -38,17 +48,26 @@
 #define YCBCR_BUF       ((uint8_t *)0x90600000u)
 #define YCBCR_CAP       (2u * 1024u * 1024u)
 
+/* 從 SD 讀進來的單格 JPEG 放這裡。實測 800x480 q:v 5 每格約 19KB、
+ * 最大 25KB，配 1MB 是為了以後換更高品質的素材也不用改。
+ * Flash 來源不會用到這塊 —— 記憶體映射可以直接就地解碼。 */
+#define FRAME_BUF       ((uint8_t *)0x90900000u)
+#define FRAME_CAP       (1u * 1024u * 1024u)
+
+/* 位移表。7200 格只要 57.6KB，配 2MB 可以到 26 萬格（約三小時）。 */
+#define TBL_BUF         ((uint32_t *)0x90A00000u)
+#define TBL_CAP         (2u * 1024u * 1024u)
+
 /* HPDMA 的區塊大小欄位只有 16 位元，而 HAL 是 (size & 0xFFFF) 遮掉、不檢查。
  * 一次交出整塊會被默默截斷或直接變成 0，所以必須分塊餵（board-notes 16.2）。 */
 #define CHUNK           (32u * 1024u)
 
-/* 素材的格率。解碼加轉色只花 2.6ms，全速跑會變成面板上限的 60fps ——
- * 比素材快 2.5 倍，看起來就是「亂閃跳」。要按素材的節奏放。 */
-#define SRC_FPS         24u
-#define FRAME_MS        (1000u / SRC_FPS)
+/* 素材格率改成從檔頭讀，不再寫死 —— 不同影片的格率不一樣，寫死的話
+ * 27fps 的素材用 24fps 播會愈跑愈慢。這個是退回用的預設值。 */
+#define DEFAULT_FPS_X100  2400u
 
 typedef struct {
-    uint32_t magic, count, width, height;
+    uint32_t magic, count, width, height, fps_x100, max_size;
 } frames_hdr_t;
 
 static JPEG_HandleTypeDef  g_hjpeg;
@@ -434,6 +453,131 @@ static void present(void)
 }
 
 /* ------------------------------------------------------------------ */
+/* 影格來源：SD 卡優先，退回外部 Flash                                   */
+/* ------------------------------------------------------------------ */
+
+extern const Diskio_drvTypeDef SD_BSP_Driver;
+bool sd_writer_requested(void);
+void sd_writer_run(void);
+
+static FATFS        g_fs;
+static FIL          g_fil;
+static char         g_drive[4];
+static bool         g_src_sd;
+static bool         g_fs_mounted;
+static frames_hdr_t g_hdr;
+static const uint32_t *g_tbl;     /* Flash：指進映射區；SD：指向 TBL_BUF */
+
+volatile uint32_t g_dbg_src;      /* 0=都沒有 1=SD 2=Flash */
+volatile int32_t  g_dbg_fs_err;   /* 最後一次 FatFs 的錯誤碼 */
+volatile uint32_t g_dbg_sum_read; /* 從 SD 讀影格的累計微秒 */
+
+static bool hdr_valid(const frames_hdr_t *h)
+{
+    return h->magic == FRAMES_MAGIC && h->count != 0u &&
+           h->width == PHYS_W && h->height == PHYS_H &&
+           (uint64_t)h->count * 8u <= TBL_CAP &&
+           h->max_size != 0u && ((h->max_size + 3u) & ~3u) <= FRAME_CAP;
+}
+
+/* SD：把檔頭與位移表讀進 PSRAM，影格本體留在卡上按需讀取。
+ * 位移表 7200 格只有 57.6KB，開機讀一次就好，之後每格只要 f_lseek + f_read。 */
+static bool src_open_sd(void)
+{
+    UINT got = 0;
+
+    if (FATFS_LinkDriver(&SD_BSP_Driver, g_drive) != 0) {
+        return false;
+    }
+    /* 第三個參數 1 = 立刻掛載。延後掛載會讓錯誤拖到第一次 f_open 才出現。 */
+    g_dbg_fs_err = (int32_t)f_mount(&g_fs, g_drive, 1);
+    if (g_dbg_fs_err != FR_OK) {
+        return false;
+    }
+    g_fs_mounted = true;
+
+    g_dbg_fs_err = (int32_t)f_open(&g_fil, SD_VIDEO_PATH, FA_READ);
+    if (g_dbg_fs_err != FR_OK) {
+        return false;
+    }
+    if (f_read(&g_fil, &g_hdr, sizeof(g_hdr), &got) != FR_OK ||
+        got != sizeof(g_hdr) || !hdr_valid(&g_hdr)) {
+        (void)f_close(&g_fil);
+        return false;
+    }
+    if (f_read(&g_fil, TBL_BUF, g_hdr.count * 8u, &got) != FR_OK ||
+        got != g_hdr.count * 8u) {
+        (void)f_close(&g_fil);
+        return false;
+    }
+    g_tbl   = TBL_BUF;
+    g_src_sd = true;
+    return true;
+}
+
+/* Flash：記憶體映射，檔頭與表格直接就地指過去，零複製。 */
+static bool src_open_flash(void)
+{
+    const frames_hdr_t *h = (const frames_hdr_t *)FRAMES_BASE;
+
+    if (!hdr_valid(h)) {
+        return false;
+    }
+    g_hdr   = *h;
+    g_tbl   = (const uint32_t *)(FRAMES_BASE + sizeof(frames_hdr_t));
+    g_src_sd = false;
+    return true;
+}
+
+/* 取一格。回傳的指標可以直接餵進 JPEG 解碼器。 */
+static const uint8_t *src_frame(uint32_t idx, uint32_t *len)
+{
+    uint32_t off  = g_tbl[idx * 2u];
+    uint32_t size = g_tbl[idx * 2u + 1u];
+    uint32_t padded = (size + 3u) & ~3u;
+    UINT     got = 0;
+    uint32_t c0;
+
+    *len = size;
+    if (!g_src_sd) {
+        return FRAMES_BASE + off;       /* 映射區就地解碼，不必複製 */
+    }
+
+    if (padded > FRAME_CAP) {
+        return NULL;
+    }
+    c0 = cyc_start();
+    if (f_lseek(&g_fil, off) != FR_OK) {
+        return NULL;
+    }
+    if (f_read(&g_fil, FRAME_BUF, size, &got) != FR_OK || got != size) {
+        return NULL;
+    }
+    /* 補到 4 的倍數並清成 0。解碼器那邊的長度會往上取整（board-notes 16.12），
+     * 多讀到的必須是有效記憶體 —— 這裡自己補，就不必依賴檔案裡的補齊。 */
+    memset(FRAME_BUF + size, 0, padded - size);
+    g_dbg_sum_read += cyc_us(c0);
+    return FRAME_BUF;
+}
+
+/* 播放中隨時可以被主機叫進燒錄模式。先把自己的檔案收乾淨再交出去。 */
+static void check_writer(void)
+{
+    if (!sd_writer_requested()) {
+        return;
+    }
+    if (g_src_sd) {
+        (void)f_close(&g_fil);
+    }
+    if (g_fs_mounted) {
+        (void)f_mount(NULL, g_drive, 0);
+        g_fs_mounted = false;
+    }
+    g_dbg_stage = 20;
+    sd_writer_run();                    /* 不會返回 */
+}
+
+/* ------------------------------------------------------------------ */
 /* 播放                                                                */
 /* ------------------------------------------------------------------ */
 
@@ -507,12 +651,11 @@ static bool decode_frame(const uint8_t *jpg, uint32_t size)
 
 void video_run(void)
 {
-    const frames_hdr_t *hdr = (const frames_hdr_t *)FRAMES_BASE;
-    const uint32_t     *tbl = (const uint32_t *)(FRAMES_BASE + sizeof(*hdr));
     JPEG_ConfTypeDef    info;
     JPEG_YCbCrToRGB_Convert_Function convert;
     uint32_t nb_mcu = 0, converted = 0;
     uint32_t idx = 0, t_run;
+    uint32_t frame_us, frame_ms, frame_frac, acc = 0;
 
     g_dbg_stage = 1;
     psram_mpu_init();
@@ -529,14 +672,37 @@ void video_run(void)
     }
     JPEG_InitColorTables();
 
-    g_dbg_hdr_magic = hdr->magic;
-    g_dbg_hdr_count = hdr->count;
-    g_dbg_hdr_w     = hdr->width;
-    g_dbg_hdr_h     = hdr->height;
-    if (hdr->magic != FRAMES_MAGIC || hdr->count == 0u) {
-        g_dbg_stage = 91;               /* 影格包沒燒進去或位址不對 */
-        for (;;) { }
+    /* 先試 SD，沒有就退回 Flash。 */
+    g_dbg_stage = 2;
+    if (src_open_sd()) {
+        g_dbg_src = 1;
+    } else if (src_open_flash()) {
+        g_dbg_src = 2;
+    } else {
+        g_dbg_src = 0;
     }
+
+    g_dbg_hdr_magic = g_hdr.magic;
+    g_dbg_hdr_count = g_hdr.count;
+    g_dbg_hdr_w     = g_hdr.width;
+    g_dbg_hdr_h     = g_hdr.height;
+
+    if (g_dbg_src == 0u) {
+        /* 兩個來源都沒有 —— 這是第一次使用的正常狀態（卡上還沒有 video.bin）。
+         * **絕對不能停在這裡空轉**：主機要靠這個迴圈把板子叫進燒錄模式，
+         * 卡死的話就變成「要有影片才裝得進影片」的雞生蛋問題。 */
+        g_dbg_stage = 91;
+        for (;;) {
+            check_writer();
+        }
+    }
+
+    /* 格率從檔頭讀。用微秒累加而不是「每格睡固定毫秒」—— HAL_GetTick 只有
+     * 1ms 解析度，24fps 的 41.67ms 無論取 41 還是 42 都會慢慢漂掉。
+     * 整數部分照加，小數部分累積到 1ms 就補一格。 */
+    frame_us   = 100000000u / (g_hdr.fps_x100 ? g_hdr.fps_x100 : DEFAULT_FPS_X100);
+    frame_ms   = frame_us / 1000u;
+    frame_frac = frame_us % 1000u;
 
     g_dbg_stage = 5;
     t_run     = HAL_GetTick();
@@ -544,26 +710,39 @@ void video_run(void)
 
     for (;;) {
         uint32_t       use = g_dbg_freeze ? 0u : idx;
-        const uint8_t *jpg = FRAMES_BASE + tbl[use * 2u];
-        uint32_t       len = tbl[use * 2u + 1u];
+        const uint8_t *jpg;
+        uint32_t       len = 0;
         uint32_t       c_all = cyc_start();
         uint32_t       c0;
 
+        check_writer();
+
         g_cur_idx = use;
+        jpg = src_frame(use, &len);
+        if (jpg == NULL) {
+            g_dbg_fail++;
+            idx = (idx + 1u) % g_hdr.count;
+            continue;
+        }
+
         c0 = cyc_start();
         if (!decode_frame(jpg, len)) {
             g_dbg_fail++;
-            g_dbg_failmap[use >> 5] |= 1u << (use & 31u);
-            idx = (idx + 1u) % hdr->count;
+            if (use < 128u) {
+                g_dbg_failmap[use >> 5] |= 1u << (use & 31u);
+            }
+            idx = (idx + 1u) % g_hdr.count;
             continue;
         }
-        g_dbg_okmap[use >> 5] |= 1u << (use & 31u);
+        if (use < 128u) {
+            g_dbg_okmap[use >> 5] |= 1u << (use & 31u);
+        }
         g_dbg_sum_dec += cyc_us(c0);
 
         if (HAL_JPEG_GetInfo(&g_hjpeg, &info) != HAL_OK ||
             JPEG_GetDecodeColorConvertFunc(&info, &convert, &nb_mcu) != HAL_OK) {
             g_dbg_fail++;
-            idx = (idx + 1u) % hdr->count;
+            idx = (idx + 1u) % g_hdr.count;
             continue;
         }
 
@@ -597,7 +776,12 @@ void video_run(void)
 
         /* 按素材的節奏放。用「下一格的目標時刻」而不是「每格睡固定時間」，
          * 否則解碼時間的抖動會累積成愈跑愈慢。 */
-        g_next_ms += FRAME_MS;
+        g_next_ms += frame_ms;
+        acc += frame_frac;
+        if (acc >= 1000u) {             /* 小數毫秒滿一格就補回去 */
+            acc -= 1000u;
+            g_next_ms += 1u;
+        }
         {
             uint32_t now = HAL_GetTick();
 
@@ -621,6 +805,6 @@ void video_run(void)
                 g_dbg_fps_x100 = (g_dbg_nframe * 100000u) / ms;
             }
         }
-        idx = (idx + 1u) % hdr->count;
+        idx = (idx + 1u) % g_hdr.count;
     }
 }

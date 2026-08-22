@@ -33,31 +33,42 @@ HAL_MODULES = ["LTDC", "I2C", "DMA2D", "XSPI", "LPTIM", "SDRAM",
 
 HAL_SOURCES = [
     "stm32h7rsxx_hal_ltdc.c", "stm32h7rsxx_hal_ltdc_ex.c",
-        "stm32h7rsxx_hal_dma2d.c", "stm32h7rsxx_hal_xspi.c",
+    "stm32h7rsxx_hal_dma2d.c", "stm32h7rsxx_hal_xspi.c",
     "stm32h7rsxx_hal_lptim.c",
-            "stm32h7rsxx_hal_jpeg.c",
+    "stm32h7rsxx_hal_jpeg.c",
     "stm32h7rsxx_hal_dma.c", "stm32h7rsxx_hal_dma_ex.c",
-    ]
+    # SD 卡：長片放不進 128MB 的外部 Flash，影格要從卡上讀。
+    "stm32h7rsxx_hal_sd.c", "stm32h7rsxx_hal_sd_ex.c",
+    "stm32h7rsxx_ll_sdmmc.c",
+]
 
 BSP_SOURCES = [
     "stm32h7s78_discovery_lcd.c",
-        "stm32h7s78_discovery_bus.c",
+    "stm32h7s78_discovery_bus.c",
     "stm32h7s78_discovery_xspi.c",
-    ]
+    "stm32h7s78_discovery_sd.c",
+]
 
 COMPONENTS = [
     
     "aps256xx/aps256xx.c", "mx66uw1g45g/mx66uw1g45g.c",
 ]
 
-# FatFs 中介層。sd_diskio.c 把 FatFs 接到 BSP_SD_*。
-FATFS_SOURCES = []
+# FatFs 本體。接到 BSP_SD 的那一層是我們自己的 core/sd_bsp_diskio.c。
+FATFS_SOURCES = [
+    ("diskio.c", "source/diskio.c"),
+    ("ff.c", "source/ff.c"),
+    ("ff_gen_drv.c", "source/ff_gen_drv.c"),
+    ("ffsystem_template.c", "source/ffsystem_template.c"),
+    ("ffunicode.c", "source/ffunicode.c"),
+]
 
 # 不使用 ST 的 fatfs.c：它的 MX_FATFS_Process 含 f_mkfs（格式化）與寫測試檔的
 # 路徑。相簿只讀不寫，掛載那幾行自己寫，把誤格式化的可能性從根本移除。
 APP_SOURCES = []
 
-VIDEO_SOURCES = ["video_main.c", "xspi_psram.c"]   # gfx/xspi_psram 來自 repo 的 shared/
+VIDEO_SOURCES = ["video_main.c", "sd_writer.c", "sd_bsp_diskio.c",
+                 "xspi_psram.c"]   # xspi_psram 來自 repo 的 shared/
 
 # ST 的 YCbCr -> RGB 轉換工具，處理 JPEG 解碼器那種 MCU 區塊輸出格式。
 UTIL_SOURCES = [("jpeg_utils.c", "JPEG/jpeg_utils.c")]
@@ -113,19 +124,18 @@ def enable_hal_modules():
     print(f"  HAL 模組啟用: {n}")
 
 
-def _unused_patch_ffconf():
-    """ST 的預設值對相簿不能用。
+def patch_ffconf():
+    """影片只用 0:/video.bin 這個 8.3 檔名，長檔名不是必要的。
 
-    FF_USE_LFN=0 會讓 IMG_20240101_120000.jpg 變成 IMG_20~1.JPG，
-    中文資料夾名稱也會整個壞掉。字碼頁預設是 932（日文），要換成 950（繁中）。
-    檔名用 UTF-8 讀出來，字型查表才好對。
+    真正必要的是 FF_FS_READONLY=0 —— 燒錄模式要寫卡。播放模式的唯讀保護
+    改在磁碟層做（sd_bsp_diskio.c 掛成 STA_PROTECT），比整個 FatFs 編成
+    唯讀更有彈性，而且同一份韌體就能兼顧兩種模式。
     """
     path = os.path.join(PROJ, "Appli", "Inc", "ffconf.h")
     s = io.open(path, encoding="utf-8").read()
     changes = {
-        r"#define FF_CODE_PAGE\s+\d+": "#define FF_CODE_PAGE    950",
+        r"#define FF_FS_READONLY\s+\d+": "#define FF_FS_READONLY  0",
         r"#define FF_USE_LFN\s+\d+": "#define FF_USE_LFN      1",
-        r"#define FF_LFN_UNICODE\s+\d+": "#define FF_LFN_UNICODE  2",
         # FF_FS_LOCK=2 表示同時最多只能開 2 個檔案或目錄。遞迴掃描時每一層
         # 都佔一個 DIR，第三層再開檔案讀 JPEG 檔頭就會拿到
         # FR_TOO_MANY_OPEN_FILES(18)。單執行緒唯讀不需要這個鎖，關掉。
@@ -136,7 +146,7 @@ def _unused_patch_ffconf():
         s, k = re.subn(pat, rep, s, count=1)
         n += k
     io.open(path, "w", encoding="utf-8").write(s)
-    print(f"  ffconf.h 調整: {n} 項（長檔名、繁中字碼頁、UTF-8）")
+    print(f"  ffconf.h 調整: {n} 項（可寫、長檔名、關檔案鎖）")
 
 
 def link(name, uri):
@@ -239,6 +249,7 @@ def main():
     rename_project()
     enable_hal_modules()
 
+    patch_ffconf()
     add_sources()
     add_includes()
     patch_main()

@@ -8,6 +8,7 @@
 # 可以指出確切位址與落在哪個符號，判斷才有依據。整份 1.5MB 讀回只要幾秒。
 #
 set -e
+OLDPWD_ARG=$(pwd)          # 記住呼叫時的目錄，--frames 的相對路徑要以它為準
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
 
@@ -24,6 +25,24 @@ PROJ="$CUBE/Projects/STM32H7S78-DK/Templates/Video"
 ELF="$PROJ/STM32CubeIDE/Appli/Debug/Video_Appli.elf"
 
 [ -f "$ELF" ] || { echo "找不到 $ELF，請先跑 scripts/build.sh"; exit 1; }
+
+     # 影格包燒到外部 Flash 的空白區。這是 SD 之外的第二條來源，適合短片：
+# 記憶體映射可以就地解碼、零複製，而且不依賴 SD 卡。
+# app 只用到約 1.5MB，0x71000000 起（16MB 偏移）之後全是空的。
+if [ "$1" = "--frames" ]; then
+    # 腳本開頭已經 cd 過，所以相對路徑要以呼叫時的目錄為準先轉成絕對路徑。
+    [ -f "$OLDPWD_ARG/$2" ] && PKG="$OLDPWD_ARG/$2" || PKG="$2"
+    [ -f "$PKG" ] || { echo "找不到影格包：$2"; exit 1; }
+    SZ=$(stat -c %s "$PKG")
+    LIMIT=$((126 * 1024 * 1024))
+    [ "$SZ" -le "$LIMIT" ] || { echo "影格包 $((SZ/1048576))MB 超過可用空間"; exit 1; }
+    echo "==> 燒錄影格包到 0x71000000（$((SZ / 1048576)) MB）"
+    "$CLI" -c port=SWD mode=UR -el "$EL" -w "$PKG" 0x71000000 |
+        grep -iE "error|complete" || true
+    echo "==> 重置"
+    "$CLI" -c port=SWD mode=HOTPLUG -rst | grep -i "reset is performed" || true
+    exit 0
+fi
 
 if [ "$1" = "--boot" ]; then
     echo "==> 燒錄 bootloader 到內部 Flash"

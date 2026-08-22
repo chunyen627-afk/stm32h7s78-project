@@ -14,7 +14,7 @@ PROJ="$CUBE/Projects/STM32H7S78-DK/Templates/Video"
 [ -d "$PROJ" ] || { echo "專案不存在，請先跑 scripts/setup.sh"; exit 1; }
 
 echo "==> 同步原始碼"
-cp "$ROOT"/app_src/*.c "$ROOT"/app_src/*.h "$REPO"/shared/xspi_psram.c "$PROJ/Appli/Video/"
+cp "$ROOT"/app_src/*.c "$ROOT"/app_src/*.h "$ROOT"/core/*.c    "$REPO"/shared/xspi_psram.c "$PROJ/Appli/Video/"
 
 # 有 makefile 就直接 make，快很多而且不用啟動整個 IDE。
 # 第一次、或改過 tools/patch_project.py 的原始碼清單之後，makefile 需要

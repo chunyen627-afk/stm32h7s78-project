@@ -36,7 +36,10 @@ fi
 echo "==> 複製元件設定檔"
 cp "$BSPEX/gt911_conf.h" "$BSPEX/mx66uw1g45g_conf.h" "$BSPEX/aps256xx_conf.h" "$PROJ/Appli/Inc/"
 
-# 和寫測試檔的路徑。影片只讀不寫，掛載那幾行自己寫比較安全。
+echo "==> 複製 FatFs 設定"
+# 只拿設定檔。ST 的 fatfs.c 不用 —— 它的 MX_FATFS_Process 含 f_mkfs（格式化）
+# 和寫測試檔的路徑。影片只需要開一個檔，掛載那幾行自己寫比較安全。
+cp "$FATFS/Inc/ffconf.h" "$FATFS/Inc/sd_diskio_config.h" "$PROJ/Appli/Inc/"
 
 echo "==> 記下韌體包位置供 build/flash 使用"
 echo "$CUBE" > "$ROOT/.cube_path"
@@ -48,7 +51,7 @@ CUBE_DIR="$CUBE" python "$ROOT/tools/patch_project.py"
 
 echo "==> 複製影片原始碼"
 mkdir -p "$PROJ/Appli/Video"
-cp "$ROOT"/app_src/*.c "$PROJ/Appli/Video/"
+cp "$ROOT"/app_src/*.c "$ROOT"/core/*.c "$PROJ/Appli/Video/"
 cp "$REPO"/shared/xspi_psram.c "$PROJ/Appli/Video/"
 
 echo
