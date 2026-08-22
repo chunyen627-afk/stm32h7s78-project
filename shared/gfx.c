@@ -18,11 +18,24 @@ static inline void sync_hw(void)
     }
 }
 
-/* Portrait (x,y) -> physical linear offset.
- * The panel is landscape and the portrait canvas is rotated 90 degrees
- * anticlockwise onto it: physical_x = y, physical_y = GFX_W-1-x. */
+/* 目前的畫布方向。預設直立，沒設定過的專案行為不變。 */
+static bool g_landscape;
+
+void gfx_set_orientation(bool landscape) { g_landscape = landscape; }
+bool gfx_is_landscape(void)              { return g_landscape; }
+int  gfx_width(void)                     { return g_landscape ? PHYS_W : GFX_W; }
+int  gfx_height(void)                    { return g_landscape ? PHYS_H : GFX_H; }
+
+/* 邏輯 (x,y) -> 實體線性位移。
+ *
+ * 直立：面板是橫向的，把 480x800 的直立畫布逆時針轉 90 度貼上去，
+ *       實體 x = y、實體 y = GFX_W-1-x。
+ * 橫向：畫布與面板同向，直接對應。 */
 static inline uint32_t map_offset(int x, int y)
 {
+    if (g_landscape) {
+        return (uint32_t)y * PHYS_W + (uint32_t)x;
+    }
     return (uint32_t)(GFX_W - 1 - x) * PHYS_W + (uint32_t)y;
 }
 
@@ -30,7 +43,8 @@ static inline uint32_t map_offset(int x, int y)
  * 同步交給呼叫端在迴圈外做一次（gfx_char、gfx_circle 等都已處理）。 */
 void gfx_pixel(int x, int y, uint16_t color)
 {
-    if ((unsigned)x >= GFX_W || (unsigned)y >= GFX_H || !g_fb) {
+    if ((unsigned)x >= (unsigned)gfx_width() ||
+        (unsigned)y >= (unsigned)gfx_height() || !g_fb) {
         return;
     }
     g_fb[map_offset(x, y)] = color;
@@ -38,7 +52,8 @@ void gfx_pixel(int x, int y, uint16_t color)
 
 uint16_t gfx_get_pixel(int x, int y)
 {
-    if ((unsigned)x >= GFX_W || (unsigned)y >= GFX_H || !g_fb) {
+    if ((unsigned)x >= (unsigned)gfx_width() ||
+        (unsigned)y >= (unsigned)gfx_height() || !g_fb) {
         return 0;
     }
     sync_hw();
@@ -65,9 +80,21 @@ void gfx_fill_rect(int x, int y, int w, int h, uint16_t color)
     /* Clip to the logical canvas. */
     if (x < 0) { w += x; x = 0; }
     if (y < 0) { h += y; y = 0; }
-    if (x + w > GFX_W) { w = GFX_W - x; }
-    if (y + h > GFX_H) { h = GFX_H - y; }
+    if (x + w > gfx_width())  { w = gfx_width() - x; }
+    if (y + h > gfx_height()) { h = gfx_height() - y; }
     if (w <= 0 || h <= 0) {
+        return;
+    }
+
+    if (g_landscape) {
+        /* 畫布與面板同向：每個邏輯列就是一段連續的實體記憶體。 */
+        sync_hw();
+        for (int yy = y; yy < y + h; yy++) {
+            uint16_t *p = &g_fb[(uint32_t)yy * PHYS_W + (uint32_t)x];
+            for (int xx = 0; xx < w; xx++) {
+                p[xx] = color;
+            }
+        }
         return;
     }
 

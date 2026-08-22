@@ -66,15 +66,34 @@
 #define SCALED_CAP      (2u * 1024u * 1024u)
 
 /* 填滿畫面時容許裁掉的最大比例，超過就退回完整顯示（留黑邊）。
- * 2:3 的直式照片放到 3:5 的畫面只需裁 10%；設 25 足以擋掉全景照那種
- * 會被砍掉一半的情況。 */
-#define MAX_CROP_PCT    25u
+ *
+ * 設 0 = 永不裁切，任何照片都完整顯示。
+ *
+ * 原本是 25，理由是「2:3 只需裁 10%，25 足以擋掉全景照那種會被砍一半的」。
+ * 但實際用起來，會被裁到的正是最常見的那幾種比例：3:4 切掉 20%（左右各 10%）、
+ * 2:3 切掉 10%（左右各 5%）—— 相簿的用途是看照片，拿內容換版面划不來。
+ *
+ * 黑邊沒有想像中大（畫面 480x800）：
+ *   2:3  -> 480x720，上下各 40px
+ *   3:4  -> 480x640，上下各 80px
+ *   9:16 -> 450x800，左右各 15px
+ *   橫式 -> 本來就超過門檻，行為不變 */
+#define MAX_CROP_PCT    0u
 
-/* 銳化強度，256 = 100%。縮小 2 倍以上時 0.4 左右不會有明顯光暈。
- * 開放編譯期覆寫，測試台要靠關掉它來分離「縮放造成的鋸齒」與
- * 「銳化把過渡壓成二值造成的鋸齒」。 */
+/* 銳化強度，256 = 100%。
+ *
+ * 原本是 100。用真實照片（高對比平滑邊緣，例如翅膀對天空）放大八倍並排比較
+ * 之後降到 30 —— 銳化是**唯一**在真實照片上看得出差別的變數：換濾波核
+ * （盒狀 / Mitchell / SSIM 最佳化）肉眼幾乎分不出來，但銳化強度一眼就看得到。
+ *
+ * 原因是它同時做兩件事：補回縮小造成的變軟（想要的），以及把邊緣過渡壓得
+ * 更陡（不想要的）。2.25 倍縮小後邊緣過渡只剩一兩個像素寬，壓陡的代價就是
+ * 過衝亮暈與階梯感 —— 也就是使用者說的鋸齒。
+ *
+ * 這是感知取捨不是對錯，數字可以再調：0 最平滑但整體偏軟，60 以上邊緣開始
+ * 出現可見的亮暈。開放編譯期覆寫，測試台靠它做 A/B。 */
 #ifndef SHARPEN_AMOUNT
-#define SHARPEN_AMOUNT  100
+#define SHARPEN_AMOUNT  0
 #endif
 
 static JPEG_HandleTypeDef g_hjpeg;
@@ -90,6 +109,21 @@ void photo_set_abort_check(bool (*fn)(void))
 static bool aborted(void)
 {
     return (g_abort_fn != NULL) && g_abort_fn();
+}
+
+/* 顯示方向。預設直立 = 原本的行為，使用者在選單或暫停時上滑切換。 */
+static photo_orient_t g_orient = PHOTO_ORIENT_PORTRAIT;
+
+void photo_set_orientation(photo_orient_t o)
+{
+    if (o < PHOTO_ORIENT_COUNT) {
+        g_orient = o;
+    }
+}
+
+photo_orient_t photo_get_orientation(void)
+{
+    return g_orient;
 }
 
 /* 解碼器實際吐出的 YCbCr 位元組數。
@@ -391,59 +425,64 @@ static void plan_geometry(uint32_t sw, uint32_t sh,
                           uint32_t *src_w, uint32_t *src_h,
                           uint32_t *sox, uint32_t *soy)
 {
+    /* 畫布尺寸隨方向改變：直立 480x800、橫向 800x480。
+     * 不能再用 GFX_W/GFX_H 常數，那兩個永遠是直立的值。 */
+    const uint32_t cw = (uint32_t)gfx_width();
+    const uint32_t ch = (uint32_t)gfx_height();
+
     /* 比較「來源寬高比」與「畫面寬高比」，用交叉相乘避免浮點與除法誤差。 */
-    uint64_t src_ratio = (uint64_t)sw * GFX_H;    /* sw/sh vs GFX_W/GFX_H */
-    uint64_t dst_ratio = (uint64_t)GFX_W * sh;
+    uint64_t src_ratio = (uint64_t)sw * ch;    /* sw/sh vs cw/ch */
+    uint64_t dst_ratio = (uint64_t)cw * sh;
     bool     wider     = (src_ratio > dst_ratio); /* 來源比畫面更寬 */
 
     /* 填滿畫面要裁掉多少？用面積比估算，超過上限就退回完整顯示。 */
     uint32_t crop_pct;
     if (wider) {
         /* 以高度為準放大，裁掉左右 */
-        uint32_t used_w = (uint32_t)(((uint64_t)sh * GFX_W) / GFX_H);
+        uint32_t used_w = (uint32_t)(((uint64_t)sh * cw) / ch);
         crop_pct = 100u - (used_w * 100u) / sw;
     } else {
         /* 以寬度為準放大，裁掉上下 */
-        uint32_t used_h = (uint32_t)(((uint64_t)sw * GFX_H) / GFX_W);
+        uint32_t used_h = (uint32_t)(((uint64_t)sw * ch) / cw);
         crop_pct = 100u - (used_h * 100u) / sh;
     }
 
     if (crop_pct <= MAX_CROP_PCT) {
         /* 填滿：目的地就是整個畫面，來源取中間一塊同比例的區域。 */
-        g_dw = GFX_W;
-        g_dh = GFX_H;
+        g_dw = cw;
+        g_dh = ch;
         if (wider) {
             *src_h = sh;
-            *src_w = (uint32_t)(((uint64_t)sh * GFX_W) / GFX_H);
+            *src_w = (uint32_t)(((uint64_t)sh * cw) / ch);
         } else {
             *src_w = sw;
-            *src_h = (uint32_t)(((uint64_t)sw * GFX_H) / GFX_W);
+            *src_h = (uint32_t)(((uint64_t)sw * ch) / cw);
         }
     } else {
         /* 完整顯示：整張都要，某一邊會留黑邊。 */
         *src_w = sw;
         *src_h = sh;
         if (wider) {
-            g_dw = GFX_W;
-            g_dh = (uint32_t)(((uint64_t)sh * GFX_W) / sw);
+            g_dw = cw;
+            g_dh = (uint32_t)(((uint64_t)sh * cw) / sw);
         } else {
-            g_dh = GFX_H;
-            g_dw = (uint32_t)(((uint64_t)sw * GFX_H) / sh);
+            g_dh = ch;
+            g_dw = (uint32_t)(((uint64_t)sw * ch) / sh);
         }
     }
 
     if (g_dw == 0u) { g_dw = 1u; }
     if (g_dh == 0u) { g_dh = 1u; }
-    if (g_dw > GFX_W) { g_dw = GFX_W; }
-    if (g_dh > GFX_H) { g_dh = GFX_H; }
+    if (g_dw > cw) { g_dw = cw; }
+    if (g_dh > ch) { g_dh = ch; }
     if (*src_w > sw) { *src_w = sw; }
     if (*src_h > sh) { *src_h = sh; }
 
     *sox = (sw - *src_w) / 2u;
     *soy = (sh - *src_h) / 2u;
 
-    g_ox = (GFX_W - g_dw) / 2u;
-    g_oy = (GFX_H - g_dh) / 2u;
+    g_ox = (cw - g_dw) / 2u;
+    g_oy = (ch - g_dh) / 2u;
 }
 
 /* 面積平均縮放：RGB888 全尺寸 -> RGB888 縮圖（邏輯直立方向，逐列存放）。
@@ -475,10 +514,10 @@ static void plan_geometry(uint32_t sw, uint32_t sh,
  * 存成緊湊格式（偏移＋長度）而不是固定跨距：2.25 倍時實際摸到的資料只有
  * 約 4KB，留得住 D-Cache；固定跨距要配到 19KB 就放不下了。 */
 #define MAX_TAPS  20
-static uint16_t g_wx[GFX_W * MAX_TAPS];
-static uint16_t g_wx_off[GFX_W];
-static uint16_t g_wx_start[GFX_W];
-static uint8_t  g_wx_n[GFX_W];
+static uint16_t g_wx[GFX_MAX_DIM * MAX_TAPS];
+static uint16_t g_wx_off[GFX_MAX_DIM];
+static uint16_t g_wx_start[GFX_MAX_DIM];
+static uint8_t  g_wx_n[GFX_MAX_DIM];
 
 volatile uint32_t g_dbg_taps_clamped;   /* tap 數超過上限被截掉的次數 */
 
@@ -562,8 +601,8 @@ static void build_x_weights(uint32_t sx_step, uint32_t xbase, uint32_t xlimit)
  * 這三個函式刻意跟「來源從哪來」解耦：韌體用 MCU band 餵，PC 測試台用
  * 整張影像逐列餵，兩邊跑的是同一段重取樣程式碼。
  */
-static uint16_t g_hrow[GFX_W * 3];      /* 水平重取樣後的一列，線性光 0..65535 */
-static uint32_t g_acc[GFX_W * 3];       /* 目前這個目的列的垂直累加 */
+static uint16_t g_hrow[GFX_MAX_DIM * 3];      /* 水平重取樣後的一列，線性光 0..65535 */
+static uint32_t g_acc[GFX_MAX_DIM * 3];       /* 目前這個目的列的垂直累加 */
 static uint32_t g_rs_dy;                /* 正在累積哪個目的列 */
 static uint32_t g_rs_wsum;              /* 這個目的列已累積的垂直權重 */
 static uint32_t g_rs_sy_step, g_rs_ybase, g_rs_ylimit;
@@ -770,8 +809,10 @@ static const uint8_t BAYER[16] = {
  * 跨列寫入不會產生額外的讀取流量，所以這個方向比較划算。 */
 static void sharpen_dither_rotate(void)
 {
-    uint16_t *fb = gfx_framebuffer();
-    uint32_t  stride = g_dw * 3u;
+    uint16_t      *fb     = gfx_framebuffer();
+    uint32_t       stride = g_dw * 3u;
+    const bool     land   = gfx_is_landscape();
+    const uint32_t cw     = (uint32_t)gfx_width();
 
     for (uint32_t y = 0; y < g_dh; y++) {
         const uint8_t *row = SCALED_BUF + (size_t)y * stride;
@@ -782,6 +823,12 @@ static void sharpen_dither_rotate(void)
         const uint8_t *up  = (y > 0u)          ? row - stride : row;
         const uint8_t *dn  = (y + 1u < g_dh)   ? row + stride : row;
         uint32_t phys_col  = g_oy + y;
+        /* 橫向時畫布與面板同向，一整條邏輯列就是一段連續的實體記憶體；
+         * 直立時要轉 90 度，寫入位址每次遞減一整列。兩者只差在這個基底
+         * 與步進，所以先算好，內層迴圈不必再判斷方向。 */
+        uint32_t fb_base   = land ? (phys_col * PHYS_W + g_ox)
+                                  : ((uint32_t)(cw - 1u - g_ox) * PHYS_W + phys_col);
+        int32_t  fb_step   = land ? 1 : -(int32_t)PHYS_W;
 
         for (uint32_t x = 0; x < g_dw; x++) {
             const uint8_t *c = row + x * 3u;
@@ -805,8 +852,7 @@ static void sharpen_dither_rotate(void)
 
             {
                 uint32_t so = (uint32_t)((dn + xr * 3u + 2u) - SCALED_BUF);
-                uint32_t fo = (uint32_t)(GFX_W - 1u - (g_ox + x)) * PHYS_W
-                              + phys_col;
+                uint32_t fo = (uint32_t)((int32_t)fb_base + (int32_t)x * fb_step);
                 if (so > g_dbg_maxscl) { g_dbg_maxscl = so; }
                 if (fo > g_dbg_maxfb)  { g_dbg_maxfb  = fo; }
             }
@@ -816,7 +862,7 @@ static void sharpen_dither_rotate(void)
                 int32_t g = (int32_t)out[1] + ((int32_t)*d >> 2) - 2;
                 int32_t b = (int32_t)out[2] + ((int32_t)*d >> 1) - 4;
 
-                fb[(size_t)(GFX_W - 1u - (g_ox + x)) * PHYS_W + phys_col] =
+                fb[(size_t)(uint32_t)((int32_t)fb_base + (int32_t)x * fb_step)] =
                     (uint16_t)(((uint32_t)(clamp8(r) & 0xF8u) << 8) |
                                ((uint32_t)(clamp8(g) & 0xFCu) << 3) |
                                ((uint32_t)clamp8(b) >> 3));
@@ -931,6 +977,12 @@ photo_result_t photo_show(const char *path)
     if (aborted()) {
         return PHOTO_ABORTED;
     }
+
+    /* 方向要在 plan_geometry 之前決定 —— 畫布尺寸是它的輸入。
+     * AUTO 就看這張照片本身是橫的還是直的。 */
+    gfx_set_orientation(g_orient == PHOTO_ORIENT_LANDSCAPE ||
+                        (g_orient == PHOTO_ORIENT_AUTO &&
+                         info.ImageWidth > info.ImageHeight));
 
     plan_geometry(info.ImageWidth, info.ImageHeight,
                   &src_w, &src_h, &sox, &soy);

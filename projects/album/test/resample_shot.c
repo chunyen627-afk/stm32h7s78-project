@@ -46,10 +46,13 @@ int main(int argc, char **argv)
     FILE    *f;
     uint16_t *fb;
 
-    if (argc != 5) {
-        fprintf(stderr, "用法：%s <in.rgb> <寬> <高> <out.fb>\n", argv[0]);
+    if (argc != 5 && argc != 6) {
+        fprintf(stderr, "用法：%s <in.rgb> <寬> <高> <out.fb> [landscape]\n",
+                argv[0]);
         return 2;
     }
+    /* 第五個參數給 1 就切成橫向畫布（800x480），驗證方向切換用。 */
+    gfx_set_orientation(argc == 6 && argv[5][0] == '1');
     sw = (uint32_t)strtoul(argv[2], NULL, 10);
     sh = (uint32_t)strtoul(argv[3], NULL, 10);
     in_bytes = (size_t)sw * sh * 3u;
@@ -110,8 +113,26 @@ int main(int argc, char **argv)
             if (ds  < best_ds)  { best_ds  = ds; }
             if (out < best_out) { best_out = out; }
         }
-        fprintf(stderr, "  縮放 %6.2f ms、輸出 %6.2f ms   (%ux%u -> %ux%u)\n",
-                best_ds, best_out, src_w, src_h, g_dw, g_dh);
+        /* 越界檢查：韌體本來就在記錄實際寫到哪，拿來當斷言用。
+         * 方向切換會改變畫布尺寸，陣列若有一處沒跟著改就會在這裡現形。 */
+        {
+            uint32_t fb_cap  = (uint32_t)PHYS_W * PHYS_H;
+            uint32_t scl_cap = g_dw * g_dh * 3u;
+            bool     ok      = (g_dbg_maxfb < fb_cap) &&
+                               (g_dbg_maxdst <= scl_cap) &&
+                               (g_dw <= GFX_MAX_DIM) && (g_dh <= GFX_MAX_DIM);
+
+            fprintf(stderr,
+                    "  %s  %ux%u -> %ux%u @(%u,%u)  縮放 %6.2f ms"
+                    "  fb %u/%u  縮圖 %u/%u  %s\n",
+                    gfx_is_landscape() ? "橫向" : "直立",
+                    src_w, src_h, g_dw, g_dh, g_ox, g_oy, best_ds,
+                    g_dbg_maxfb, fb_cap, g_dbg_maxdst, scl_cap,
+                    ok ? "範圍正常" : "*** 越界 ***");
+            if (!ok) {
+                return 1;
+            }
+        }
     }
 
     f = fopen(argv[4], "wb");

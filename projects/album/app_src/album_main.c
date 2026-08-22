@@ -647,16 +647,27 @@ static void build_order(void)
 
 #define ROW_Y0       120
 #define ROW_H        58
-#define ROWS_VISIBLE 7
-#define BTN_ALL_Y    580
+/* 可見列數從 7 減成 6，騰出的 58px 給「方向」那一列。資料夾清單本來就
+ * 可以上下滑，少一列的代價比擠不下設定小。 */
+#define ROWS_VISIBLE 6
+#define BTN_ALL_Y    516
 #define BTN_ALL_H    48
-#define IV_Y         650
+#define OR_Y         584
+#define OR_H         48
+#define OR_X0        110
+#define OR_W         100
+#define OR_GAP       10
+#define IV_Y         652
 #define IV_H         48
 #define IV_X0        110
 #define IV_W         74
 #define IV_GAP       10
 #define BTN_GO_Y     720
 #define BTN_GO_H     62
+
+static const char *const ORIENT_NAME[PHOTO_ORIENT_COUNT] = {
+    "直立", "橫向", "自動"
+};
 
 static uint32_t g_scroll;
 
@@ -696,6 +707,9 @@ static void draw_select_screen(void)
 {
     uint32_t shown;
 
+    /* 選單、掃描進度、錯誤訊息都是照直立版面寫死的座標。播放中可能切到
+     * 橫向，回到這些畫面之前一定要扳回來，否則版面整個跑掉。 */
+    gfx_set_orientation(false);
     gfx_clear(COL_BG);
     gfx_text_center(GFX_W / 2, 24, "電子相簿", COL_TEXT);
     gfx_text_center(GFX_W / 2, 62, "選擇要播放的資料夾", COL_DIM);
@@ -723,6 +737,15 @@ static void draw_select_screen(void)
 
     gfx_pill(16, BTN_ALL_Y, GFX_W - 32, BTN_ALL_H, COL_PANEL);
     gfx_text_center(GFX_W / 2, BTN_ALL_Y + 14, "全部選取或取消", COL_TEXT);
+
+    gfx_text(20, OR_Y + 14, "方向", COL_DIM);
+    for (uint32_t o = 0; o < PHOTO_ORIENT_COUNT; o++) {
+        int  x  = OR_X0 + (int)o * (OR_W + OR_GAP);
+        bool on = ((uint32_t)photo_get_orientation() == o);
+        gfx_pill(x, OR_Y, OR_W, OR_H, on ? COL_ACCENT : COL_PANEL);
+        gfx_text_center(x + OR_W / 2, OR_Y + 14, ORIENT_NAME[o],
+                        on ? COL_BG : COL_TEXT);
+    }
 
     gfx_text(20, IV_Y + 14, "間隔", COL_DIM);
     for (uint32_t s = 2; s <= 5; s++) {
@@ -801,6 +824,14 @@ static bool select_screen(void)
                 g_top[i].selected = !any;
             }
             dirty = true;
+        } else if (y >= OR_Y && y < OR_Y + OR_H) {
+            for (uint32_t o = 0; o < PHOTO_ORIENT_COUNT; o++) {
+                int bx = OR_X0 + (int)o * (OR_W + OR_GAP);
+                if (x >= bx && x < bx + OR_W) {
+                    photo_set_orientation((photo_orient_t)o);
+                    dirty = true;
+                }
+            }
         } else if (y >= IV_Y && y < IV_Y + IV_H) {
             for (uint32_t s = 2; s <= 5; s++) {
                 int bx = IV_X0 + (int)(s - 2) * (IV_W + IV_GAP);
@@ -829,6 +860,7 @@ static bool select_screen(void)
 static void show_scan_progress(void)
 {
     watchdog_feed();
+    gfx_set_orientation(false);
     for (int i = 0; i < 2; i++) {
         gfx_clear(COL_BG);
         gfx_text_center(GFX_W / 2, GFX_H / 2 - 60, "掃描記憶卡", COL_TEXT);
@@ -840,6 +872,7 @@ static void show_scan_progress(void)
 
 static void show_message(const char *line1, const char *line2)
 {
+    gfx_set_orientation(false);
     for (int i = 0; i < 2; i++) {
         gfx_clear(COL_BG);
         gfx_text_center(GFX_W / 2, GFX_H / 2 - 40, line1, COL_TEXT);
@@ -874,20 +907,31 @@ static bool wait_screen_on(void)
  * 按鍵操作沒有觸覺以外的回饋，使用者按下去看畫面沒變會不確定有沒有成功。
  * 在畫面中央閃一個圖示一秒再還原 —— 蓋住的區域先備份，還原後照片完整。 */
 #define ICON_SZ     140
-#define ICON_X      ((GFX_W - ICON_SZ) / 2)
-#define ICON_Y      ((GFX_H - ICON_SZ) / 2)
 #define ICON_SAVE   ((uint16_t *)0x91F00000u)   /* 140x140x2 = 39KB */
+
+/* 圖示置中的位置。畫布尺寸隨方向改變，所以不能是常數。 */
+static int icon_x(void) { return (gfx_width()  - ICON_SZ) / 2; }
+static int icon_y(void) { return (gfx_height() - ICON_SZ) / 2; }
 
 static void icon_backup(bool restore)
 {
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    int       ix = icon_x(), iy = icon_y();
 
-    /* 邏輯 (x,y) -> 實體 (GFX_W-1-x) 列、y 行。逐邏輯列搬。 */
+    /* 兩種方向下「哪個軸在實體記憶體裡連續」剛好相反：
+     *   直立：邏輯 x 是實體列，所以沿著邏輯 y 走才連續
+     *   橫向：畫布與面板同向，沿著邏輯 x 走就連續
+     * 兩者都是每次搬 ICON_SZ 個連續像素，只差基底怎麼算。 */
     for (uint32_t i = 0; i < ICON_SZ; i++) {
-        uint32_t r   = (uint32_t)(GFX_W - 1 - (ICON_X + i));
-        uint16_t *fb = front + r * PHYS_W + ICON_Y;
+        uint16_t *fb;
         uint16_t *sv = ICON_SAVE + i * ICON_SZ;
 
+        if (gfx_is_landscape()) {
+            fb = front + (uint32_t)(iy + (int)i) * PHYS_W + (uint32_t)ix;
+        } else {
+            fb = front + (uint32_t)(gfx_width() - 1 - (ix + (int)i)) * PHYS_W
+                       + (uint32_t)iy;
+        }
         if (restore) {
             memcpy(fb, sv, ICON_SZ * sizeof(uint16_t));
         } else {
@@ -900,8 +944,9 @@ static void flash_icon(bool paused)
 {
     uint16_t *back  = gfx_framebuffer();
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
-    int cx = GFX_W / 2;
-    int cy = GFX_H / 2;
+    int cx = gfx_width()  / 2;
+    int cy = gfx_height() / 2;
+    int ICON_X = icon_x(), ICON_Y = icon_y();
 
     icon_backup(false);
     gfx_set_framebuffer(front);
@@ -933,6 +978,38 @@ static void flash_icon(bool paused)
     icon_backup(true);
 }
 
+/* 切換方向時閃一下目前的模式。
+ *
+ * 三段循環沒有回饋的話使用者不知道自己切到哪了 —— 沿用暫停圖示那套
+ * 「壓暗背景、蓋上內容、一秒後還原」的機制。 */
+static void flash_orient(void)
+{
+    uint16_t *back  = gfx_framebuffer();
+    uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    int cx = gfx_width() / 2;
+    int cy = gfx_height() / 2;
+    int ix = icon_x(), iy = icon_y();
+
+    icon_backup(false);
+    gfx_set_framebuffer(front);
+
+    for (int j = 0; j < ICON_SZ; j++) {
+        for (int i = 0; i < ICON_SZ; i++) {
+            uint16_t v = gfx_get_pixel(ix + i, iy + j);
+            gfx_pixel(ix + i, iy + j,
+                      (uint16_t)((((v >> 11) & 0x1Fu) >> 1) << 11 |
+                                 (((v >> 5) & 0x3Fu) >> 1) << 5 |
+                                 ((v & 0x1Fu) >> 1)));
+        }
+    }
+    gfx_text_center(cx, cy - 10, ORIENT_NAME[photo_get_orientation()],
+                    COL_TEXT);
+
+    gfx_set_framebuffer(back);
+    nap(1000);
+    icon_backup(true);
+}
+
 /* 暫停中的滑動判定。
  * 邏輯座標：x 是橫向（0~479），y 是縱向（0~799，往下遞增）。
  * 縱向門檻設得比橫向大，因為畫面高是寬的 1.67 倍，手滑起來也比較長。 */
@@ -945,6 +1022,7 @@ static void flash_icon(bool paused)
 #define PAUSE_MENU   1
 #define PAUSE_PREV   2
 #define PAUSE_NEXT   3
+#define PAUSE_ROTATE 4
 
 static int paused_loop(void)
 {
@@ -1025,6 +1103,12 @@ static int paused_loop(void)
                     g_paused = 0u;
                     return PAUSE_MENU;      /* 往下滑：回選單 */
                 }
+                if (ay >= SWIPE_MIN_Y && ay > ax && dy < 0) {
+                    /* 往上滑：方向循環（直立 -> 橫向 -> 自動）。
+                     * 按鍵已經被短按/長按佔滿，再加第三種時間長度手指
+                     * 拿捏不出來（board-notes 14.4），所以走手勢。 */
+                    return PAUSE_ROTATE;
+                }
                 if (ax >= SWIPE_MIN_X && ax > ay) {
                     g_paused = 0u;
                     return (dx < 0) ? PAUSE_NEXT : PAUSE_PREV;
@@ -1100,6 +1184,18 @@ static int pause_session(int32_t *cur)
         }
         if (a == PAUSE_RESUME) {
             return 0;
+        }
+        if (a == PAUSE_ROTATE) {
+            photo_set_orientation((photo_orient_t)
+                (((uint32_t)photo_get_orientation() + 1u) % PHOTO_ORIENT_COUNT));
+            /* 重畫目前這張，讓使用者當場看到新方向的結果。 */
+            if (*cur >= 0 &&
+                photo_show(PLAYLIST_BASE + g_order[*cur] * PATH_MAX)
+                    == PHOTO_OK) {
+                present();
+            }
+            flash_orient();
+            continue;
         }
 
         /* 翻頁：往指定方向找一張解得開的，最多繞一圈。 */

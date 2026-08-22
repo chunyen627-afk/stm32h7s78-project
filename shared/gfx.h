@@ -20,6 +20,24 @@
 #define GFX_W   480
 #define GFX_H   800
 
+/* 兩種方向裡較長的那一邊。要開「一列夠長」的緩衝區時用這個，
+ * 照 GFX_W 開的話橫向模式下寬度變 800 會直接越界。 */
+#define GFX_MAX_DIM  800
+
+/* 畫布方向。
+ *
+ * 面板實體是 800x480 橫向，預設把邏輯 480x800 直立畫布旋轉映射上去。
+ * 切成橫向時直接 1:1 對應，畫布變成 800x480 —— 橫式照片因此能顯示到
+ * 720x480 而不是 480x320，面積是 2.25 倍。
+ *
+ * 預設直立，所以沒呼叫這個函式的專案（例如 tetris）行為完全不變。
+ * GFX_W / GFX_H 仍然是「直立」的尺寸，選單那類固定版面照舊用它們；
+ * 需要跟著方向走的程式碼改用 gfx_width() / gfx_height()。 */
+void gfx_set_orientation(bool landscape);
+bool gfx_is_landscape(void);
+int  gfx_width(void);
+int  gfx_height(void);
+
 /* RGB565 helpers. */
 #define RGB565(r, g, b) \
     ((uint16_t)((((r) & 0xF8) << 8) | (((g) & 0xFC) << 3) | ((b) >> 3)))
