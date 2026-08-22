@@ -94,7 +94,14 @@ int main(int argc, char **argv)
         double best_ds = 1e9, best_out = 1e9;
         for (int i = 0; i < 20; i++) {
             clock_t t0 = clock();
-            downscale(RGB_BUF, sw, src_w, src_h, sox, soy);
+            /* 韌體是逐條 MCU band 餵進 resample_row()，測試台手上是一整張
+             * RGB888，所以直接逐列餵 —— 走的是同一段重取樣程式碼，
+             * 差別只在誰負責把來源列生出來。 */
+            resample_begin(src_h, src_w, sox, soy);
+            for (uint32_t yy = soy; yy < soy + src_h; yy++) {
+                resample_row(RGB_BUF + (size_t)yy * sw * 3u, yy);
+            }
+            resample_end();
             clock_t t1 = clock();
             sharpen_dither_rotate();
             clock_t t2 = clock();

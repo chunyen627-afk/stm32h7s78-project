@@ -362,15 +362,6 @@ static void init_gamma_tables(void)
 #define RESAMPLE_LINEAR 1
 #endif
 
-/* 盒子邊界的處理方式：
- *   1 = 分數覆蓋率。邊界上的來源像素按重疊比例加權，數學上正確。
- *   0 = 整數邊界。來源像素非全進即全出，盒子彼此不重疊，走訪次數少一半，
- *       每個樣本也不必算權重 —— 便宜很多，但盒子大小會隨位置跳動。
- * 兩者的畫質差距要用測試台量，不要用推理決定。 */
-#ifndef AREA_FRACTIONAL
-#define AREA_FRACTIONAL 1
-#endif
-
 #if RESAMPLE_LINEAR
 #define TO_LIGHT(v)    ((uint32_t)g_srgb_to_lin[(v)])
 #define FROM_LIGHT(v)  g_lin_to_srgb[(v) >> 4]
@@ -499,11 +490,7 @@ static void build_x_weights(uint32_t sx_step, uint32_t xbase, uint32_t xlimit)
         uint32_t fx0 = xbase + dx * sx_step;
         uint32_t fx1 = xbase + (dx + 1u) * sx_step;
         uint32_t sx0 = fx0 >> 16;
-#if AREA_FRACTIONAL
-        uint32_t sx1 = (fx1 + 0xFFFFu) >> 16;
-#else
-        uint32_t sx1 = fx1 >> 16;
-#endif
+        uint32_t sx1 = (fx1 + 0xFFFFu) >> 16;   /* 進位才不會漏掉邊界那顆 */
         uint32_t n = 0;
 
         if (sx1 <= sx0)   { sx1 = sx0 + 1u; }
@@ -518,107 +505,245 @@ static void build_x_weights(uint32_t sx_step, uint32_t xbase, uint32_t xlimit)
         g_wx_off[dx]   = (uint16_t)off;
         g_wx_start[dx] = (uint16_t)sx0;
         for (uint32_t xx = sx0; xx < sx1; xx++) {
-#if AREA_FRACTIONAL
+            /* 這顆來源像素有多少落在涵蓋範圍內，就給多少權重。 */
             uint32_t xl = (xx << 16) > fx0 ? (xx << 16) : fx0;
             uint32_t xr = ((xx + 1u) << 16) < fx1 ? ((xx + 1u) << 16) : fx1;
             uint32_t w  = (xr > xl) ? ((xr - xl) >> 8) : 0u;
-#else
-            uint32_t w  = 256u;            /* 整數盒：每顆來源像素等權 */
-#endif
             g_wx[off++] = (uint16_t)w;
             n++;
         }
         g_wx_n[dx] = (uint8_t)n;
+
+        /* 正規化成總和「剛好」256。
+         *
+         * 這樣水平方向累加出來的 sum(lin * wx) 上限是 65535*256，右移 8 位
+         * 就直接是 0..65535 的加權平均 —— 內層迴圈完全不必做除法，
+         * 也不必為了不同的 dx 記錄不同的除數。
+         *
+         * 順帶把邊界被夾掉的情況一併處理掉：那些 dx 的原始權重和本來就小於
+         * 一格，正規化等於自動重新分配，不會出現邊緣變暗。 */
+        {
+            uint16_t *wv = &g_wx[g_wx_off[dx]];
+            uint32_t  sum = 0, out = 0, big = 0;
+
+            for (uint32_t k = 0; k < n; k++) { sum += wv[k]; }
+            if (sum == 0u) { sum = 1u; }
+            for (uint32_t k = 0; k < n; k++) {
+                wv[k] = (uint16_t)((wv[k] * 256u + sum / 2u) / sum);
+                out  += wv[k];
+                if (wv[k] > wv[big]) { big = k; }
+            }
+            /* 四捨五入的餘數補到最大的那一項，總和才會精確是 256。 */
+            if (n > 0u) {
+                wv[big] = (uint16_t)((uint32_t)wv[big] + 256u - out);
+            }
+        }
     }
 }
 
-static void downscale(const uint8_t *src, uint32_t sw,
-                      uint32_t src_w, uint32_t src_h,
-                      uint32_t sox, uint32_t soy)
-{
-    uint32_t sx_step = (src_w << 16) / g_dw;
-    uint32_t sy_step = (src_h << 16) / g_dh;
-    uint32_t xbase   = sox << 16;
-    uint32_t ybase   = soy << 16;
-    uint32_t xlimit  = sox + src_w;
-    uint32_t ylimit  = soy + src_h;
+/* ------------------------------------------------------------------ */
+/* 串流式重取樣                                                        */
+/* ------------------------------------------------------------------ */
 
-    /* 縮圖最大就是整個畫面，理論上不會超過；真的超過寧可不畫也不要踩過界。 */
-    if ((size_t)g_dw * g_dh * 3u > SCALED_CAP) {
+/* 來源列一次餵一條進來，累加到目的列，滿了就吐出去。
+ *
+ * 為什麼要改成這個形狀：原本的寫法是「走目的像素、回頭去抓來源」，需要
+ * 一整張全尺寸 RGB888 攤在 PSRAM 裡（2.16MP 就是 6.5MB）。那塊被寫進去
+ * 一次、又被完整讀出來一次，共 13MB 的來回搬運，而縮放對每個來源像素
+ * 其實只用一次 —— 純粹是為了「能隨機存取」才付的代價。
+ *
+ * 改成串流之後只需要一條 band（一列 MCU）的緩衝區，放得進內部 SRAM，
+ * 那 13MB 的 PSRAM 流量整個消失。
+ *
+ * 附帶的好處是水平與垂直分離了：水平重取樣現在「每條來源列做一次」，
+ * 而不是「每個目的列都把它涵蓋的來源列重做一遍」。原本 3.25x3.25 的
+ * 二維取樣變成 3.25 + 少數幾次加法。
+ *
+ * 這三個函式刻意跟「來源從哪來」解耦：韌體用 MCU band 餵，PC 測試台用
+ * 整張影像逐列餵，兩邊跑的是同一段重取樣程式碼。
+ */
+static uint16_t g_hrow[GFX_W * 3];      /* 水平重取樣後的一列，線性光 0..65535 */
+static uint32_t g_acc[GFX_W * 3];       /* 目前這個目的列的垂直累加 */
+static uint32_t g_rs_dy;                /* 正在累積哪個目的列 */
+static uint32_t g_rs_wsum;              /* 這個目的列已累積的垂直權重 */
+static uint32_t g_rs_sy_step, g_rs_ybase, g_rs_ylimit;
+
+static void resample_begin(uint32_t src_h, uint32_t src_w,
+                           uint32_t sox, uint32_t soy)
+{
+    g_rs_sy_step = (src_h << 16) / g_dh;
+    g_rs_ybase   = soy << 16;
+    g_rs_ylimit  = soy + src_h;
+    g_rs_dy      = 0;
+    g_rs_wsum    = 0;
+
+    build_x_weights((src_w << 16) / g_dw, sox << 16, sox + src_w);
+    memset(g_acc, 0, (size_t)g_dw * 3u * sizeof(g_acc[0]));
+}
+
+/* 把累積好的目的列寫進縮圖緩衝區。 */
+static void resample_emit(void)
+{
+    uint8_t  *dst = SCALED_BUF + (size_t)g_rs_dy * g_dw * 3u;
+    uint32_t  w   = g_rs_wsum;
+    uint32_t  half;
+
+    if (w == 0u) { w = 1u; }        /* 除零比畫錯更糟 */
+    half = w >> 1;
+
+    for (uint32_t i = 0; i < g_dw * 3u; i++) {
+        dst[i] = FROM_LIGHT((g_acc[i] + half) / w);
+    }
+    {
+        uint32_t off = (uint32_t)(g_dw * 3u + (uint32_t)(dst - SCALED_BUF));
+        if (off > g_dbg_maxdst) { g_dbg_maxdst = off; }
+    }
+
+    g_rs_dy++;
+    g_rs_wsum = 0;
+    memset(g_acc, 0, (size_t)g_dw * 3u * sizeof(g_acc[0]));
+}
+
+/* row 指向來源影像第 yy 列的開頭（RGB888，整張影像寬度）。
+ * yy 是絕對來源列號，所以水平權重表裡的 sx0 可以直接拿來索引。 */
+static void resample_row(const uint8_t *row, uint32_t yy)
+{
+    uint32_t ytop = yy << 16;
+    uint32_t ybot = (yy + 1u) << 16;
+
+    if (yy < (g_rs_ybase >> 16) || yy >= g_rs_ylimit || g_rs_dy >= g_dh) {
         return;
     }
 
-    build_x_weights(sx_step, xbase, xlimit);
+    /* 水平重取樣。權重已正規化成總和 256，所以右移 8 位就是加權平均，
+     * 上限 65535*256 右移之後剛好回到 0..65535，不必除法。 */
+    for (uint32_t dx = 0; dx < g_dw; dx++) {
+        const uint16_t *wx   = &g_wx[g_wx_off[dx]];
+        const uint8_t  *p    = row + (size_t)g_wx_start[dx] * 3u;
+        uint32_t        ntap = g_wx_n[dx];
+        uint32_t        r = 0, g = 0, b = 0;
 
-    for (uint32_t dy = 0; dy < g_dh; dy++) {
-        uint32_t fy0 = ybase + dy * sy_step;          /* 涵蓋範圍，16.16 */
-        uint32_t fy1 = ybase + (dy + 1u) * sy_step;
-        uint32_t sy0 = fy0 >> 16;                     /* 碰到的整數列 [sy0, sy1) */
-#if AREA_FRACTIONAL
-        uint32_t sy1 = (fy1 + 0xFFFFu) >> 16;         /* 無條件進位才不會漏掉尾巴 */
-#else
-        uint32_t sy1 = fy1 >> 16;                     /* 無條件捨去，盒子不重疊 */
-#endif
-        uint8_t *dst = SCALED_BUF + (size_t)dy * g_dw * 3u;
-
-        /* 每 32 列給一次放棄的機會，把最壞反應時間壓到幾十毫秒。 */
-        if ((dy & 31u) == 0u && aborted()) {
-            return;
+        for (uint32_t k = 0; k < ntap; k++) {
+            uint32_t w = wx[k];
+            r += TO_LIGHT(p[0]) * w;
+            g += TO_LIGHT(p[1]) * w;
+            b += TO_LIGHT(p[2]) * w;
+            p += 3;
         }
-        if (sy1 <= sy0)   { sy1 = sy0 + 1u; }
-        if (sy1 > ylimit) { sy1 = ylimit; }
+        g_hrow[dx * 3u + 0u] = (uint16_t)(r >> 8);
+        g_hrow[dx * 3u + 1u] = (uint16_t)(g >> 8);
+        g_hrow[dx * 3u + 2u] = (uint16_t)(b >> 8);
+    }
 
-        for (uint32_t dx = 0; dx < g_dw; dx++) {
-            const uint16_t *wx   = &g_wx[g_wx_off[dx]];
-            uint32_t        sx0  = g_wx_start[dx];
-            uint32_t        ntap = g_wx_n[dx];
-            uint32_t r = 0, g = 0, b = 0, n = 0;
+    if (yy > g_dbg_maxsy) { g_dbg_maxsy = yy; }
 
-            if (sy1 - 1u > g_dbg_maxsy) { g_dbg_maxsy = sy1 - 1u; }
-            if (sx0 + ntap - 1u > g_dbg_maxsx) { g_dbg_maxsx = sx0 + ntap - 1u; }
+    /* 這條來源列可能橫跨不只一個目的列（縮放比不是整數時很常見），
+     * 所以是迴圈不是 if。放大時一條來源列會餵飽好幾個目的列，同樣走這裡。 */
+    while (g_rs_dy < g_dh) {
+        uint32_t fy0 = g_rs_ybase + g_rs_dy * g_rs_sy_step;
+        uint32_t fy1 = g_rs_ybase + (g_rs_dy + 1u) * g_rs_sy_step;
+        uint32_t top = (fy0 > ytop) ? fy0 : ytop;
+        uint32_t bot = (fy1 < ybot) ? fy1 : ybot;
 
-            for (uint32_t yy = sy0; yy < sy1; yy++) {
-                const uint8_t *p;
-#if AREA_FRACTIONAL
-                /* 這一列與涵蓋範圍重疊多少，換算成 0..256。
-                 * 這個只跟 dy 有關，一列算一次就好，不必進到內層。 */
-                uint32_t ytop = (yy << 16) > fy0 ? (yy << 16) : fy0;
-                uint32_t ybot = ((yy + 1u) << 16) < fy1 ? ((yy + 1u) << 16) : fy1;
-                uint32_t wy   = (ybot > ytop) ? ((ybot - ytop) >> 8) : 0u;
+        if (bot > top) {
+            /* 重疊量換算成 0..256。極端放大時可能不足 1，夾成 1 免得
+             * 整個目的列拿不到任何貢獻而變成黑的。 */
+            uint32_t wy = (bot - top) >> 8;
 
-                if (wy == 0u) {
-                    continue;
-                }
-#else
-                const uint32_t wy = 256u;
-#endif
-                p = src + ((size_t)yy * sw + sx0) * 3u;
-                for (uint32_t k = 0; k < ntap; k++) {
-                    /* 兩個方向的覆蓋率相乘就是這顆來源像素的權重。 */
-                    uint32_t w = ((uint32_t)wx[k] * wy) >> 8;
-
-                    /* 先轉成線性光再加權平均。累加上限：65535 x 總權重
-                     * （2.25 倍時約 1296）約 8500 萬，uint32 裝得下。 */
-                    r += TO_LIGHT(p[0]) * w;
-                    g += TO_LIGHT(p[1]) * w;
-                    b += TO_LIGHT(p[2]) * w;
-                    n += w;
-                    p += 3;
-                }
+            if (wy == 0u) { wy = 1u; }
+            for (uint32_t i = 0; i < g_dw * 3u; i++) {
+                g_acc[i] += (uint32_t)g_hrow[i] * wy;
             }
+            g_rs_wsum += wy;
+        }
 
-            if (n == 0u) { n = 1u; }        /* 理論上不會發生，除零比畫錯更糟 */
-            /* 平均完再轉回 sRGB。四捨五入，不要直接截斷。 */
-            dst[0] = FROM_LIGHT((r + (n >> 1)) / n);
-            dst[1] = FROM_LIGHT((g + (n >> 1)) / n);
-            dst[2] = FROM_LIGHT((b + (n >> 1)) / n);
-            dst += 3;
-            {
-                uint32_t off = (uint32_t)(dst - SCALED_BUF);
-                if (off > g_dbg_maxdst) { g_dbg_maxdst = off; }
-            }
+        if (fy1 <= ybot) {
+            resample_emit();        /* 這個目的列收齊了 */
+        } else {
+            break;                  /* 還要等後面的來源列 */
         }
     }
+}
+
+static void resample_end(void)
+{
+    /* 最後一個目的列可能因為來源高度被 MCU 邊界截掉而沒收齊。 */
+    if (g_rs_dy < g_dh && g_rs_wsum > 0u) {
+        resample_emit();
+    }
+}
+
+/* 一條 MCU 列轉出來的 RGB888。**放內部 SRAM 是整個改動的重點** ——
+ * band 待在 SRAM，全尺寸 RGB888 那 13MB 的 PSRAM 來回搬運就整個消失。
+ *
+ * 160KB 的容量：4:2:0（MCU 高 16）撐得住寬 3413 的照片，
+ * 4:4:4 與 4:2:2（MCU 高 8）撐到 6826。超過就退回用 PSRAM 的 RGB_BUF，
+ * 慢，但正確。
+ *
+ * 尾端多留 256 bytes：右邊界的部分 MCU 會多寫幾個像素，寫入上界算出來是
+ * 16*ScaledWidth + 45。board-notes 11.5 那條「緩衝區之間不要首尾相接」。 */
+#define BAND_CAP  (160u * 1024u)
+static uint8_t g_band[BAND_CAP + 256u];
+
+volatile uint32_t g_dbg_band_psram;   /* band 放不進 SRAM 而退回 PSRAM 的次數 */
+
+/* 逐條 MCU 列解碼並重取樣，不需要全尺寸的 RGB888 中間層。 */
+static void downscale_banded(JPEG_YCbCrToRGB_Convert_Function convert,
+                             uint32_t img_w, uint32_t img_h,
+                             uint32_t mcu_w, uint32_t mcu_h, uint32_t mcu_bytes,
+                             uint32_t src_w, uint32_t src_h,
+                             uint32_t sox, uint32_t soy)
+{
+    uint32_t per_row = (img_w + mcu_w - 1u) / mcu_w;
+    uint32_t n_rows  = (img_h + mcu_h - 1u) / mcu_h;
+    uint32_t stride  = img_w * 3u;
+    size_t   need    = (size_t)stride * mcu_h + 256u;
+    uint8_t *band    = g_band;
+    uint32_t cc      = 0;
+
+    if ((size_t)g_dw * g_dh * 3u > SCALED_CAP) {
+        return;
+    }
+    if (need > sizeof(g_band)) {
+        band = RGB_BUF;
+        g_dbg_band_psram++;
+    }
+
+    resample_begin(src_h, src_w, sox, soy);
+
+    for (uint32_t m = 0; m < n_rows; m++) {
+        uint32_t first = m * mcu_h;
+        uint32_t done  = 0;
+        uint32_t c0;
+
+        if (first >= soy + src_h)  { break; }      /* 剩下的都在取用範圍下方 */
+        if (first + mcu_h <= soy)  { continue; }   /* 整條在取用範圍上方 */
+        if (aborted())             { return; }
+
+        /* BlockIndex 傳 0，同時把輸入指標滑到這條 MCU 列的起點。
+         *
+         * 轉色函式是用 currentMCU（從 BlockIndex 起算）去推輸出位址的
+         * xRef = (currentMCU * mcu_w / WidthExtend) * mcu_h，而輸入指標
+         * 則是每處理完一個 MCU 就 += 一個區塊、與索引無關。所以傳 0
+         * 等於告訴它「這些 MCU 是影像最上面那一條」，輸出就落在
+         * band 的第 0..mcu_h-1 列 —— 不必給它整張影像大小的緩衝區，
+         * 也不必動任何指標偏移的取巧手法。 */
+        c0 = cyc_start();
+        (void)convert(YCBCR_BUF + (size_t)m * per_row * mcu_bytes,
+                      band, 0, per_row * mcu_bytes, &done);
+        cc += cyc_us(c0);
+
+        for (uint32_t r = 0; r < mcu_h; r++) {
+            uint32_t yy = first + r;
+
+            if (yy >= img_h) { break; }            /* MCU 補齊出來的列，丟掉 */
+            resample_row(band + (size_t)r * stride, yy);
+        }
+    }
+    resample_end();
+
+    /* 轉色現在夾在縮放裡面，但分開記帳，之前幾輪的數字才比得下去。 */
+    g_dbg_us_cc = cc;
 }
 
 static inline uint8_t clamp8(int32_t v)
@@ -704,9 +829,10 @@ photo_result_t photo_show(const char *path)
 {
     JPEG_ConfTypeDef info;
     JPEG_YCbCrToRGB_Convert_Function convert;
-    uint32_t nb_mcu = 0, converted = 0;
+    uint32_t nb_mcu = 0;
     uint32_t size, src_w, src_h, sox, soy, t0;
     uint32_t c0, call;
+    uint32_t hf, vf, bs;        /* MCU 的寬、高、位元組數 */
 
     call = cyc_start();
 
@@ -749,7 +875,6 @@ photo_result_t photo_show(const char *path)
      *   4:2:0  MCU 16x16 384 bytes（每像素 1.5）
      * 高度也要補齊到 MCU 邊界，解碼器會多寫到補齊的部分。 */
     {
-        uint32_t hf, vf, bs;
         uint32_t nmcu, need_ycbcr, need_rgb, aligned_h;
 
         if (info.ChromaSubsampling == JPEG_420_SUBSAMPLING) {
@@ -767,6 +892,8 @@ photo_result_t photo_show(const char *path)
         need_rgb   = (uint32_t)info.ImageWidth * aligned_h * 3u;
 
         g_dbg_need_rgb = need_rgb;
+        /* need_rgb 現在只在 band 塞不進 SRAM、退回用 RGB_BUF 時才用得到，
+         * 但那條退路仍需要這麼多空間，所以檢查照舊。 */
         if (need_ycbcr > YCBCR_CAP || need_rgb > RGB_CAP) {
             g_dbg_toobig++;
             return PHOTO_ERR_TOO_BIG;
@@ -792,10 +919,6 @@ photo_result_t photo_show(const char *path)
     if (JPEG_GetDecodeColorConvertFunc(&info, &convert, &nb_mcu) != HAL_OK) {
         return PHOTO_ERR_DECODE;
     }
-    c0 = cyc_start();
-    (void)convert(YCBCR_BUF, RGB_BUF, 0, g_out_total, &converted);
-    g_dbg_us_cc = cyc_us(c0);
-
     g_dbg_outcount  = g_out_total;
     g_dbg_w         = info.ImageWidth;
     g_dbg_h         = info.ImageHeight;
@@ -821,7 +944,8 @@ photo_result_t photo_show(const char *path)
 
     t0 = HAL_GetTick();
     c0 = cyc_start();
-    downscale(RGB_BUF, info.ImageWidth, src_w, src_h, sox, soy);
+    downscale_banded(convert, info.ImageWidth, info.ImageHeight,
+                     hf, vf, bs, src_w, src_h, sox, soy);
     g_dbg_us_scale = cyc_us(c0);
     g_dbg_ms_scale = HAL_GetTick() - t0;
 

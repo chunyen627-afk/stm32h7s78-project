@@ -13,13 +13,10 @@ REPO=$(cd ../../.. && pwd)
 OUT=out
 mkdir -p "$OUT"
 
-# 兩個獨立變數的四種組合：盒子邊界（整數／分數）× 色彩空間（sRGB／線性光）。
-# 目的是分辨畫質的提升來自哪一個、成本又花在哪一個。
+# 每組一個編譯旗標，用來隔離單一變因。
 VARIANTS=(
-    "int_srgb:-DAREA_FRACTIONAL=0 -DRESAMPLE_LINEAR=0"   # 最初的版本
-    "int_lin:-DAREA_FRACTIONAL=0 -DRESAMPLE_LINEAR=1"    # 只加線性光（便宜）
-    "frac_srgb:-DAREA_FRACTIONAL=1 -DRESAMPLE_LINEAR=0"  # 只加分數覆蓋率
-    "frac_lin:-DAREA_FRACTIONAL=1 -DRESAMPLE_LINEAR=1"   # 目前燒在板子上的
+    "base:"                          # 面積平均 + 線性光 + 銳化 100
+    "srgbavg:-DRESAMPLE_LINEAR=0"    # 隔離線性光的貢獻
 )
 
 echo "==> 產生測試圖"

@@ -61,8 +61,10 @@ def main():
         jobs = [
             ("refbox",     Image.BOX,     False),
             ("reflanczos", Image.LANCZOS, False),
-            ("reflinbox",  Image.BOX,     True),
-            ("reflin",     Image.LANCZOS, True),
+            ("reflinbox",  Image.BOX,      True),
+            ("reflintri",  Image.BILINEAR, True),   # 三角，支撐 2x，無負瓣
+            ("reflincub",  Image.BICUBIC,  True),   # 三次，輕微負瓣
+            ("reflin",     Image.LANCZOS,  True),   # 支撐 6x，負瓣最強
         ]
         for tag, filt, linear in jobs:
             if linear:
