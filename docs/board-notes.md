@@ -1304,6 +1304,76 @@ USE 的原因當場就寫在暫存器上，不必猜。**只留第一次**——
 **「26% 失敗」和「這 32 格因為 size 不是 4 的倍數所以必定失敗」是同一件事，
 但後者可以直接寫成修正。**
 
+### 16.13 分帶轉色：YCbCr 中間層放內部 SRAM
+
+16.11 的結論是「瓶頸是 100MHz PSRAM 的頻寬，不是運算」。每格的 PSRAM 流量：
+
+| 動作 | 量 |
+|---|---|
+| JPEG DMA 寫 YCbCr | 576 KB |
+| DMA2D 讀 YCbCr | 576 KB |
+| DMA2D 寫 RGB565 | 768 KB（省不掉，LTDC 要從 PSRAM 掃描） |
+| **合計** | **1,920 KB/格** = 24fps 下 46 MB/s，而 LTDC 同時也要 46 MB/s |
+
+把 YCbCr 搬進內部 SRAM 可以砍掉前兩項。**但整塊放不下**：800x480 的 4:2:0
+要 562KB，而內部 AXI SRAM 只有 **456KB**（連結腳本的 `__RAM_SIZE = 0x72000`，
+不是憑印象猜的）。
+
+**解法是分帶**：SRAM 裡只放幾條 MCU 列，解出一帶就立刻 DMA2D 轉進
+framebuffer，576KB 從頭到尾不落 PSRAM。一條 MCU 列 = `寬/16` 個 MCU x
+384 bytes（4:2:0），800 寬時是 19,200 bytes；480 高 = 30 條，取 2 條一帶
+剛好整除成 15 帶。
+
+#### 關鍵在 HAL_JPEG_Pause
+
+輸出緩衝區只有一塊，填滿之後**一定要暫停**，否則 `JPEG_DMAOutCpltCallback`
+會拿同一塊重啟輸出 DMA，在我們還沒轉完的時候就把它蓋掉（它只檢查
+`JPEG_CONTEXT_PAUSE_OUTPUT` 旗標）。
+
+```c
+/* DataReadyCallback（中斷內）：只記長度並暫停 */
+g_band_len = OutDataLength;
+HAL_JPEG_Pause(hjpeg, JPEG_PAUSE_RESUME_OUTPUT);
+
+/* 主迴圈：轉掉、餵回同一塊、恢復 */
+band_drain();
+HAL_JPEG_ConfigOutputBuffer(&hjpeg, g_band, BAND_BYTES);
+HAL_JPEG_Resume(&hjpeg, JPEG_PAUSE_RESUME_OUTPUT);
+```
+
+**轉色不要放在回呼裡做。** 轉一帶要幾百微秒，在中斷裡忙等會把 SysTick
+押後、`HAL_GetTick()` 漏拍，對時與逾時判斷全部失準。
+
+#### 只在格式對得上時才分帶
+
+`MCU_ROW_BYTES` 是照 4:2:0、寬 800 算死的常數，格式一變數字就錯，
+而錯的行數會讓 DMA2D 寫超出 framebuffer。第一格一定走原本的整塊路徑
+（那時 DMA2D 還沒設定），順便把取樣格式與寬高量出來，相符才開始分帶。
+
+#### 實測（同一份韌體 A/B、各 2184 格）
+
+| | 分帶關閉 | 分帶開啟 |
+|---|---|---|
+| 讀檔 | 2.84 ms | 2.94 ms |
+| 解碼 | 3.66 ms | **2.06 ms** |
+| 轉色 | 19.91 ms | **13.72 ms** |
+| 換頁 | 7.98 ms | 8.40 ms |
+| 合計 | 34.39 ms | **27.12 ms** |
+| 能力上限 | 29.1 fps | **36.9 fps** |
+| 跟不上素材格率 | 156 次 | **0 次** |
+
+轉色快 31%，而且**解碼也快了 44%** —— 事前沒預期到這一點：JPEG 的輸出 DMA
+現在寫的是 SRAM 不是 PSRAM，而它跟 DMA2D 搶的本來就是同一條匯流排。
+**優化一個階段順便讓另一個階段變快，是「共用資源受限」的典型徵兆。**
+
+A/B 用 `g_dbg_useband` 這個 SWD 可寫的旗標做，同一份韌體、同樣的影格 ——
+重編一版再比會混進別的差異。
+
+#### 快取
+
+分帶緩衝區在內部 SRAM，是可快取的區域，但 **CPU 從頭到尾不碰它**：
+JPEG DMA 寫、DMA2D 讀，兩者都繞過 D-Cache。沒有髒的快取列，
+所以不需要任何 clean/invalidate。
 ---
 
 ## 十七、SD 卡：從電腦把大檔送進板子
