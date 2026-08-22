@@ -67,6 +67,30 @@
  * 27fps 的素材用 24fps 播會愈跑愈慢。這個是退回用的預設值。 */
 #define DEFAULT_FPS_X100  2400u
 
+/* ---- 分帶轉色：YCbCr 中間層放內部 SRAM ---------------------------
+ *
+ * 瓶頸是 100MHz PSRAM 的頻寬不是運算（board-notes 16.11）。每格原本的
+ * PSRAM 流量：
+ *
+ *   JPEG DMA 寫 YCbCr   576KB
+ *   DMA2D   讀 YCbCr    576KB
+ *   DMA2D   寫 RGB565   768KB   <- 這個省不掉，LTDC 要從 PSRAM 掃描
+ *   -------------------------
+ *   合計              1,920KB/格 = 24fps 下 46 MB/s，而 LTDC 同時也要 46
+ *
+ * 把 YCbCr 搬進內部 SRAM 就能砍掉前兩項的 1,152KB。
+ * 問題是**整塊放不下**：800x480 的 4:2:0 要 562KB，而內部 AXI SRAM 只有
+ * 456KB（連結腳本的 __RAM_SIZE = 0x72000）。
+ *
+ * 所以改成分帶：SRAM 裡只放幾條 MCU 列，解出一帶就立刻 DMA2D 轉進
+ * framebuffer，576KB 從頭到尾不落 PSRAM。
+ *
+ * 一條 MCU 列 = 800/16 = 50 個 MCU，4:2:0 每個 MCU 384 bytes -> 19,200 bytes。
+ * 480/16 = 30 條，取 2 條一帶剛好整除成 15 帶（不整除的話最後一帶要特別處理）。 */
+#define MCU_ROW_BYTES   ((PHYS_W / 16u) * 384u)     /* 19200，只對 4:2:0 成立 */
+#define BAND_MCU_ROWS   2u
+#define BAND_BYTES      (BAND_MCU_ROWS * MCU_ROW_BYTES)
+
 typedef struct {
     uint32_t magic, count, width, height, fps_x100, max_size;
 } frames_hdr_t;
@@ -144,6 +168,25 @@ static uint32_t       g_out_cb;
 
 static uint32_t g_next_ms;               /* 下一格該顯示的時刻 */
 
+/* ---- 分帶狀態 ---------------------------------------------------- */
+
+/* 這塊在內部 SRAM（.bss 落在 0x24000000 的 AXI SRAM）。CPU 從頭到尾不碰它 ——
+ * JPEG DMA 寫、DMA2D 讀，兩者都繞過 D-Cache，所以不需要任何快取維護。 */
+static uint8_t g_band[BAND_BYTES] __attribute__((aligned(32)));
+
+static volatile uint32_t g_band_len;     /* 非 0 = 有一帶等著轉 */
+static volatile uint8_t  g_band_paused;  /* 已經叫 HAL 暫停輸出 */
+static uint32_t          g_band_y;       /* 下一帶要寫到第幾條掃描線 */
+static uint8_t          *g_band_fb;      /* 目的 framebuffer */
+static bool              g_banding;      /* 這一格走分帶 */
+static bool              g_band_ok;      /* 格式對得上，可以分帶 */
+
+/* SWD 可寫，用來 A/B：寫 0 就退回原本「整塊 YCbCr 放 PSRAM」的路徑，
+ * 不用重編就能比較兩者的每格耗時。 */
+volatile uint32_t g_dbg_useband = 1u;
+volatile uint32_t g_dbg_bands;           /* 累計轉過幾帶 */
+volatile uint32_t g_dbg_band_short;      /* 長度不是整條 MCU 列的次數 */
+
 /* ---- 晶片接面溫度 ------------------------------------------------
  *
  * 板子上沒有外接溫度感測器，但 MCU 內建 DTS。量到的是**晶片接面溫度**，
@@ -212,10 +255,28 @@ static inline uint32_t cyc_us(uint32_t t0)
 void HAL_JPEG_DataReadyCallback(JPEG_HandleTypeDef *hjpeg, uint8_t *pDataOut,
                                 uint32_t OutDataLength)
 {
-    uint32_t end = (uint32_t)(pDataOut - YCBCR_BUF) + OutDataLength;
+    uint32_t end;
     uint32_t left;
 
     g_out_cb++;
+
+    /* 分帶模式：不在這裡轉色。
+     *
+     * 轉一帶要幾百微秒，在回呼（中斷）裡忙等會把 SysTick 押後，HAL_GetTick
+     * 就會漏拍，對時與逾時判斷全部失準。所以這裡只做兩件事：記下長度、
+     * 叫 HAL 暫停輸出。真正的轉色交給主迴圈。
+     *
+     * 一定要 Pause：不暫停的話 HAL 會拿**同一塊**緩衝區重啟輸出 DMA，
+     * 在我們還沒轉完的時候就蓋掉它（JPEG_DMAOutCpltCallback 只檢查
+     * PAUSE_OUTPUT 旗標）。 */
+    if (g_banding) {
+        g_band_len    = OutDataLength;
+        (void)HAL_JPEG_Pause(hjpeg, JPEG_PAUSE_RESUME_OUTPUT);
+        g_band_paused = 1u;
+        return;
+    }
+
+    end = (uint32_t)(pDataOut - YCBCR_BUF) + OutDataLength;
     if (end > g_out_total) {
         g_out_total = end;      /* 取最大值不累加：HAL 可能對同一批回呼兩次 */
     }
@@ -508,6 +569,45 @@ static void present(void)
     g_front ^= 1u;
 }
 
+/* 轉一帶：從 SRAM 讀 YCbCr，寫進 framebuffer 對應的那幾條掃描線。 */
+static void dma2d_band(uint8_t *dst, const uint8_t *src, uint32_t lines)
+{
+    DMA2D->FGMAR = (uint32_t)src;
+    DMA2D->OMAR  = (uint32_t)dst;
+    DMA2D->NLR   = (PHYS_W << DMA2D_NLR_PL_Pos) | lines;
+    DMA2D->IFCR  = DMA2D_IFCR_CTCIF | DMA2D_IFCR_CTEIF | DMA2D_IFCR_CCEIF;
+    DMA2D->CR   |= DMA2D_CR_START;
+
+    while ((DMA2D->CR & DMA2D_CR_START) != 0u) { }
+    __DSB();
+}
+
+/* 把等著的那一帶轉掉。主迴圈呼叫，不在中斷裡。 */
+static void band_drain(void)
+{
+    uint32_t len = g_band_len;
+    uint32_t lines;
+    uint32_t c0;
+
+    if (len == 0u) {
+        return;
+    }
+    /* 只處理整條 MCU 列。餘數代表對不上預期的版面，寧可丟掉那一小段
+     * 也不要拿錯的行數去寫 framebuffer（寫超過就踩到下一塊緩衝區）。 */
+    lines = (len / MCU_ROW_BYTES) * 16u;
+    if ((len % MCU_ROW_BYTES) != 0u) {
+        g_dbg_band_short++;
+    }
+    if (lines != 0u && (g_band_y + lines) <= PHYS_H) {
+        c0 = cyc_start();
+        dma2d_band(g_band_fb + (size_t)g_band_y * PHYS_W * 2u, g_band, lines);
+        g_dbg_sum_cc += cyc_us(c0);
+        g_band_y     += lines;
+        g_dbg_bands++;
+    }
+    g_band_len = 0u;
+}
+
 /* ------------------------------------------------------------------ */
 /* 影格來源：SD 卡優先，退回外部 Flash                                   */
 /* ------------------------------------------------------------------ */
@@ -637,7 +737,7 @@ static void check_writer(void)
 /* 播放                                                                */
 /* ------------------------------------------------------------------ */
 
-static bool decode_frame(const uint8_t *jpg, uint32_t size)
+static bool decode_frame(const uint8_t *jpg, uint32_t size, uint8_t *dst)
 {
     uint32_t first;
 
@@ -650,25 +750,57 @@ static bool decode_frame(const uint8_t *jpg, uint32_t size)
     g_in_cb     = 0u;
     g_out_cb    = 0u;
 
+    /* 只有在「格式確定對得上」時才走分帶：MCU_ROW_BYTES 是照 4:2:0、寬 800
+     * 算死的，格式一變那個數字就錯，而錯的行數會寫超出 framebuffer。
+     * 第一格 g_dma2d_ready 還是 false，所以一定走原本的整塊路徑，
+     * 順便把格式量出來。 */
+    g_banding = (g_dbg_useband != 0u) && g_dma2d_ready && g_band_ok &&
+                (dst != NULL);
+    if (g_banding) {
+        g_band_len    = 0u;
+        g_band_paused = 0u;
+        g_band_y      = 0u;
+        g_band_fb     = dst;
+    }
+
     /* 第一塊也要是 4 的倍數。HAL 在啟動時的處理是**捨去**
      * （`InDataLength - InDataLength % 4`），續傳時卻是**進位** —— 兩邊規則
      * 不一致。捨去會把尾巴留給下一次，而那個尾巴正好是 1~3 個位元組時就
      * 觸發 USE。這裡先進位，小影格就一次餵完，不會有第二次啟動。 */
     first = (size > CHUNK) ? CHUNK : ((size + 3u) & ~3u);
     if (HAL_JPEG_Decode_DMA(&g_hjpeg, (uint8_t *)jpg, first,
-                            YCBCR_BUF, CHUNK) != HAL_OK) {
+                            g_banding ? g_band : YCBCR_BUF,
+                            g_banding ? BAND_BYTES : CHUNK) != HAL_OK) {
         g_dbg_lasterr = -3;
         return false;
     }
     {
         uint32_t t0 = HAL_GetTick();
+
         while (g_done == 0u) {
+            /* 分帶模式：回呼填滿一帶就會暫停輸出，主迴圈在這裡把它轉掉
+             * 再餵回同一塊、恢復輸出。轉色因此跟解碼交錯進行，而 YCbCr
+             * 從頭到尾只存在於內部 SRAM。 */
+            if (g_banding && g_band_len != 0u) {
+                band_drain();
+                if (g_band_paused != 0u) {
+                    g_band_paused = 0u;
+                    HAL_JPEG_ConfigOutputBuffer(&g_hjpeg, g_band, BAND_BYTES);
+                    (void)HAL_JPEG_Resume(&g_hjpeg, JPEG_PAUSE_RESUME_OUTPUT);
+                }
+            }
             if ((HAL_GetTick() - t0) > 2000u) {
                 g_dbg_lasterr = -4;
                 (void)HAL_JPEG_Abort(&g_hjpeg);
+                g_banding = false;
                 return false;
             }
         }
+    }
+    /* 解碼結束時 HAL 還會回呼一次，最後一帶留在這裡等著轉。 */
+    if (g_banding) {
+        band_drain();
+        g_band_paused = 0u;
     }
     /* 錯誤碼一定要在 DeInit 之前擷取 —— 重新初始化會把 ErrorCode 清成 0，
      * 先前 jerr/derr 全是 0 就是這個順序寫錯造成的假象。 */
@@ -782,8 +914,11 @@ void video_run(void)
             continue;
         }
 
+        {
+            uint32_t cc0 = g_dbg_sum_cc;   /* 分帶時轉色發生在解碼期間 */
+
         c0 = cyc_start();
-        if (!decode_frame(jpg, len)) {
+        if (!decode_frame(jpg, len, (uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR))) {
             g_dbg_fail++;
             if (use < 128u) {
                 g_dbg_failmap[use >> 5] |= 1u << (use & 31u);
@@ -794,7 +929,9 @@ void video_run(void)
         if (use < 128u) {
             g_dbg_okmap[use >> 5] |= 1u << (use & 31u);
         }
-        g_dbg_sum_dec += cyc_us(c0);
+        /* 扣掉分帶轉色的時間，解碼那欄才還是「純解碼」，跟舊數字可比。 */
+        g_dbg_sum_dec += cyc_us(c0) - (g_dbg_sum_cc - cc0);
+        }
 
         if (HAL_JPEG_GetInfo(&g_hjpeg, &info) != HAL_OK ||
             JPEG_GetDecodeColorConvertFunc(&info, &convert, &nb_mcu) != HAL_OK) {
@@ -807,11 +944,17 @@ void video_run(void)
         if (!g_dma2d_ready) {
             g_dma2d_ready = dma2d_setup(info.ChromaSubsampling);
             g_dbg_stage = g_dma2d_ready ? 6u : 92u;
+            /* MCU_ROW_BYTES 是照 4:2:0、寬 800 算死的，格式不合就不能分帶。 */
+            g_band_ok = (info.ChromaSubsampling == JPEG_420_SUBSAMPLING) &&
+                        (info.ImageWidth == (uint32_t)PHYS_W) &&
+                        (info.ImageHeight == (uint32_t)PHYS_H);
         }
 
         c0 = cyc_start();
         if (g_front) { g_dbg_to_fb0++; } else { g_dbg_to_fb1++; }
-        if (g_dma2d_ready) {
+        if (g_banding) {
+            /* 已經在解碼期間一帶一帶轉完了，這裡什麼都不用做。 */
+        } else if (g_dma2d_ready) {
             /* DMA2D 讀寫都繞過 D-Cache，不必先失效快取。 */
             dma2d_convert((uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR),
                           info.ImageWidth, info.ImageHeight);
