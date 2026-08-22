@@ -1413,16 +1413,22 @@ static const int CTL_ACT[CTL_COUNT] = {
 };
 
 /* 版面跟著方向走：直立畫布是 480x800、橫向是 800x480，寫死座標會跑掉。 */
-static int ctl_y(void)     { return gfx_height() - CTL_H - 12; }
-
-/* 按鈕寬度有上限，整排置中。
+/* 控制列**一律用直立座標**，不跟著照片的方向轉。
  *
- * 原本是「把可用寬度平均分成五份」，直立（畫布 480）算出來 86px 剛好，
- * 但橫向的畫布寬 800，同一條算式會把每顆撐到 150px —— 文字才 72px，
- * 按鈕整個攤開變形。位置維持在畫布下方不動，只是不再跟著寬度長大。 */
+ * AUTO 模式會逐張決定畫布方向（直式照片用 480x800、橫式用 800x480），
+ * 原本控制列跟著 gfx_width()/gfx_height() 走，於是按鈕也跟著轉 ——
+ * 但使用者的手一直在同一個地方，會轉的應該只有照片。
+ *
+ * 順帶修掉一個實際的 bug：`read_touch()` 回傳的**永遠是直立座標**
+ * （`GFX_W-1-TouchY, TouchX`，跟畫布方向無關）。原本橫向時用橫向座標
+ * 做判定、卻拿直立座標來比，按鈕根本按不準。統一成直立就對上了。
+ *
+ * 這也是相簿既有的做法：選單、掃描進度、錯誤訊息都是照直立版面寫死座標，
+ * 畫之前先 gfx_set_orientation(false)。 */
+static int ctl_y(void)     { return (int)GFX_H - CTL_H - 12; }
 static int ctl_btn_w(void)
 {
-    int w = (gfx_width() - 2 * CTL_X0 - (CTL_COUNT - 1) * CTL_GAP) / CTL_COUNT;
+    int w = ((int)GFX_W - 2 * CTL_X0 - (CTL_COUNT - 1) * CTL_GAP) / CTL_COUNT;
 
     return (w > CTL_BTN_MAX) ? CTL_BTN_MAX : w;
 }
@@ -1430,34 +1436,24 @@ static int ctl_btn_x(int i)
 {
     int total = CTL_COUNT * ctl_btn_w() + (CTL_COUNT - 1) * CTL_GAP;
 
-    return (gfx_width() - total) / 2 + i * (ctl_btn_w() + CTL_GAP);
+    return ((int)GFX_W - total) / 2 + i * (ctl_btn_w() + CTL_GAP);
 }
 
 static void ctl_backup(bool restore)
 {
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
     uint16_t *sv    = CTL_SAVE;
-    int       w     = gfx_width();
     int       y0    = ctl_y();
 
-    if (gfx_is_landscape()) {
-        /* 橫向：畫布與面板同向，一列就是一段連續記憶體。 */
-        for (int j = 0; j < CTL_H; j++) {
-            uint16_t *fb = front + (uint32_t)(y0 + j) * PHYS_W;
+    /* 固定用直立的映射：邏輯 x 是實體列，所以沿著邏輯 y 走才連續。
+     * 不看 gfx_is_landscape() —— 控制列的位置本來就不跟著照片轉。 */
+    for (int i = 0; i < (int)GFX_W; i++) {
+        uint16_t *fb = front + (uint32_t)((int)GFX_W - 1 - i) * PHYS_W
+                             + (uint32_t)y0;
 
-            if (restore) { memcpy(fb, sv, (size_t)w * 2u); }
-            else         { memcpy(sv, fb, (size_t)w * 2u); }
-            sv += w;
-        }
-    } else {
-        /* 直立：邏輯 x 是實體列，所以沿著邏輯 y 走才連續。 */
-        for (int i = 0; i < w; i++) {
-            uint16_t *fb = front + (uint32_t)(w - 1 - i) * PHYS_W + (uint32_t)y0;
-
-            if (restore) { memcpy(fb, sv, (size_t)CTL_H * 2u); }
-            else         { memcpy(sv, fb, (size_t)CTL_H * 2u); }
-            sv += CTL_H;
-        }
+        if (restore) { memcpy(fb, sv, (size_t)CTL_H * 2u); }
+        else         { memcpy(sv, fb, (size_t)CTL_H * 2u); }
+        sv += CTL_H;
     }
 }
 
@@ -1465,11 +1461,16 @@ static void ctl_draw(void)
 {
     uint16_t *back  = gfx_framebuffer();
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
-    int       y0    = ctl_y();
-    int       bw    = ctl_btn_w();
+    bool      was_ls = gfx_is_landscape();
+    int       y0, bw;
+
+    /* 畫之前先切回直立，畫完再還原 —— 照片可能正顯示在橫向畫布上。 */
+    gfx_set_orientation(false);
+    y0 = ctl_y();
+    bw = ctl_btn_w();
 
     gfx_set_framebuffer(front);
-    gfx_fill_rect(0, y0, gfx_width(), CTL_H, COL_BG);
+    gfx_fill_rect(0, y0, (int)GFX_W, CTL_H, COL_BG);
     for (int i = 0; i < CTL_COUNT; i++) {
         int bx = ctl_btn_x(i);
 
@@ -1478,6 +1479,7 @@ static void ctl_draw(void)
                         CTL_NAME[i], COL_TEXT);
     }
     gfx_set_framebuffer(back);
+    gfx_set_orientation(was_ls);
 }
 
 /* 點在控制列上就回傳對應的動作，否則回 -1（交給滑動判定）。 */
