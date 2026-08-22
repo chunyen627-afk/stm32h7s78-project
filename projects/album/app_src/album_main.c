@@ -1388,166 +1388,197 @@ static void flash_orient(void)
 #define PAUSE_NEXT   3
 #define PAUSE_ROTATE 4
 
-/* ---- 暫停中的觸控控制列 ------------------------------------------
+/* ---- 暫停中的疊加層（覆刻影片播放器）----------------------------
  *
- * 滑動手勢仍然保留（整個螢幕都是判定區，很好用），但手勢有個天生的問題：
- * **看不見**。第一次拿到相框的人不會知道可以左右滑。控制列把同一組動作
- * 攤在畫面上，兩種操作方式並存、互不影響。
+ * 版面與互動跟 play_video() 那套一致，兩邊看起來才是同一個介面：
  *
- * 控制列直接畫在「顯示中」的那塊 buffer 上，所以要先把底下的畫面存起來、
- * 離開暫停時原封還原 —— 重新解一張照片要 1.5 秒，存還原只要幾毫秒。
- * 搬移方式跟 icon_backup() 同一套：直立時邏輯 x 才是實體列。 */
+ *   上排   返回（左）   方向（中）   暫停（右，指示用）
+ *   下方   拉桿：目前第幾張 / 共幾張，可以拖曳翻頁
+ *
+ * 點畫面暫停、再點一下（疊加層以外的地方）繼續。疊加層停留 OV_MS 之後
+ * 自己收起來但**維持暫停** —— 收起只是讓照片看得完整。收起狀態下點一下
+ * 只把它叫回來，不會直接觸發動作，否則使用者看不到按鈕在哪就先按到東西。
+ *
+ * 疊加層直接畫在「顯示中」的那塊 buffer 上，所以先把底下的畫面存起來、
+ * 離開時原封還原 —— 重新解一張照片要 1.5 秒，存還原只要幾毫秒。
+ *
+ * **一律用直立座標**，不跟著照片的方向轉：AUTO 會逐張決定畫布方向，
+ * 但使用者的手一直在同一個地方，會轉的應該只有照片。而且 read_touch()
+ * 回傳的永遠是直立座標，統一成直立兩邊才對得上。 */
 
-/* 借用照片路徑的 YCbCr 區。暫停中不會解碼，而按下任何按鈕之後都會**先還原
+/* 借用照片路徑的 YCbCr 區。暫停中不解碼，而按下任何按鈕之後都會**先還原
  * 畫面才去解碼**，兩者不會互相踩到。 */
 #define CTL_SAVE     ((uint16_t *)0x90600000u)
 
-#define CTL_H        96
-#define CTL_BTN_H    72
-#define CTL_X0       8
-#define CTL_GAP      8
-#define CTL_COUNT    4
-/* 上限取直立時算出來的寬度：文字最寬是「上一張」三個字 = 72px，
- * 104 留得下邊距又不會空蕩。橫向不再把它撐成 150px。 */
-#define CTL_BTN_MAX  104
+#define OV_TOP_Y     36
+#define OV_TOP_H     56
+#define OV_PILL_W    120
+#define OV_BACK_X    20
+#define OV_ORIENT_X  ((int)GFX_W / 2 - OV_PILL_W / 2)
+#define OV_PAUSE_X   ((int)GFX_W - 20 - OV_PILL_W)
 
-/* 沒有「繼續」這一顆 —— 點控制列以外的任何地方就是繼續，跟影片播放器一樣。
- *
- * 原本有那顆按鈕時，同一次觸碰會被兩個地方吃到：paused_loop 把它判成
- * 「繼續」而恢復播放，接著播放中的「點畫面暫停」又把同一次觸碰算進去，
- * 於是放一張就立刻回到暫停 —— 使用者看到的是「按繼續沒用」。
- * 實測：每按一次 decode_ok 都有 +1（確實恢復了），但 pause_entries 也 +1。
- * 用 SWD 注入同一個動作（沒有手指）則會連續播下去，兩相對照就定案了。 */
-static const char *const CTL_NAME[CTL_COUNT] = {
-    "上一張", "下一張", "方向", "返回"
-};
-static const int CTL_ACT[CTL_COUNT] = {
-    PAUSE_PREV, PAUSE_NEXT, PAUSE_ROTATE, PAUSE_MENU
-};
+/* 拉桿的幾何直接沿用影片疊加層的常數。 */
+#define PB_X         40
+#define PB_W         400
+#define PB_Y         700
+#define PB_H         14
+#define PB_HIT       60
+#define OV_BOT_Y     (PB_Y - 16)
+#define OV_BOT_H     96
 
-/* 版面跟著方向走：直立畫布是 480x800、橫向是 800x480，寫死座標會跑掉。 */
-/* 控制列**一律用直立座標**，不跟著照片的方向轉。
- *
- * AUTO 模式會逐張決定畫布方向（直式照片用 480x800、橫式用 800x480），
- * 原本控制列跟著 gfx_width()/gfx_height() 走，於是按鈕也跟著轉 ——
- * 但使用者的手一直在同一個地方，會轉的應該只有照片。
- *
- * 順帶修掉一個實際的 bug：`read_touch()` 回傳的**永遠是直立座標**
- * （`GFX_W-1-TouchY, TouchX`，跟畫布方向無關）。原本橫向時用橫向座標
- * 做判定、卻拿直立座標來比，按鈕根本按不準。統一成直立就對上了。
- *
- * 這也是相簿既有的做法：選單、掃描進度、錯誤訊息都是照直立版面寫死座標，
- * 畫之前先 gfx_set_orientation(false)。 */
-static int ctl_y(void)     { return (int)GFX_H - CTL_H - 12; }
-static int ctl_btn_w(void)
-{
-    int w = ((int)GFX_W - 2 * CTL_X0 - (CTL_COUNT - 1) * CTL_GAP) / CTL_COUNT;
+#define PAUSE_SEEK   5           /* 拖曳拉桿翻頁 */
 
-    return (w > CTL_BTN_MAX) ? CTL_BTN_MAX : w;
-}
-static int ctl_btn_x(int i)
-{
-    int total = CTL_COUNT * ctl_btn_w() + (CTL_COUNT - 1) * CTL_GAP;
+static uint32_t g_ov_index;      /* 疊加層要顯示的張數（由 pause_session 給） */
+static uint32_t g_seek_target;   /* 拖曳結束時停在哪一張 */
 
-    return ((int)GFX_W - total) / 2 + i * (ctl_btn_w() + CTL_GAP);
-}
+/* 剛恢復播放的時刻。恢復之後短時間內不理會觸控 —— 否則同一次觸碰
+ * （或放開瞬間的彈跳）會立刻又被播放迴圈判成「暫停」，症狀是
+ * 「點一下播放不了」。實體鍵不會有這個問題，因為它是閂鎖旗標，
+ * 不會被兩個迴圈各吃一次；使用者回報「只有實體鍵按得動」正是這個差別。 */
+static uint32_t g_resume_ms;
+#define RESUME_GUARD_MS  700u
 
-static void ctl_backup(bool restore)
+/* 存還原一條橫帶（邏輯 y0 起算 h 列，整個畫布寬）。
+ * 直立時邏輯 x 是實體列，所以沿著邏輯 y 走才連續。 */
+static uint16_t *strip_backup(int y0, int h, uint16_t *sv, bool restore)
 {
     uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
-    uint16_t *sv    = CTL_SAVE;
-    int       y0    = ctl_y();
 
-    /* 固定用直立的映射：邏輯 x 是實體列，所以沿著邏輯 y 走才連續。
-     * 不看 gfx_is_landscape() —— 控制列的位置本來就不跟著照片轉。 */
     for (int i = 0; i < (int)GFX_W; i++) {
         uint16_t *fb = front + (uint32_t)((int)GFX_W - 1 - i) * PHYS_W
                              + (uint32_t)y0;
 
-        if (restore) { memcpy(fb, sv, (size_t)CTL_H * 2u); }
-        else         { memcpy(sv, fb, (size_t)CTL_H * 2u); }
-        sv += CTL_H;
+        if (restore) { memcpy(fb, sv, (size_t)h * 2u); }
+        else         { memcpy(sv, fb, (size_t)h * 2u); }
+        sv += h;
     }
+    return sv;
 }
 
-static void ctl_draw(void)
+static void ctl_backup(bool restore)
 {
-    uint16_t *back  = gfx_framebuffer();
-    uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    uint16_t *sv = CTL_SAVE;
+
+    sv = strip_backup(OV_TOP_Y, OV_TOP_H, sv, restore);
+    (void)strip_backup(OV_BOT_Y, OV_BOT_H, sv, restore);
+}
+
+/* 只重畫下方的拉桿。拖曳時每幾毫秒就要更新一次，不能整個疊加層重畫。 */
+static void ov_draw_bar(uint32_t idx)
+{
+    uint16_t *back   = gfx_framebuffer();
+    uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
     bool      was_ls = gfx_is_landscape();
-    int       y0, bw;
+    uint32_t  total  = g_order_count ? g_order_count : 1u;
+    uint32_t  done_w = (uint32_t)PB_W * idx / total;
 
-    /* 畫之前先切回直立，畫完再還原 —— 照片可能正顯示在橫向畫布上。 */
     gfx_set_orientation(false);
-    y0 = ctl_y();
-    bw = ctl_btn_w();
-
     gfx_set_framebuffer(front);
-    gfx_fill_rect(0, y0, (int)GFX_W, CTL_H, COL_BG);
-    for (int i = 0; i < CTL_COUNT; i++) {
-        int bx = ctl_btn_x(i);
 
-        /* 方向那一顆直接顯示目前模式（自動／直立／橫向），比固定寫「方向」
-         * 有用 —— 按下去之前就知道現在是什麼狀態。 */
-        const char *name = (CTL_ACT[i] == PAUSE_ROTATE)
-                           ? ORIENT_NAME[photo_get_orientation()]
-                           : CTL_NAME[i];
-
-        gfx_pill(bx, y0 + 12, bw, CTL_BTN_H, COL_PANEL);
-        gfx_text_center(bx + bw / 2, y0 + 12 + (CTL_BTN_H - 24) / 2,
-                        name, COL_TEXT);
+    gfx_fill_rect(0, OV_BOT_Y, (int)GFX_W, OV_BOT_H, COL_BG);
+    gfx_fill_rect(PB_X, PB_Y, PB_W, PB_H, COL_LINE);
+    if (done_w != 0u) {
+        gfx_fill_rect(PB_X, PB_Y, (int)done_w, PB_H, COL_ACCENT);
     }
+    gfx_fill_rect(PB_X + (int)done_w - 3, PB_Y - 8, 6, PB_H + 16, COL_TEXT);
+
+    gfx_number(PB_X, PB_Y + 30, idx + 1u, COL_TEXT);
+    gfx_number_right(PB_X + PB_W, PB_Y + 30, total, COL_DIM);
+
     gfx_set_framebuffer(back);
     gfx_set_orientation(was_ls);
 }
 
-/* 點在控制列上就回傳對應的動作，否則回 -1（交給滑動判定）。 */
+static void ctl_draw(void)
+{
+    uint16_t *back   = gfx_framebuffer();
+    uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    bool      was_ls = gfx_is_landscape();
+
+    gfx_set_orientation(false);
+    gfx_set_framebuffer(front);
+
+    gfx_pill(OV_BACK_X, OV_TOP_Y, OV_PILL_W, OV_TOP_H, COL_PANEL);
+    gfx_text_center(OV_BACK_X + OV_PILL_W / 2, OV_TOP_Y + 16, "返回", COL_TEXT);
+
+    /* 方向那顆直接顯示目前模式（自動／直立／橫向），按下去之前就知道狀態。 */
+    gfx_pill(OV_ORIENT_X, OV_TOP_Y, OV_PILL_W, OV_TOP_H, COL_PANEL);
+    gfx_text_center(OV_ORIENT_X + OV_PILL_W / 2, OV_TOP_Y + 16,
+                    ORIENT_NAME[photo_get_orientation()], COL_TEXT);
+
+    gfx_pill(OV_PAUSE_X, OV_TOP_Y, OV_PILL_W, OV_TOP_H, COL_PANEL);
+    gfx_text_center(OV_PAUSE_X + OV_PILL_W / 2, OV_TOP_Y + 16,
+                    "暫停", COL_ACCENT);
+
+    gfx_set_framebuffer(back);
+    gfx_set_orientation(was_ls);
+
+    ov_draw_bar(g_ov_index);
+}
+
+/* 回傳動作代碼；-1 = 疊加層以外（＝繼續播放）。
+ * 「暫停」那顆只是指示，點它跟點空白處一樣。 */
 static int ctl_hit(int x, int y)
 {
-    if (y < ctl_y()) {
-        return -1;
-    }
-    for (int i = 0; i < CTL_COUNT; i++) {
-        int bx = ctl_btn_x(i);
-
-        if (x >= bx && x < bx + ctl_btn_w()) {
-            return CTL_ACT[i];
+    if (y >= OV_TOP_Y && y < OV_TOP_Y + OV_TOP_H) {
+        if (x >= OV_BACK_X && x < OV_BACK_X + OV_PILL_W) {
+            return PAUSE_MENU;
+        }
+        if (x >= OV_ORIENT_X && x < OV_ORIENT_X + OV_PILL_W) {
+            return PAUSE_ROTATE;
         }
     }
-    return PAUSE_RESUME - 1000;         /* 點在列上但沒中按鈕：什麼都不做 */
+    if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
+        return PAUSE_SEEK;
+    }
+    return -1;
+}
+
+/* 疊加層目前有沒有蓋上去。存還原必須成對，所以集中在這兩個函式裡
+ * （board-notes 14.5 那個對稱性教訓）。 */
+static bool g_ov_shown;
+
+static void ov_show(void)
+{
+    if (!g_ov_shown) {
+        ctl_backup(false);
+        ctl_draw();
+        g_ov_shown = true;
+    }
+}
+
+static void ov_hide(void)
+{
+    if (g_ov_shown) {
+        ctl_backup(true);
+        g_ov_shown = false;
+    }
 }
 
 static int paused_loop_inner(void);
 
-/* 只有「剛進暫停」才閃那顆圖示。按翻頁鍵之後會再進來一次，那時候再閃一秒
- * 等於每按一次就卡一秒 —— 使用者感覺到的「反應慢」大半來自這裡。 */
+/* 只有「剛進暫停」才閃那顆圖示（目前已經不閃了，保留旗標備用）。 */
 static bool g_pause_flash;
 
-/* 除錯：SWD 寫入 PAUSE_*（0=繼續 1=返回 2=上一張 3=下一張 4=方向）就當成
- * 按了那一顆。觸控沒辦法遠端重現，沒有這個鉤子就只能靠使用者回報。
- * 不寫（維持 -1）就完全等於不存在。 */
+/* 除錯：SWD 寫入 PAUSE_* 就當成按了那一顆。觸控沒辦法遠端重現，
+ * 沒有這個鉤子就只能靠使用者回報。不寫（維持 -1）等於不存在。 */
 volatile int32_t  g_dbg_inject = -1;
-volatile uint32_t g_dbg_pause_entries;   /* 進了幾次暫停迴圈 */
-volatile int32_t  g_dbg_last_action;     /* 上一次回報的動作 */
-
-/* 暫停中最後一次觸控讀到什麼、判成哪一顆。按鈕按不到時，這三個數字直接
- * 說明是座標不對還是判定不對 —— 不必猜。
- * hit: >=0 是動作代碼，-1 = 不在控制列上，-1000 = 在列上但沒中按鈕。 */
+volatile uint32_t g_dbg_pause_entries;
+volatile int32_t  g_dbg_last_action;
 volatile int32_t  g_dbg_tx, g_dbg_ty, g_dbg_hit;
-volatile int32_t  g_dbg_ctl_y, g_dbg_ctl_bw;
 
-/* 進暫停就畫控制列，離開時還原底下的畫面。所有出口都會經過這裡，
- * 不會有「某條路徑忘了還原」的問題（board-notes 14.5 那個對稱性教訓）。 */
+/* 所有出口都會經過這裡，不會有「某條路徑忘了還原」的問題。 */
 static int paused_loop(void)
 {
     int a;
 
-    ctl_backup(false);
-    ctl_draw();
+    g_ov_shown = false;
+    ov_show();
     a = paused_loop_inner();
-    ctl_backup(true);
+    ov_hide();
     return a;
 }
+
 
 static int paused_loop_inner(void)
 {
@@ -1561,11 +1592,18 @@ static int paused_loop_inner(void)
     wait_release();
 
     g_dbg_pause_entries++;
+    {
+    uint32_t ov_until = HAL_GetTick() + OV_MS;
 
     for (;;) {
         int x0, y0;
 
         watchdog_feed();
+        /* 疊加層過了時間就自己收起來，但**維持暫停** —— 跟影片一樣，
+         * 收起來只是讓照片看得完整，不代表繼續播。 */
+        if (g_ov_shown && (int32_t)(HAL_GetTick() - ov_until) >= 0) {
+            ov_hide();
+        }
         if (g_dbg_inject >= 0) {
             int hit = g_dbg_inject;
 
@@ -1588,47 +1626,81 @@ static int paused_loop_inner(void)
             return PAUSE_RESUME;
         }
 
-        /* 暫停中只吃控制列上的按鈕。
-
-         * 原本這裡是全螢幕的滑動手勢（左右翻頁、下滑回選單、上滑切方向）。
-         * 手勢好用但**看不見** —— 第一次拿到相框的人不會知道有這回事，
-         * 而且斜著滑還要處理兩種動作互搶、快速滑動還會漏報座標
-         * （board-notes 14.7）。控制列把同一組動作攤在畫面上之後，
-         * 手勢就只剩「多一條容易誤觸的路徑」，所以整個拿掉。 */
         if (read_touch(&x0, &y0)) {
-            int hit = ctl_hit(x0, y0);
+            int hit;
+
+            /* 收起來的時候點一下只是把它叫回來，不會直接觸發動作 ——
+             * 否則使用者看不到按鈕在哪就先按到東西（影片也是這樣）。 */
+            if (!g_ov_shown) {
+                ov_show();
+                ov_until = HAL_GetTick() + OV_MS;
+                wait_release();
+                continue;
+            }
+            ov_until = HAL_GetTick() + OV_MS;   /* 有互動就延長 */
+            hit = ctl_hit(x0, y0);
 
             g_dbg_touch_hit++;
-            g_dbg_tx     = x0;
-            g_dbg_ty     = y0;
-            g_dbg_hit    = hit;
-            g_dbg_ctl_y  = ctl_y();
-            g_dbg_ctl_bw = ctl_btn_w();
+            g_dbg_tx  = x0;
+            g_dbg_ty  = y0;
+            g_dbg_hit = hit;
+
+            if (hit == PAUSE_SEEK) {
+                /* 拖曳翻頁。手指還在畫面上時只更新拉桿與張數（很便宜），
+                 * 放開才真的去解那一張 —— 每張要 1.5 秒，邊拖邊解會卡死。 */
+                uint32_t total = g_order_count ? g_order_count : 1u;
+                uint32_t tgt   = g_ov_index;
+                uint32_t seen  = HAL_GetTick();
+                int      lastx = x0;
+                int      x, y, px;
+
+                for (;;) {
+                    watchdog_feed();
+                    if (read_touch(&x, &y)) {
+                        lastx = x;
+                        seen  = HAL_GetTick();
+                    } else if ((HAL_GetTick() - seen) > SWIPE_GAP_MS) {
+                        break;          /* 真的放開了 */
+                    }
+                    px = lastx - PB_X;
+                    if (px < 0)    { px = 0; }
+                    if (px > PB_W) { px = PB_W; }
+                    tgt = (uint32_t)(((uint64_t)px * total) / PB_W);
+                    if (tgt >= total) { tgt = total - 1u; }
+                    if (tgt != g_ov_index) {
+                        g_ov_index = tgt;
+                        ov_draw_bar(tgt);
+                    }
+                    nap(10);
+                }
+                g_seek_target     = tgt;
+                g_dbg_last_action = PAUSE_SEEK;
+                return PAUSE_SEEK;
+            }
+
             if (hit >= 0) {
-                /* **按下就回報**，不等手指離開 —— 殘留的觸碰由下一次進來
-                 * 時的 wait_release() 吃掉。切方向要留在暫停，讓使用者
-                 * 當場看到結果。 */
+                /* 按下就回報，不等手指離開。切方向要留在暫停，
+                 * 讓使用者當場看到結果。 */
                 if (hit != PAUSE_ROTATE) {
                     g_paused = 0u;
                 }
                 g_dbg_last_action = hit;
                 return hit;
             }
-            if (hit == -1) {
-                /* 點在控制列以外 = 繼續播放。
-                 *
-                 * 這裡**要等手指離開才回報**（其他按鈕不用）：恢復播放之後
-                 * 播放迴圈也在看觸控，同一次觸碰會立刻又被判成「暫停」。
-                 * 翻頁那幾顆不會有這個問題，因為它們後面接著 1.5 秒的解碼，
-                 * 手指早就離開了。 */
-                wait_release();
-                g_paused = 0u;
-                g_dbg_last_action = PAUSE_RESUME;
-                return PAUSE_RESUME;
-            }
-            wait_release();         /* 控制列上的空白處：吃掉這次觸碰 */
+
+            /* 疊加層以外 = 繼續播放。
+             *
+             * 這條**一定要等手指離開才回報**：恢復播放之後播放迴圈也在看
+             * 觸控，同一次觸碰會立刻又被判成「暫停」—— 使用者看到的就是
+             * 「點一下播放不了」。翻頁那幾條不會有這個問題，因為後面接著
+             * 1.5 秒的解碼，手指早就離開了。 */
+            wait_release();
+            g_paused          = 0u;
+            g_dbg_last_action = PAUSE_RESUME;
+            return PAUSE_RESUME;
         }
         nap(8);
+    }
     }
 }
 
@@ -1677,7 +1749,8 @@ static int wait_interval(uint32_t already_ms)
         {
             int tx, ty;
 
-            if (read_touch(&tx, &ty)) {
+            if ((HAL_GetTick() - g_resume_ms) > RESUME_GUARD_MS &&
+                read_touch(&tx, &ty)) {
                 (void)tx; (void)ty;
                 /* 不在這裡等放開 —— paused_loop_inner 進來就會吃掉殘留的
                  * 觸碰。在這裡等等於讓「點一下叫出控制列」多花兩百毫秒。 */
@@ -1702,9 +1775,13 @@ static int wait_interval(uint32_t already_ms)
  * 回傳 0 = 繼續播放，1 = 回選單。 */
 static int pause_session(int32_t *cur)
 {
-    g_pause_flash = true;           /* 這一輪只閃一次圖示 */
+    g_pause_flash = true;
     for (;;) {
-        int a = paused_loop();
+        int a;
+
+        /* 疊加層的拉桿要顯示目前是第幾張。 */
+        g_ov_index = (uint32_t)((*cur < 0) ? 0 : *cur);
+        a = paused_loop();
         int dir;
         uint32_t target, tries;
         photo_result_t r;
@@ -1713,7 +1790,21 @@ static int pause_session(int32_t *cur)
             return 1;
         }
         if (a == PAUSE_RESUME) {
+            g_resume_ms = HAL_GetTick();
             return 0;
+        }
+        if (a == PAUSE_SEEK) {
+            /* 拖曳結束才真的去解那一張。停在暫停，讓使用者可以再拖。 */
+            uint32_t t = g_seek_target;
+
+            if (t < g_order_count &&
+                photo_show(PLAYLIST_BASE + g_order[t] * PATH_MAX)
+                    == PHOTO_OK) {
+                present();
+                *cur = (int32_t)t;
+                g_decode_ok++;
+            }
+            continue;
         }
         if (a == PAUSE_ROTATE) {
             /* 自動 <-> 固定，不再三段循環。離開自動時凍結在**目前這張的
