@@ -74,7 +74,7 @@ static char     g_scan_path[SCAN_PATH_LEN];
 static uint32_t g_cur_top;
 
 static uint32_t g_front;
-static uint32_t g_interval_s = 3;      /* 預設 3 秒，可調 2~5 */
+static uint32_t g_interval_s = 2;      /* 預設 2 秒，可調 2~5 */
 
 /* 診斷用，SWD 讀得到。 */
 volatile uint32_t g_stage;
@@ -98,13 +98,30 @@ volatile int32_t  g_dbg_swipe_dy;       /* 1 = 播放暫停中（畫面凍結）
 /* 基礎設施                                                            */
 /* ------------------------------------------------------------------ */
 
-/* PSRAM 設成 write-through：CPU 的寫入直接落到記憶體，LTDC 從 PSRAM 讀才不會
- * 讀到還留在快取裡的舊內容。整片 32MB 都設，因為解碼緩衝區也在這裡面。 */
+/* PSRAM 分兩種快取政策，依「有沒有硬體會碰這塊記憶體」來切。
+ *
+ * 下半 16MB（0x90000000~0x90FFFFFF）維持 write-through，因為裡面有兩塊
+ * 是 CPU 與硬體共用的：framebuffer 被 LTDC 每秒讀 60 次，JPEG 原始檔會被
+ * JPEG 硬體讀走。write-through 保證 CPU 寫下去的內容立刻在記憶體裡。
+ *
+ * 上半 16MB（0x91000000~0x91FFFFFF）改成 write-back。這塊全部是 CPU 自己
+ * 的暫存 —— RGB888 全尺寸、縮圖、播放清單、資料夾索引、圖示備份 ——
+ * 沒有任何硬體會讀，所以不需要任何快取維護動作。
+ *
+ * 為什麼要分：write-through 在 ARMv7-M 是「不做 write-allocate」，而原本
+ * 這裡還加上 NOT_BUFFERABLE，連寫入緩衝都關掉 —— 每一個 byte store 都變成
+ * 一次獨立、同步、不能合併成 burst 的 PSRAM 交易。實測轉色每像素要 121 個
+ * 週期（查表換算合理值是 15~25），銳化那段更高到 473，多出來的全是在等
+ * 匯流排。改成 write-back 之後，連續的 byte store 會先在快取線裡累積，
+ * 整條 32 bytes 一次 burst 出去。
+ *
+ * 重疊時編號大的優先，所以上半部用第 8 號蓋掉第 7 號那片 32MB。 */
 static void psram_mpu_init(void)
 {
     MPU_Region_InitTypeDef mpu = {0};
 
     HAL_MPU_Disable();
+
     mpu.Enable           = MPU_REGION_ENABLE;
     mpu.Number           = MPU_REGION_NUMBER7;
     mpu.BaseAddress      = 0x90000000u;
@@ -117,6 +134,18 @@ static void psram_mpu_init(void)
     mpu.SubRegionDisable = 0x00;
     mpu.DisableExec      = MPU_INSTRUCTION_ACCESS_DISABLE;
     HAL_MPU_ConfigRegion(&mpu);
+
+    /* TEX=1 + C=1 + B=1 就是 write-back 且讀寫都 allocate。
+     * write-allocate 是重點：寫入未命中時先把整條快取線讀進來，之後同一條線
+     * 上的寫入全部命中，最後整條一次寫回，這樣才有 burst。 */
+    mpu.Number           = MPU_REGION_NUMBER8;
+    mpu.BaseAddress      = 0x91000000u;
+    mpu.Size             = MPU_REGION_SIZE_16MB;
+    mpu.IsCacheable      = MPU_ACCESS_CACHEABLE;
+    mpu.IsBufferable     = MPU_ACCESS_BUFFERABLE;
+    mpu.TypeExtField     = MPU_TEX_LEVEL1;
+    HAL_MPU_ConfigRegion(&mpu);
+
     HAL_MPU_Enable(MPU_PRIVILEGED_DEFAULT);
 
     SCB_CleanInvalidateDCache();
