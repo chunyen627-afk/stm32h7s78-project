@@ -61,6 +61,7 @@ static volatile uint32_t g_out_total;
 static const uint8_t    *g_in_ptr;
 static uint32_t          g_in_left;
 
+volatile uint32_t g_vdbg_fsize;
 volatile uint32_t g_vdbg_decoded;
 volatile uint32_t g_vdbg_fail;
 volatile int32_t  g_vdbg_lasterr;
@@ -305,6 +306,9 @@ bool video_probe(const char *path, video_info_t *info)
         (void)f_close(&f);
         return false;
     }
+    /* 掃描時就記下來，這樣開機不必等使用者去點播放就能用 SWD 確認
+     * 卡上的檔案是不是預期的那一份。 */
+    g_vdbg_fsize = (uint32_t)f_size(&f);
     (void)f_close(&f);
 
     info->count    = h.count;
@@ -325,7 +329,8 @@ bool video_open(const video_info_t *info)
         g_vdbg_lasterr = -1;
         return false;
     }
-    g_open = true;
+    g_open       = true;
+    g_vdbg_fsize = (uint32_t)f_size(&g_fil);
 
     /* 位移表開機讀一次就好，之後每格只要 f_lseek + f_read。 */
     if (f_lseek(&g_fil, VIDEO_HDR_BYTES) != FR_OK ||

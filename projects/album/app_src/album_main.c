@@ -1374,7 +1374,120 @@ static void flash_orient(void)
 #define PAUSE_NEXT   3
 #define PAUSE_ROTATE 4
 
+/* ---- 暫停中的觸控控制列 ------------------------------------------
+ *
+ * 滑動手勢仍然保留（整個螢幕都是判定區，很好用），但手勢有個天生的問題：
+ * **看不見**。第一次拿到相框的人不會知道可以左右滑。控制列把同一組動作
+ * 攤在畫面上，兩種操作方式並存、互不影響。
+ *
+ * 控制列直接畫在「顯示中」的那塊 buffer 上，所以要先把底下的畫面存起來、
+ * 離開暫停時原封還原 —— 重新解一張照片要 1.5 秒，存還原只要幾毫秒。
+ * 搬移方式跟 icon_backup() 同一套：直立時邏輯 x 才是實體列。 */
+
+/* 借用照片路徑的 YCbCr 區。暫停中不會解碼，而按下任何按鈕之後都會**先還原
+ * 畫面才去解碼**，兩者不會互相踩到。 */
+#define CTL_SAVE     ((uint16_t *)0x90600000u)
+
+#define CTL_H        96
+#define CTL_BTN_H    72
+#define CTL_X0       14
+#define CTL_GAP      12
+#define CTL_COUNT    4
+
+static const char *const CTL_NAME[CTL_COUNT] = {
+    "上一張", "繼續", "下一張", "返回"
+};
+static const int CTL_ACT[CTL_COUNT] = {
+    PAUSE_PREV, PAUSE_RESUME, PAUSE_NEXT, PAUSE_MENU
+};
+
+/* 版面跟著方向走：直立畫布是 480x800、橫向是 800x480，寫死座標會跑掉。 */
+static int ctl_y(void)     { return gfx_height() - CTL_H - 12; }
+static int ctl_btn_w(void)
+{
+    return (gfx_width() - 2 * CTL_X0 - (CTL_COUNT - 1) * CTL_GAP) / CTL_COUNT;
+}
+static int ctl_btn_x(int i) { return CTL_X0 + i * (ctl_btn_w() + CTL_GAP); }
+
+static void ctl_backup(bool restore)
+{
+    uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    uint16_t *sv    = CTL_SAVE;
+    int       w     = gfx_width();
+    int       y0    = ctl_y();
+
+    if (gfx_is_landscape()) {
+        /* 橫向：畫布與面板同向，一列就是一段連續記憶體。 */
+        for (int j = 0; j < CTL_H; j++) {
+            uint16_t *fb = front + (uint32_t)(y0 + j) * PHYS_W;
+
+            if (restore) { memcpy(fb, sv, (size_t)w * 2u); }
+            else         { memcpy(sv, fb, (size_t)w * 2u); }
+            sv += w;
+        }
+    } else {
+        /* 直立：邏輯 x 是實體列，所以沿著邏輯 y 走才連續。 */
+        for (int i = 0; i < w; i++) {
+            uint16_t *fb = front + (uint32_t)(w - 1 - i) * PHYS_W + (uint32_t)y0;
+
+            if (restore) { memcpy(fb, sv, (size_t)CTL_H * 2u); }
+            else         { memcpy(sv, fb, (size_t)CTL_H * 2u); }
+            sv += CTL_H;
+        }
+    }
+}
+
+static void ctl_draw(void)
+{
+    uint16_t *back  = gfx_framebuffer();
+    uint16_t *front = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    int       y0    = ctl_y();
+    int       bw    = ctl_btn_w();
+
+    gfx_set_framebuffer(front);
+    gfx_fill_rect(0, y0, gfx_width(), CTL_H, COL_BG);
+    for (int i = 0; i < CTL_COUNT; i++) {
+        int bx = ctl_btn_x(i);
+
+        gfx_pill(bx, y0 + 12, bw, CTL_BTN_H, COL_PANEL);
+        gfx_text_center(bx + bw / 2, y0 + 12 + (CTL_BTN_H - 24) / 2,
+                        CTL_NAME[i], COL_TEXT);
+    }
+    gfx_set_framebuffer(back);
+}
+
+/* 點在控制列上就回傳對應的動作，否則回 -1（交給滑動判定）。 */
+static int ctl_hit(int x, int y)
+{
+    if (y < ctl_y()) {
+        return -1;
+    }
+    for (int i = 0; i < CTL_COUNT; i++) {
+        int bx = ctl_btn_x(i);
+
+        if (x >= bx && x < bx + ctl_btn_w()) {
+            return CTL_ACT[i];
+        }
+    }
+    return PAUSE_RESUME - 1000;         /* 點在列上但沒中按鈕：什麼都不做 */
+}
+
+static int paused_loop_inner(void);
+
+/* 進暫停就畫控制列，離開時還原底下的畫面。所有出口都會經過這裡，
+ * 不會有「某條路徑忘了還原」的問題（board-notes 14.5 那個對稱性教訓）。 */
 static int paused_loop(void)
+{
+    int a;
+
+    ctl_backup(false);
+    ctl_draw();
+    a = paused_loop_inner();
+    ctl_backup(true);
+    return a;
+}
+
+static int paused_loop_inner(void)
 {
     g_paused    = 1u;
     g_req_pause = 0u;               /* 消化掉進來的那一次 */
@@ -1411,6 +1524,23 @@ static int paused_loop(void)
             uint32_t seen = t0;
 
             g_dbg_touch_hit++;
+
+            /* 先看是不是按在控制列上。要在滑動判定**之前**攔截，否則按鈕
+             * 上的一點點手指位移會被當成滑動，變成「按下一張卻翻了兩張」。 */
+            {
+                int hit = ctl_hit(x0, y0);
+
+                if (hit != -1) {
+                    wait_release();
+                    if (hit < 0) {
+                        continue;       /* 點在列上但沒中按鈕 */
+                    }
+                    if (hit != PAUSE_ROTATE) {
+                        g_paused = 0u;
+                    }
+                    return hit;
+                }
+            }
 
             /* 取「整段過程中的最大位移」，而不是放開瞬間的位置。
              *
@@ -1504,6 +1634,21 @@ static int wait_interval(uint32_t already_ms)
 
         if (g_req_pause) {
             return 3;               /* 交給 slideshow 統一處理暫停 */
+        }
+
+        /* 播放中點一下畫面就暫停並叫出控制列。
+         *
+         * 原本只有實體鍵能暫停，而滑動手勢只在暫停中才有作用 —— 等於
+         * 「要先知道有那顆按鍵，才進得去操作介面」。點畫面是最直覺的入口，
+         * 而且跟影片播放器的操作方式一致。 */
+        {
+            int tx, ty;
+
+            if (read_touch(&tx, &ty)) {
+                (void)tx; (void)ty;
+                wait_release();
+                return 3;
+            }
         }
         nap(15);
     }

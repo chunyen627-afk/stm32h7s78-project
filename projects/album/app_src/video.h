@@ -57,6 +57,10 @@ void video_jpeg_data_ready(void *hjpeg, uint8_t *pDataOut, uint32_t len);
 void video_jpeg_get_data(void *hjpeg, uint32_t nb_decoded);
 
 /* 診斷（SWD 讀）。 */
+/* 開著的影片檔大小。用來確認卡上到底是哪一份 —— 換了轉檔參數之後
+ * 光看畫面分不出「檔案沒換」和「參數改錯」，檔案大小一比就知道。 */
+extern volatile uint32_t g_vdbg_fsize;
+
 extern volatile uint32_t g_vdbg_decoded;
 extern volatile uint32_t g_vdbg_fail;
 extern volatile int32_t  g_vdbg_lasterr;
