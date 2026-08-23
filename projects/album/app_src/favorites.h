@@ -57,4 +57,9 @@ bool fav_is(const char *path);
 fav_result_t fav_add(const char *path);
 fav_result_t fav_remove(const char *path);
 
+/* 純寫入壓力測試：對一個沒在用的格子反覆寫 N 次，量這張卡連續接受幾次
+ * 小型寫入。不動清單內容，用來把「卡片問題」跟「最愛邏輯問題」分開。
+ * 結果在 g_fav_st_ok / g_fav_st_fail / g_fav_st_first。 */
+void fav_stress(uint32_t n);
+
 #endif /* FAVORITES_H_INCLUDED */

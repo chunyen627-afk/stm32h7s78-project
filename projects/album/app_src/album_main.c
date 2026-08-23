@@ -737,6 +737,7 @@ volatile uint32_t   g_dbg_autoplay;    /* SWD 可寫，直接開始放照片 */
 volatile uint32_t   g_dbg_fakedirs;    /* SWD 可寫，測試資料夾清單捲動 */
 volatile uint32_t   g_dbg_fakevids;    /* SWD 可寫，測試影片清單捲動 */
 volatile uint32_t   g_dbg_favtest;     /* SWD 可寫，見 fav_selftest() */
+volatile uint32_t   g_dbg_wrtest;      /* SWD 可寫，純寫入壓力測試 fav_stress() */
 
 static bool ends_with_bin(const char *name)
 {
@@ -1317,8 +1318,8 @@ static bool select_screen(void)
         }
         /* 除錯旗標也要在這裡看：選單這個迴圈在等觸控時不會回到主迴圈，
          * 只在主迴圈檢查的話，SWD 設旗標永遠不會生效。 */
-        if (g_dbg_favtest) {
-            return false;               /* 交回主迴圈去跑最愛的自動測試 */
+        if (g_dbg_favtest || g_dbg_wrtest) {
+            return false;               /* 交回主迴圈去跑測試 */
         }
         if (g_dbg_autovideo && g_vid_count > 0u) {
             play_video(&g_vids[0]);
@@ -2763,6 +2764,16 @@ void album_run(void)
 
                     g_dbg_favtest = 0;      /* 吃掉旗標，不會自己重跑 */
                     fav_selftest(n);
+                    first = false;
+                    continue;
+                }
+                /* 純寫入壓力測試：只量卡片，完全不碰最愛的邏輯。 */
+                if (g_dbg_wrtest) {
+                    uint32_t n = g_dbg_wrtest;
+
+                    g_dbg_wrtest = 0;
+                    show_message("寫入壓力測試", "進行中");
+                    fav_stress(n);
                     first = false;
                     continue;
                 }

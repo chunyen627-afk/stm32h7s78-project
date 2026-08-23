@@ -63,6 +63,15 @@ volatile uint32_t g_fav_loaded;         /* 開機載入到幾筆 */
 volatile uint32_t g_fav_created;        /* 建立過清單檔幾次 */
 volatile uint32_t g_fav_slot_writes;    /* 寫過幾格 */
 volatile uint32_t g_fav_fr;             /* 最後一次 FatFs 的回傳碼 */
+volatile uint32_t g_fav_fr_open;        /* 開機時 f_open 清單檔的回傳碼 */
+volatile uint32_t g_fav_badlen;         /* 清單檔長度不對的次數 */
+volatile uint32_t g_fav_openerr;        /* 開機讀不到清單檔（非 NO_FILE）的次數 */
+
+/* 寫入壓力測試的結果，見 fav_stress()。 */
+volatile uint32_t g_fav_st_ok;
+volatile uint32_t g_fav_st_fail;
+volatile uint32_t g_fav_st_first;       /* 第幾次開始失敗 */
+volatile uint32_t g_fav_st_done;
 
 static fav_result_t fail(fav_result_t e)
 {
@@ -242,6 +251,7 @@ static fav_result_t write_slot(uint32_t i)
 void fav_init(const char *drive)
 {
     FIL     f;
+    FRESULT r;
     UINT    got = 0;
 
     g_ready = false;
@@ -250,9 +260,11 @@ void fav_init(const char *drive)
     /* drive 是 "0:/"，結尾已經有斜線。 */
     (void)snprintf(g_path, sizeof(g_path), "%s%s", drive, FAV_FILE_NAME);
 
-    if (f_open(&f, g_path, FA_READ) == FR_OK) {
-        FRESULT r = f_read(&f, FAV_TABLE, FAV_FILE_BYTES, &got);
+    r = f_open(&f, g_path, FA_READ);
+    g_fav_fr_open = (uint32_t)r;
 
+    if (r == FR_OK) {
+        r = f_read(&f, FAV_TABLE, FAV_FILE_BYTES, &got);
         (void)f_close(&f);
         if (r == FR_OK && got == FAV_FILE_BYTES) {
             g_count      = recount();
@@ -260,15 +272,64 @@ void fav_init(const char *drive)
             g_ready      = true;
             return;
         }
-        /* 長度不對（被人改過／舊版）就不要亂猜，當作沒有清單。
-         * 使用者在電腦上刪掉它，下次開機會重建一個乾淨的。 */
+        /* 長度不對（被人改過／舊版）就不要亂猜，也**不要重建** ——
+         * 使用者在電腦上刪掉它，下次開機才會建一個乾淨的。 */
+        g_fav_badlen++;
         return;
     }
 
-    if (create_file() == FAV_OK) {
-        g_count = 0;
-        g_ready = true;
+    /* **只有「真的沒有這個檔案」才建新的。**
+     *
+     * 這裡踩過一個會**掉資料**的坑：原本是「f_open 失敗就 create_file()」，
+     * 把 FR_DISK_ERR 也當成「檔案不存在」。這張卡偶爾會有一瞬間讀不到，
+     * 那一下就足以讓韌體用 FA_CREATE_NEW 造一個新的空清單 ——
+     * 使用者 41 筆收藏就這樣變成 1 筆。
+     *
+     * f_open 的失敗必須分開看：FR_NO_FILE / FR_NO_PATH 是「真的沒有」，
+     * 其餘（FR_DISK_ERR、FR_NOT_READY…）是「這次讀不到」，那就這輪不提供
+     * 收藏功能（愛心會顯示成不可按），下次開機再說。**寧可少一個功能，
+     * 不要毀掉使用者的清單。** */
+    if (r == FR_NO_FILE || r == FR_NO_PATH) {
+        if (create_file() == FAV_OK) {
+            g_count = 0;
+            g_ready = true;
+        }
+    } else {
+        g_fav_openerr++;        /* 卡片這次讀不到，什麼都不做 */
     }
+}
+
+/* 純粹的寫入壓力測試：對最後一格反覆寫入同樣的空白內容 N 次。
+ *
+ * **不動清單內容**（最後一格本來就是空的，寫進去還是空的），所以這是在量
+ * 「這張卡連續接受幾次小型寫入」，跟最愛的邏輯完全無關 ——
+ * 用來回答「到底是不是卡片的問題」。
+ *
+ * 每次寫入 = 一個資料磁區 + 一個目錄項，跟真正收藏一次的成本相同。 */
+void fav_stress(uint32_t n)
+{
+    uint32_t slot = FAV_MAX - 1u;
+    uint32_t run  = 0;
+
+    g_fav_st_ok = 0; g_fav_st_fail = 0; g_fav_st_first = 0; g_fav_st_done = 0;
+    if (!g_ready) {
+        return;
+    }
+    rec_set(slot, NULL);
+
+    for (uint32_t i = 0; i < n; i++) {
+        if (write_slot(slot) == FAV_OK) {
+            g_fav_st_ok++;
+            run = 0;
+        } else {
+            g_fav_st_fail++;
+            if (g_fav_st_first == 0u) { g_fav_st_first = i + 1u; }
+            /* 卡片一旦不回應就再也不會好，繼續試只是每次多等十幾秒
+             * （每次失敗要走完兩輪 SD_WRITE_WAIT_MS）。連續八次就收工。 */
+            if (++run >= 8u) { break; }
+        }
+    }
+    g_fav_st_done = 1u;
 }
 
 bool     fav_ready(void) { return g_ready; }
