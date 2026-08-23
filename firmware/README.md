@@ -36,7 +36,7 @@ ST 韌體包與 CubeIDE）。
 - **照片**：放進 SD 卡（**FAT32 或 exFAT**），相簿會遞迴掃描
 - **最愛清單** `我的最愛.txt`：不用自己準備，第一次開機時韌體會在卡的
   根目錄建一個空的（64KB）。純文字，電腦上打得開
-- **影片**：`video.bin` 放 SD 卡根目錄，用 `projects/video/tools/mp4pack.py`
+- **影片**：`video.bin` 放 SD 卡根目錄，用 `projects/video/tools/video2bin.py`
   從 mp4 轉出來。太大（動輒上百 MB）不進版控
 - **中文字型** `font_zh.c`：6.4MB 的產生物，`scripts/setup.sh` 會現場產生
 

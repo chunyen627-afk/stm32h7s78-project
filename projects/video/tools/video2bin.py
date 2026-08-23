@@ -42,8 +42,8 @@ wmv / flv / ts / gif，甚至一個裝滿 JPEG 的資料夾。這支程式本身
 **補齊不是美觀考量**：輸入 DMA 的資料寬度是 word，每一塊的長度都必須是
 4 的倍數（board-notes 16.12，那個坑讓 26% 的影格解碼失敗）。
 
-**這份是正本。** 使用者桌面上有一份一模一樣的複本（video2bin.py）方便隨手用，
-改這裡的話記得同步過去。
+**這份是正本。** 使用者桌面的 `影像轉檔工具\` 有一份一模一樣的複本，
+加上兩個拖放用的批次檔。改這裡的話記得同步過去。
 """
 import argparse
 import os
@@ -241,6 +241,23 @@ def pack(framedir, dst, fps):
         print("  可以放 SD 卡，也小到能燒進外部 Flash")
 
 
+def pick_output(base, taken):
+    """BASE.bin -> BASE02.bin -> BASE03.bin ...，跳過已經存在或這輪用過的。
+
+    編號從 02 開始而不是 01，因為第一個就叫 BASE.bin（使用者說的
+    「先取第一個名稱，之後批量自己補編號」）。兩位數補零讓它在
+    相簿的清單裡照字母排序也是對的。
+    """
+    cand = base + ".bin"
+    n = 1
+    while cand in taken or os.path.exists(cand):
+        n += 1
+        if n > 99:
+            sys.exit("同名的檔案已經有 99 個了，換一個名字")
+        cand = "%s%02d.bin" % (base, n)
+    return cand
+
+
 def main():
     ap = argparse.ArgumentParser(
         description="把影片轉成板子能跑的 .bin 影格包",
@@ -253,9 +270,15 @@ def main():
   video2bin.py a.mkv out.bin --fps 30 --quality 4
   video2bin.py a.mov --start 60 --duration 30    只取第 60 秒起的 30 秒
 """)
-    ap.add_argument("src", nargs="?",
-                    help="影片檔（ffmpeg 讀得懂的都行）或影格目錄")
-    ap.add_argument("dst", nargs="?", help="輸出的 .bin（預設同名同目錄）")
+    ap.add_argument("src", nargs="*",
+                    help="影片檔（ffmpeg 讀得懂的都行）或影格目錄，可以給多個")
+    ap.add_argument("--out", metavar="檔案",
+                    help="指定輸出的 .bin（只能配一個來源，會直接覆寫）")
+    ap.add_argument("--name", metavar="名稱",
+                    help="輸出檔名的開頭；第一個是「名稱.bin」，"
+                         "之後自動編號成 名稱02.bin、名稱03.bin…")
+    ap.add_argument("--ask-name", action="store_true",
+                    help="開始前問一次要用什麼檔名（給拖放的批次檔用）")
     ap.add_argument("--fps", type=float, default=24, help="目的格率（預設 24）")
     ap.add_argument("--quality", type=int, default=5,
                     help="JPEG 品質，2 最好 31 最差（預設 5）")
@@ -271,50 +294,89 @@ def main():
     # 給拖放用的 .bat 在沒收到檔案時呼叫。訊息放這裡而不是 .bat 裡，
     # 是因為 cmd 用「解析當下」的字碼頁讀 .bat，中文會被切斷。
     ap.add_argument("--dropinfo", action="store_true", help=argparse.SUPPRESS)
-    ap.add_argument("--preview-hint", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--name-hint", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
 
     if args.dropinfo:
-        if args.preview_hint:
-            print("")
-            print("  把影片檔拖到這個 .bat 上面，會在影片旁邊產生三張 PNG，")
-            print("  分別是影片 10% / 50% / 90% 的畫面，尺寸就是面板實際顯示的 800x480。")
-            print("")
-            print("  方向平常不用管：直式自動轉 ccw、橫向不轉，兩種都在板子上驗過。")
-            print("  只有遇到怪素材（例如來源本身就錄反了）才需要看預覽，")
-            print("  然後用 --rotate 180 / --flip / --mirror 調。")
+        print("")
+        print("  把影片檔拖到這個 .bat 上面就會轉成 .bin，一次可以拖多個。")
+        print("")
+        if args.name_hint:
+            print("  這一支會先問你要用什麼檔名：")
+            print("    給「MOVIE」-> MOVIE.bin、MOVIE02.bin、MOVIE03.bin…")
+            print("    直接 Enter  -> 沿用各自的原檔名")
+            print("  編號會跳過已經存在的檔案，所以分幾次拖也會接著編下去。")
         else:
-            print("")
-            print("  把影片檔拖到這個 .bat 上面，就會轉成同名的 .bin。")
-            print("  一次可以拖多個。")
-            print("")
-            print("  方向自動處理：直式來源轉 ccw、橫向不轉 —— 兩種都在板子上驗過，")
-            print("  平常不用給任何參數。")
-            print("")
-            print("  轉好的 .bin 複製到 SD 卡根目錄，相簿選單的「影片」就會列出來。")
-            print("")
-            print("  要調參數就開命令列：")
-            print("      python video2bin.py 影片.mp4 --quality 4")
-            print("      python video2bin.py --help")
+            print("  輸出檔名沿用原檔名（video2.mp4 -> video2.bin），")
+            print("  放在影片旁邊。想自己取名就用「轉成BIN-自訂檔名.bat」。")
+        print("")
+        print("  方向自動處理：直式來源轉 ccw、橫向不轉 —— 兩種都在板子上驗過，")
+        print("  平常不用給任何參數。")
+        print("")
+        print("  轉好的 .bin 複製到 SD 卡根目錄，相簿選單的「影片」就會列出來")
+        print("  （清單最多列 16 部）。")
+        print("")
+        print("  要調參數就開命令列： python video2bin.py --help")
         return
 
     if not args.src:
         ap.error("要給一個影片檔或影格目錄")
 
-    if not os.path.exists(args.src):
-        sys.exit("找不到檔案：%s" % args.src)
+    # 舊版是 "video2bin.py 來源 輸出.bin"，現在來源可以有多個，
+    # 那種寫法會被當成兩個來源。明講一聲，不要默默做錯事。
+    if len(args.src) == 2 and args.src[1].lower().endswith(".bin"):
+        sys.exit("要指定輸出檔名請用 --out，例如："
+                 "  video2bin.py %s --out %s"
+                 % (args.src[0], args.src[1]))
+    if args.out and len(args.src) > 1:
+        sys.exit("--out 只能配一個來源。多個來源請用 --name")
+
+    for one in args.src:
+        if not os.path.exists(one):
+            sys.exit("找不到檔案：%s" % one)
 
     need("ffmpeg")
     need("ffprobe")
 
-    dst = args.dst or (os.path.splitext(args.src)[0] + ".bin")
+    base = args.name
+    if args.ask_name and not base and not args.out:
+        print("")
+        print("  輸出檔名（直接按 Enter = 沿用各自的原檔名）")
+        print("  給了名字的話：第一個是「名稱.bin」，之後自動編號 名稱02.bin…")
+        try:
+            base = input("  > ").strip()
+        except EOFError:
+            base = ""
+        base = base or None
 
-    if os.path.isdir(args.src):
+    taken = []
+    for i, one in enumerate(args.src):
+        if len(args.src) > 1:
+            print("")
+            print("======== [%d/%d] %s ========"
+                  % (i + 1, len(args.src), os.path.basename(one)))
+        if args.out:
+            dst = args.out
+        elif base:
+            dst = pick_output(os.path.join(os.path.dirname(one) or ".", base),
+                              taken)
+        else:
+            dst = os.path.splitext(one)[0] + ".bin"
+        taken.append(dst)
+        convert_one(one, dst, args)
+
+    if len(args.src) > 1:
+        print("")
+        print("  共 %d 個檔案。注意相簿的影片清單最多列 16 部。" % len(args.src))
+
+
+def convert_one(src, dst, args):
+    if os.path.isdir(src):
         print("==> 打包（來源是影格目錄，不做旋轉縮放）")
-        pack(args.src, dst, args.fps)
+        pack(src, dst, args.fps)
         return
 
-    src_w, src_h, src_fps = probe(args.src)
+    src_w, src_h, src_fps = probe(src)
     vf, rotate = build_filter(src_w, src_h, args.rotate, args.flip,
                               args.mirror, args.fps)
 
@@ -330,13 +392,13 @@ def main():
 
     if args.preview:
         print("==> 產生預覽（不轉檔）")
-        preview(args.src, vf)
+        preview(src, vf)
         return
 
     tmp = tempfile.mkdtemp(prefix="video2bin_")
     try:
         print("==> 切影格")
-        extract(args.src, tmp, args, vf)
+        extract(src, tmp, args, vf)
         print("==> 打包")
         pack(tmp, dst, args.fps)
     finally:

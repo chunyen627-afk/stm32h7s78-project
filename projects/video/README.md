@@ -6,10 +6,12 @@
 ## 轉檔工具
 
 ```bash
-python tools/mp4pack.py 影片.mp4                  # 輸出 影片.bin，方向自動
-python tools/mp4pack.py 影片.mp4 --preview        # 只產生三張 800x480 預覽圖看方向
-python tools/mp4pack.py 影片.mkv --rotate 180     # 來源上下顛倒時
-python tools/mp4pack.py --help
+python tools/video2bin.py 影片.mp4                  # 輸出 影片.bin，方向自動
+python tools/video2bin.py a.mp4 b.mp4 c.mp4        # 一次多個
+python tools/video2bin.py a.mp4 b.mp4 --name MOVIE # MOVIE.bin、MOVIE02.bin…
+python tools/video2bin.py a.mkv --out 我要的名字.bin
+python tools/video2bin.py a.mp4 --preview          # 三張 800x480 預覽圖看方向
+python tools/video2bin.py --help
 ```
 
 **輸入吃 ffmpeg 讀得懂的任何格式** —— mp4 / mkv / avi / mov / webm / wmv /
@@ -20,6 +22,13 @@ flv / ts / gif，或一個裝滿 JPEG 的資料夾。
 
 **先 `--preview` 再轉整片。** 預覽幾秒就好，轉一部五分鐘的片要好幾分鐘、
 輸出可能上百 MB —— 沒必要轉完才發現躺反了。
+
+**輸出檔名**：預設沿用來源檔名（`a.mp4` → `a.bin`，放在影片旁邊）。
+`--name MOVIE` 會變成 `MOVIE.bin`、`MOVIE02.bin`、`MOVIE03.bin`… ——
+編號會跳過已經存在的檔案，所以分幾次轉也會接著編下去。
+`--out` 則是直接指定單一檔名（會覆寫）。
+
+**相簿的影片清單最多列 16 部**（`MAX_VIDEOS`）。
 
 使用者桌面上有一份複本（`video2bin.py`）與兩個拖放用的批次檔
 （`轉成BIN.bat` / `預覽方向.bat`）。**整組搬到任何資料夾都能跑**，
