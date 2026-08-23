@@ -14,6 +14,7 @@
 
 ```
 docs/board-notes.md   板子層級的坑（所有專案共用，遇到問題先翻這裡）
+tools/sd-check.ps1    SD 卡好壞的快速判斷（見下）
 shared/               跨專案共用的程式碼
   gfx.c / gfx.h         直立繪圖層（面板 800x480 橫式，轉成 480x800 用）
   xspi_psram.c          PSRAM 降頻（這塊板子的個體差異補償，見下）
@@ -74,6 +75,21 @@ bit 2 = 1」時才會顯示成不符，所以換一版程式就可能冒出新�
 落在查表資料可以忽略，**落在 `.text` 的函式不行**，要調整版面避開。
 不要相信 `STM32_Programmer_CLI -v` 的 Data mismatch，那可能是假警報，
 一定要另外讀回來確認（board-notes 10.5）。
+
+## 記憶卡壞了沒？
+
+```powershell
+.	ools\sd-check.ps1 -DriveLetter F              # 預設寫 2GB
+.	ools\sd-check.ps1 -DriveLetter F -FillAll     # 用光可用空間
+```
+
+**判斷一張卡好壞，唯一有效的方法是寫夠多。** 讀取正常不代表什麼，小量寫入
+正常也不代表什麼 —— 實際踩過的那張 8GB：PC 上讀 4493 個檔案零錯誤、
+刪檔建資料夾 chkdsk 全正常，但連續寫 188 秒就從 USB 匯流排消失。
+
+腳本不需要管理員權限、不動既有資料。板子上還有更敏感的版本
+（相簿韌體的 `g_dbg_wrtest`，壞卡 15 次寫入就現形）。
+判讀方式與實測基準見 [docs/board-notes.md](docs/board-notes.md) 20.15。
 
 ## 除錯慣例
 
