@@ -738,6 +738,7 @@ volatile uint32_t   g_dbg_fakedirs;    /* SWD 可寫，測試資料夾清單捲�
 volatile uint32_t   g_dbg_fakevids;    /* SWD 可寫，測試影片清單捲動 */
 volatile uint32_t   g_dbg_favtest;     /* SWD 可寫，見 fav_selftest() */
 volatile uint32_t   g_dbg_wrtest;      /* SWD 可寫，純寫入壓力測試 fav_stress() */
+volatile uint32_t   g_dbg_cardreinit;  /* SWD 可寫，重新初始化卡片（換時脈用）*/
 
 static bool ends_with_bin(const char *name)
 {
@@ -1318,7 +1319,7 @@ static bool select_screen(void)
         }
         /* 除錯旗標也要在這裡看：選單這個迴圈在等觸控時不會回到主迴圈，
          * 只在主迴圈檢查的話，SWD 設旗標永遠不會生效。 */
-        if (g_dbg_favtest || g_dbg_wrtest) {
+        if (g_dbg_favtest || g_dbg_wrtest || g_dbg_cardreinit) {
             return false;               /* 交回主迴圈去跑測試 */
         }
         if (g_dbg_autovideo && g_vid_count > 0u) {
@@ -2766,6 +2767,12 @@ void album_run(void)
                     fav_selftest(n);
                     first = false;
                     continue;
+                }
+                /* 改完 g_dbg_sdclkdiv 之後用這個讓新時脈生效，不必重燒。 */
+                if (g_dbg_cardreinit) {
+                    g_dbg_cardreinit = 0;
+                    g_card_sick = true;     /* 讓下面的 card_recover 收尾 */
+                    break;
                 }
                 /* 純寫入壓力測試：只量卡片，完全不碰最愛的邏輯。 */
                 if (g_dbg_wrtest) {

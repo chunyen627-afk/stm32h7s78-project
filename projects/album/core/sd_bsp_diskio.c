@@ -62,6 +62,45 @@ volatile uint32_t g_sd_cardstate;   /* 失敗當下的卡片狀態 */
 volatile uint32_t g_sd_halstate;    /* hsd.State：1=READY 才收得下新指令 */
 volatile uint32_t g_sd_aborts;      /* 用 Abort 把狀態機救回來的次數 */
 
+/* SDMMC 的時脈分頻。0 = 沿用 BSP 設的（見下），非 0 就在初始化之後改掉。
+ *
+ * **為什麼要能調**：使用者問「同一張卡在電腦上寫就沒事」—— 問得對，
+ * 那表示問題不一定在卡片，而可能在這塊板子的 SDMMC 介面。
+ * BSP_SD_Init() 除了設 ClockDiv = SDMMC_NSPEED_CLK_DIV(4) 之外，還會呼叫
+ * HAL_SD_ConfigSpeedBusOperation(..., SDMMC_SPEED_MODE_HIGH) 把卡片切到
+ * High Speed —— 分頻變成 2，**時脈直接加倍**，而且那個呼叫的回傳值被
+ * (void) 丟掉。
+ *
+ * 這跟 board-notes 第十章一模一樣：BSP 預設把介面拉到規格上限，
+ * 讀取撐得住、寫入撐不住（寫入要由卡片在時脈邊緣鎖存，餘裕本來就更緊）。
+ *
+ * 實際時脈 = SDMMC 核心時脈 / (2 x ClockDiv)。
+ * 2 = High Speed（BSP 切完的值）、4 = Normal、8 = 再半、16 = 再半。 */
+volatile uint32_t g_dbg_sdclkdiv;
+volatile uint32_t g_dbg_sdclkdiv_now;   /* 實際生效的 CLKDIV */
+volatile uint32_t g_dbg_sdclkcr;        /* 整個 CLKCR，確認匯流排寬度沒被動到 */
+
+/* **只凍結第一次失敗**的完整現場。
+ *
+ * 先前每次讀到的都是最後一次嘗試留下的值（第二次重試之後），所以
+ * hsd.State 看起來是 READY、ErrorCode 是 0 —— 那是收拾過的殘骸，不是病因。
+ * board-notes 16.12 記過這一招：後續的失敗會覆蓋掉，只留第一次。 */
+volatile uint32_t g_f1_taken;       /* 1 = 已經抓到第一次 */
+volatile int32_t  g_f1_rc;          /* BSP_SD_WriteBlocks 的回傳 */
+volatile uint32_t g_f1_state;       /* 呼叫前的 hsd.State */
+volatile uint32_t g_f1_err;         /* 呼叫後的 hsd.ErrorCode */
+volatile uint32_t g_f1_ctx;         /* hsd.Context */
+volatile uint32_t g_f1_sta;         /* SDMMC1->STA */
+volatile uint32_t g_f1_dctrl;       /* SDMMC1->DCTRL */
+volatile uint32_t g_f1_dcount;      /* SDMMC1->DCOUNT */
+volatile uint32_t g_f1_cardst;      /* BSP_SD_GetCardState */
+volatile uint32_t g_f1_nwrites;     /* 之前成功寫過幾次 */
+
+/* 傳輸前發現資料路徑狀態機還卡著、把它清掉的次數。 */
+volatile uint32_t g_sd_dpsm_stuck;
+volatile uint32_t g_sd_dpsm_cleared;
+volatile uint32_t g_sd_hard_reinit;     /* 主動完整重新初始化的次數 */
+
 /* 解鎖／上鎖**不需要重新掛載**。
  *
  * FatFs 的 mount_volume() 在 volume 已掛載時仍然每次都呼叫 disk_status()
@@ -176,6 +215,26 @@ static DSTATUS sdbsp_initialize(BYTE lun)
     if (BSP_SD_IsDetected(SD_INSTANCE) != SD_PRESENT) {
         return g_stat;
     }
+    /* 用 SWD 指定的分頻覆寫 BSP 的設定。
+     *
+     * **只改 CLKCR 裡的 CLKDIV 欄位，其他位元原封不動。**
+     * 第一版是改 Init.ClockDiv 再呼叫 SDMMC_Init()，結果整組暫存器被重寫 ——
+     * 而 Init.BusWide 還停在 BSP 初始化時的 1B（切 4-bit 是後來用
+     * HAL_SD_ConfigWideBusOperation 做的，沒有回填 Init）。於是主機變 1-bit、
+     * 卡片還在 4-bit，掛載直接 FR_DISK_ERR。
+     *
+     * 教訓：**Init 結構不等於硬體現況**。後續用別的 API 改過的設定不會回寫
+     * 進去，拿它整組重灌就會把那些改動洗掉。 */
+    if (g_dbg_sdclkdiv != 0u) {
+        SDMMC_TypeDef *sd = hsd_sdmmc[SD_INSTANCE].Instance;
+
+        sd->CLKCR = (sd->CLKCR & ~SDMMC_CLKCR_CLKDIV) |
+                    (g_dbg_sdclkdiv & SDMMC_CLKCR_CLKDIV);
+    }
+    g_dbg_sdclkdiv_now =
+        hsd_sdmmc[SD_INSTANCE].Instance->CLKCR & SDMMC_CLKCR_CLKDIV;
+    g_dbg_sdclkcr = hsd_sdmmc[SD_INSTANCE].Instance->CLKCR;
+
     g_sd_stage = 4;
 
     /* 沒解鎖就標成 STA_PROTECT：已初始化但唯讀，FatFs 之後任何寫入都會被擋。
@@ -261,12 +320,68 @@ static DRESULT sdbsp_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
 /* 每次寫入完成之後的最小間隔（board-notes 17.9）。 */
 #define SD_WRITE_GAP_MS 2u
 
+/* 送下一個指令之前，確認資料路徑狀態機真的回到 idle。
+ *
+ * 實測第一次寫入失敗的現場：`hsd.State` = READY、`ErrorCode` = 0、
+ * BSP 回 -4，而 `SDMMC1->STA` 的 **DPSMACT（bit 12）還是 1** ——
+ * 上一次傳輸的資料路徑沒有收乾淨。HAL 完全沒記錄到錯誤，因為從它的角度
+ * 看軟體狀態是乾淨的。
+ *
+ * 這就是為什麼「精準 15 次之後必掛」而且跟時脈、跟寫哪個磁區都無關：
+ * 累積的是**主機端的週邊狀態**，不是卡片的耗損。同一張卡在電腦上寫沒事
+ * 也是同一個道理。
+ *
+ * 跟 board-notes 16.8（JPEG 週邊累積狀態、Abort 清不掉要 DeInit+Init）
+ * 與 16.10（DMA2D 的 State 停在 BUSY）是同一個家族。
+ * HAL_SD_Abort() 會送 CMD12 並把狀態機收回來，是清它的正規手段。 */
+static void dpsm_settle(void)
+{
+    SDMMC_TypeDef *sd = hsd_sdmmc[SD_INSTANCE].Instance;
+
+    if ((sd->STA & SDMMC_STA_DPSMACT) == 0u) {
+        return;
+    }
+    g_sd_dpsm_stuck++;
+    (void)HAL_SD_Abort(&hsd_sdmmc[SD_INSTANCE]);
+    if ((sd->STA & SDMMC_STA_DPSMACT) == 0u) {
+        g_sd_dpsm_cleared++;
+    }
+}
+
+/* 把 SD 週邊完整重新初始化（不動 FatFs 的掛載狀態）。
+ *
+ * 實測「精準 15 次寫入之後必掛」而且 HAL_SD_Abort() 救不回來，只有整個
+ * DeInit + Init 才會恢復 —— 跟 board-notes 16.8 的 JPEG 週邊一模一樣。
+ * 這個函式讓上層可以在還沒撞到那個上限之前先主動清一次。 */
+int32_t sd_bsp_hard_reinit(void)
+{
+    int32_t rc;
+
+    /* BSP_SD_Init 內部有 4 次重試、每次 200ms 延遲，而且 HAL 的 SD_InitCard()
+     * 有沒有逾時保護的迴圈 —— 整段可能吃掉一秒以上。16 秒的看門狗雖然夠，
+     * 但這個函式可能被連續呼叫，所以前後都餵一下。 */
+    keepalive();
+    (void)BSP_SD_DeInit(SD_INSTANCE);
+    for (int i = 0; i < 5; i++) { keepalive(); HAL_Delay(10); }
+    rc = BSP_SD_Init(SD_INSTANCE);
+    keepalive();
+    if (rc == BSP_ERROR_NONE && g_dbg_sdclkdiv != 0u) {
+        SDMMC_TypeDef *sd = hsd_sdmmc[SD_INSTANCE].Instance;
+
+        sd->CLKCR = (sd->CLKCR & ~SDMMC_CLKCR_CLKDIV) |
+                    (g_dbg_sdclkdiv & SDMMC_CLKCR_CLKDIV);
+    }
+    g_sd_hard_reinit++;
+    return rc;
+}
+
 static DRESULT sd_write_one(const uint32_t *data, uint32_t sector, uint32_t count)
 {
     for (uint32_t attempt = 0; attempt < SD_WRITE_TRIES; attempt++) {
         int32_t rc;
 
         keepalive();
+        dpsm_settle();
 
         /* 前一次操作沒結束就送下一個指令，卡片會直接拒絕。
          * 這裡用寫入的長逾時 —— 上一次可能也是寫入，還在收尾。 */
@@ -274,8 +389,27 @@ static DRESULT sd_write_one(const uint32_t *data, uint32_t sector, uint32_t coun
             g_sd_wtimeout++;
         }
 
-        rc = BSP_SD_WriteBlocks(SD_INSTANCE, (uint32_t *)(uintptr_t)data,
-                                sector, count);
+        {
+            uint32_t st_before = (uint32_t)hsd_sdmmc[SD_INSTANCE].State;
+
+            rc = BSP_SD_WriteBlocks(SD_INSTANCE, (uint32_t *)(uintptr_t)data,
+                                    sector, count);
+
+            if (rc != BSP_ERROR_NONE && g_f1_taken == 0u) {
+                SDMMC_TypeDef *sd = hsd_sdmmc[SD_INSTANCE].Instance;
+
+                g_f1_rc      = rc;
+                g_f1_state   = st_before;
+                g_f1_err     = HAL_SD_GetError(&hsd_sdmmc[SD_INSTANCE]);
+                g_f1_ctx     = hsd_sdmmc[SD_INSTANCE].Context;
+                g_f1_sta     = sd->STA;
+                g_f1_dctrl   = sd->DCTRL;
+                g_f1_dcount  = sd->DCOUNT;
+                g_f1_cardst  = (uint32_t)BSP_SD_GetCardState(SD_INSTANCE);
+                g_f1_nwrites = g_sd_writes;
+                g_f1_taken   = 1u;
+            }
+        }
         if (rc == BSP_ERROR_NONE) {
             if (sd_wait_ready_ms(SD_WRITE_WAIT_MS) == 0) {
                 /* board-notes 17.9：這張卡在**密集單磁區寫入**下大約

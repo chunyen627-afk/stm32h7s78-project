@@ -38,6 +38,10 @@
 /* 磁碟層的寫入閘門。 */
 void sd_bsp_unlock_write(void);
 void sd_bsp_lock_write(void);
+int32_t sd_bsp_hard_reinit(void);
+
+/* 每寫幾次就主動把 SD 週邊重新初始化一次；0 = 不做。實驗用。 */
+volatile uint32_t g_dbg_wrreinit;
 
 /* 清單的記憶體映像，同時也是檔案內容。64KB，放 PSRAM 尾端的空區：
  * 0x91E00000 是資料夾索引（8KB），到 0x92000000 是 32MB 的盡頭。
@@ -72,6 +76,7 @@ volatile uint32_t g_fav_st_ok;
 volatile uint32_t g_fav_st_fail;
 volatile uint32_t g_fav_st_first;       /* 第幾次開始失敗 */
 volatile uint32_t g_fav_st_done;
+volatile uint32_t g_dbg_wrspread;       /* 1 = 每次換一格寫（散布磁區）*/
 
 static fav_result_t fail(fav_result_t e)
 {
@@ -308,16 +313,30 @@ void fav_init(const char *drive)
  * 每次寫入 = 一個資料磁區 + 一個目錄項，跟真正收藏一次的成本相同。 */
 void fav_stress(uint32_t n)
 {
-    uint32_t slot = FAV_MAX - 1u;
-    uint32_t run  = 0;
+    uint32_t run = 0;
 
     g_fav_st_ok = 0; g_fav_st_fail = 0; g_fav_st_first = 0; g_fav_st_done = 0;
     if (!g_ready) {
         return;
     }
-    rec_set(slot, NULL);
 
     for (uint32_t i = 0; i < n; i++) {
+        /* g_dbg_wrspread：每次換一格寫，等於散布到不同的磁區。
+         *
+         * 預設是**一直寫同一格**（同一個資料磁區 + 同一個目錄項）。
+         * 如果只有這樣會死、換位置就不會，代表卡片受不了的是「反覆寫同一個
+         * 位置」而不是「寫入」本身 —— 那在軟體端有解（把紀錄輪流散開）。
+         * 兩者要分開量才知道。
+         *
+         * 從尾端往回取，避開前面正在用的格子。 */
+        uint32_t slot = g_dbg_wrspread
+                        ? (FAV_MAX - 1u - (i % (FAV_MAX / 2u)))
+                        : (FAV_MAX - 1u);
+
+        if (g_dbg_wrreinit != 0u && i != 0u && (i % g_dbg_wrreinit) == 0u) {
+            (void)sd_bsp_hard_reinit();
+        }
+        rec_set(slot, NULL);
         if (write_slot(slot) == FAV_OK) {
             g_fav_st_ok++;
             run = 0;
