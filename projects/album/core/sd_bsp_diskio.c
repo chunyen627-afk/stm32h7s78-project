@@ -207,6 +207,12 @@ static DRESULT sdbsp_read(BYTE lun, BYTE *buff, DWORD sector, UINT count)
         return RES_NOTRDY;
     }
 
+    /* 讀取的**失敗**路徑以前沒有餵狗：BSP_SD_ReadBlocks 一失敗就直接 return，
+     * 完全不會走到 sd_wait_ready()。卡片進 BUSY 之後每一次讀取都是這條路，
+     * 上層又會把整份清單重試一遍 —— 16 秒的看門狗就把板子打掉了，
+     * 開機看到 IWDGRST 還會停在「請拔出記憶卡再重新插入」。
+     * 有餵狗，上層的 card_sick 偵測才有機會先跑到。 */
+    keepalive();
     g_sd_reads++;
     if (((uint32_t)(uintptr_t)buff & 3U) == 0U) {
         if (BSP_SD_ReadBlocks(SD_INSTANCE, (uint32_t *)(uintptr_t)buff,

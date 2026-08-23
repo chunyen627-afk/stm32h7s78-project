@@ -109,6 +109,36 @@ volatile uint32_t g_stage;
 volatile int32_t  g_err;
 volatile uint32_t g_decode_ok;
 volatile uint32_t g_decode_fail;
+
+/* 卡片「還插著但不再回應」的偵測。
+ *
+ * 寫入失敗會讓這張卡進 BUSY 就再也不回來，之後**連讀取都失敗**。
+ * 那時每一張照片都解不開，而翻頁迴圈會把整份清單試一遍再重來 ——
+ * 迴圈裡有乖乖餵狗，所以看門狗不會救，結果是永遠空轉：
+ * 實測 g_decode_fail 衝到 1,511,732，使用者看到的就是「卡死」。
+ *
+ * 連續失敗超過門檻就判定卡片掛了，跳出去做一次完整的重新初始化。
+ * 門檻要大於「偶爾一張壞檔」但遠小於整份清單。 */
+#define CARD_SICK_RUN   24u
+static uint32_t g_read_fail_run;
+static bool     g_card_sick;
+
+volatile uint32_t g_dbg_card_sick;      /* 判定過幾次 */
+volatile uint32_t g_dbg_card_recover;   /* 重新初始化過幾次 */
+
+static void note_decode(bool ok)
+{
+    if (ok) {
+        g_decode_ok++;
+        g_read_fail_run = 0;
+        return;
+    }
+    g_decode_fail++;
+    if (++g_read_fail_run >= CARD_SICK_RUN && !g_card_sick) {
+        g_card_sick = true;
+        g_dbg_card_sick++;
+    }
+}
 volatile uint32_t g_last_ms;
 volatile uint32_t g_exit_touch;   /* 因觸控離開播放的次數 */
 volatile uint32_t g_skipped_long; /* 路徑太長被跳過的照片數 */
@@ -706,6 +736,7 @@ volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
 volatile uint32_t   g_dbg_autoplay;    /* SWD 可寫，直接開始放照片 */
 volatile uint32_t   g_dbg_fakedirs;    /* SWD 可寫，測試資料夾清單捲動 */
 volatile uint32_t   g_dbg_fakevids;    /* SWD 可寫，測試影片清單捲動 */
+volatile uint32_t   g_dbg_favtest;     /* SWD 可寫，見 fav_selftest() */
 
 static bool ends_with_bin(const char *name)
 {
@@ -1286,6 +1317,9 @@ static bool select_screen(void)
         }
         /* 除錯旗標也要在這裡看：選單這個迴圈在等觸控時不會回到主迴圈，
          * 只在主迴圈檢查的話，SWD 設旗標永遠不會生效。 */
+        if (g_dbg_favtest) {
+            return false;               /* 交回主迴圈去跑最愛的自動測試 */
+        }
         if (g_dbg_autovideo && g_vid_count > 0u) {
             play_video(&g_vids[0]);
             dirty = true;
@@ -2257,7 +2291,7 @@ static int pause_session(int32_t *cur)
                     == PHOTO_OK) {
                 present();
                 *cur = (int32_t)t;
-                g_decode_ok++;
+                note_decode(true);
             }
             continue;
         }
@@ -2288,7 +2322,7 @@ static int pause_session(int32_t *cur)
         tries  = 0;
         r      = PHOTO_ERR_READ;
 
-        while (tries < g_order_count) {
+        while (tries < g_order_count && !g_card_sick) {
             watchdog_feed();
             target = (target + g_order_count + (uint32_t)dir) % g_order_count;
             r = photo_show(PLAYLIST_BASE + g_order[target] * PATH_MAX);
@@ -2296,12 +2330,12 @@ static int pause_session(int32_t *cur)
             if (r == PHOTO_OK || r == PHOTO_ABORTED) {
                 break;
             }
-            g_decode_fail++;
+            note_decode(false);
         }
         if (r == PHOTO_OK) {
             present();
             *cur = (int32_t)target;
-            g_decode_ok++;
+            note_decode(true);
         }
     }
 }
@@ -2323,7 +2357,7 @@ static void slideshow(void)
         uint32_t t0;
 
         watchdog_feed();
-        if (!sd_present() || !wait_screen_on()) {
+        if (!sd_present() || g_card_sick || !wait_screen_on()) {
             return;
         }
 
@@ -2346,7 +2380,7 @@ static void slideshow(void)
         }
 
         if (r == PHOTO_OK) {
-            g_decode_ok++;
+            note_decode(true);
 
             if (cur >= 0) {
                 int w = wait_interval(g_last_ms);
@@ -2368,7 +2402,7 @@ static void slideshow(void)
             cur = (int32_t)pos;
         } else {
             /* 一張壞掉的照片不能讓相框停住，記錄之後直接換下一張。 */
-            g_decode_fail++;
+            note_decode(false);
         }
 
         pos++;
@@ -2380,6 +2414,30 @@ static void slideshow(void)
 }
 
 /* ------------------------------------------------------------------ */
+
+/* 卡片還插著但停止回應時的復原。
+ *
+ * 軟體重置**不會**切斷 SD 卡電源，所以光是重開機救不回來（README 記過
+ * 這條）。要靠 BSP_SD_DeInit() 把 SDMMC 斷電、偵測腳 DeInit 掉，
+ * 下一次 disk_initialize 才會從乾淨的狀態重跑完整的 BSP_SD_Init。
+ *
+ * 這是「卡片不回應」與「卡片被拔掉」共用的復原路徑 —— 差別只在前者
+ * 使用者不必動手。 */
+static void card_recover(void)
+{
+    g_dbg_card_recover++;
+    show_message("記憶卡沒有回應", "重新初始化中");
+
+    f_mount(NULL, g_drive, 0);          /* 丟掉 FatFs 的快取 */
+    (void)BSP_SD_DeInit(0);
+    for (int i = 0; i < 10; i++) {      /* 分段等，中間要餵狗 */
+        watchdog_feed();
+        HAL_Delay(100);
+    }
+
+    g_read_fail_run = 0;
+    g_card_sick     = false;            /* 外層迴圈會重新掛載並掃描 */
+}
 
 /* 掛載並掃描一次。回傳 false 代表這輪不能播（沒卡、掛不起來、沒照片）。 */
 static bool mount_and_scan(void)
@@ -2474,6 +2532,87 @@ static void wait_for_card(void)
     show_message("讀取記憶卡", "載入中");
 }
 
+/* ------------------------------------------------------------------ */
+/* 最愛的自動測試                                                      */
+/* ------------------------------------------------------------------ */
+
+/* SWD 寫 g_dbg_favtest = N 就跑一輪：挑 N 張平均散布的照片收藏，
+ * 再用最愛模式把它們全部播一遍。不寫就完全等於不存在
+ * （board-notes 16.3：實驗要由外部旗標觸發）。
+ *
+ * 為什麼要做成韌體端的自動測試而不是用 SWD 一步一步戳：
+ * 每次 SWD 連線要一秒多，戳十幾步就好幾十秒，而且**節奏跟使用者用手點
+ * 完全不同** —— 這次的失敗正是連續操作幾次之後才出現的，
+ * 慢慢戳反而重現不了。 */
+volatile uint32_t g_dbg_ft_step;        /* 正在收藏第幾張 */
+volatile uint32_t g_dbg_ft_added;       /* 收藏成功幾張 */
+volatile int32_t  g_dbg_ft_err;         /* 第一次失敗的錯誤碼 */
+volatile uint32_t g_dbg_ft_failat;      /* 第幾張開始失敗 */
+volatile uint32_t g_dbg_ft_order;       /* 最愛模式建出幾張的播放順序 */
+volatile uint32_t g_dbg_ft_shown;       /* 播成功幾張 */
+volatile uint32_t g_dbg_ft_showfail;
+volatile uint32_t g_dbg_ft_wr;          /* 整輪用掉幾次 disk_write */
+volatile uint32_t g_dbg_ft_done;        /* 1 = 跑完 */
+
+extern volatile uint32_t g_sd_writes;
+
+static void fav_selftest(uint32_t n)
+{
+    uint32_t step, w0;
+
+    if (n == 0u || g_photo_count == 0u) {
+        return;
+    }
+    if (n > g_photo_count) { n = g_photo_count; }
+    step = g_photo_count / n;
+    if (step == 0u) { step = 1u; }
+
+    g_dbg_ft_done = 0; g_dbg_ft_step = 0; g_dbg_ft_added = 0;
+    g_dbg_ft_err  = 0; g_dbg_ft_failat = 0; g_dbg_ft_order = 0;
+    g_dbg_ft_shown = 0; g_dbg_ft_showfail = 0;
+    w0 = g_sd_writes;
+
+    show_message("最愛自動測試", "收藏中");
+
+    for (uint32_t i = 0; i < n && !g_card_sick; i++) {
+        const char  *path = PLAYLIST_BASE + (i * step) * PATH_MAX;
+        fav_result_t r;
+
+        g_dbg_ft_step = i + 1u;
+        watchdog_feed();
+        r = fav_add(path);
+        if (r == FAV_OK) {
+            g_dbg_ft_added++;
+        } else if (g_dbg_ft_err == 0) {
+            g_dbg_ft_err    = (int32_t)r;
+            g_dbg_ft_failat = i + 1u;
+        }
+        /* 模擬使用者用手點的節奏，不要背對背灌。 */
+        nap(300);
+    }
+
+    show_message("最愛自動測試", "播放中");
+    g_fav_mode = true;
+    build_order();
+    g_dbg_ft_order = g_order_count;
+
+    for (uint32_t i = 0; i < g_order_count && !g_card_sick; i++) {
+        watchdog_feed();
+        if (photo_show(PLAYLIST_BASE + g_order[i] * PATH_MAX) == PHOTO_OK) {
+            present();
+            g_dbg_ft_shown++;
+            note_decode(true);
+        } else {
+            g_dbg_ft_showfail++;
+            note_decode(false);
+        }
+    }
+    g_fav_mode = false;
+
+    g_dbg_ft_wr   = g_sd_writes - w0;
+    g_dbg_ft_done = 1u;
+}
+
 void album_run(void)
 {
     TS_Init_t ts = { .Width = PHYS_W, .Height = PHYS_H,
@@ -2548,13 +2687,19 @@ void album_run(void)
         for (;;) { }
     }
 
-    /* 被看門狗打掉，代表上一輪卡在記憶卡初始化裡出不來。這種狀態只有把卡片
-     * 真正斷電（拔出來）才能清掉，所以先擋住不要再去碰它，否則會一直重置。 */
+    /* 被看門狗打掉，代表上一輪卡在記憶卡裡出不來。
+     *
+     * 原本是「停住並要求使用者拔卡」，因為以為只有真正斷電才清得掉。
+     * 但 BSP_SD_DeInit() 就會把 SDMMC 斷電、偵測腳 DeInit 掉，效果一樣 ——
+     * 而且不必人在旁邊。相框放在桌上自己卡死、要人來拔卡才會動，
+     * 是最糟的失敗模式。
+     *
+     * 先自己試一次；真的救不回來，下面的 mount_and_scan() 會失敗並顯示
+     * 「記憶卡無法讀取」，那是個安靜等待的狀態，不會一直重置。 */
     if (wdt_reset) {
-        show_message("記憶卡沒有回應", "請拔出記憶卡再重新插入");
-        while (sd_present()) {
-            nap(100);
-        }
+        show_message("記憶卡沒有回應", "重新初始化中");
+        (void)BSP_SD_DeInit(0);
+        HAL_Delay(1000);
     }
 
     watchdog_start();
@@ -2592,10 +2737,10 @@ void album_run(void)
         for (uint32_t k = 0; k < 6u && k < g_order_count; k++) {
             watchdog_feed();
             if (photo_show(PLAYLIST_BASE + g_order[k] * PATH_MAX) == PHOTO_OK) {
-                g_decode_ok++;
+                note_decode(true);
                 present();
             } else {
-                g_decode_fail++;
+                note_decode(false);
             }
             HAL_Delay(300);
         }
@@ -2610,7 +2755,17 @@ void album_run(void)
         {
             bool first = true;
 
-            while (sd_present()) {
+            while (sd_present() && !g_card_sick) {
+                /* SWD 寫 g_dbg_favtest = N 就跑一輪最愛的自動測試。
+                 * 選單迴圈看到旗標會先退出來，所以隨時觸發得到。 */
+                if (g_dbg_favtest) {
+                    uint32_t n = g_dbg_favtest;
+
+                    g_dbg_favtest = 0;      /* 吃掉旗標，不會自己重跑 */
+                    fav_selftest(n);
+                    first = false;
+                    continue;
+                }
                 /* 自動開播：掃描完直接播，不必手動勾資料夾按開始。
                  *
                  * 資料夾本來就預設全選（見掃描那段），所以自動開播等於
@@ -2634,8 +2789,11 @@ void album_run(void)
                     slideshow();
                 }
             }
+            if (g_card_sick) {
+                card_recover();
+            }
         }
 #endif
-        /* 跳出來代表卡片被拔掉了。 */
+        /* 跳出來代表卡片被拔掉了，或是它不再回應（card_recover 已處理）。 */
     }
 }

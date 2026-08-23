@@ -86,18 +86,36 @@ static bool rec_empty(uint32_t i)
     return rec(i)[0] != '/';
 }
 
-/* 把一筆紀錄的路徑取出來（去掉補的空白），放進 out。 */
-static void rec_get(uint32_t i, char *out, size_t cap)
+/* 這一格存的是不是這個路徑。
+ *
+ * **不能拿空白當結束符。** 紀錄是用空白補到固定寬度的，但使用者的資料夾
+ * 名稱裡本來就可能有空白（卡上實際就有 "Ayu Makihara (...) 77 set in 1"）。
+ * 第一版用空白當終止字元，路徑一有空白就被截斷，比對永遠失敗 ——
+ * 症狀是「收藏當下愛心變紅，但下次看到同一張又是空心，最愛也播不出來」。
+ *
+ * **而且用沒有空白的資料夾完全測不到。** 先前那三張測試照片都在
+ * ai_generated/ 底下，路徑裡一個空白都沒有，所以全部通過；
+ * 自動測試收藏 12 張、最愛模式只找回 2 張，才把它抓出來。
+ *
+ * 正解是從固定的結尾往回剝掉補的空白。FAT 檔名不會以空白結尾
+ * （Windows 會去掉），所以不會誤傷。
+ *
+ * 直接比對而不先取出字串，順便快很多：絕大多數格子第一個位元組就不同，
+ * memcmp 立刻返回。 */
+static bool rec_eq(uint32_t i, const char *rel, size_t rl)
 {
     const char *r = rec(i);
-    size_t      n = 0;
 
-    while (n < FAV_PATH_MAX && n + 1u < cap && r[n] != ' ' &&
-           r[n] != '\r' && r[n] != '\n') {
-        out[n] = r[n];
-        n++;
+    if (rl == 0u || rl > FAV_PATH_MAX) {
+        return false;
     }
-    out[n] = 0;
+    if (memcmp(r, rel, rl) != 0) {
+        return false;
+    }
+    for (size_t k = rl; k < FAV_PATH_MAX; k++) {
+        if (r[k] != ' ') { return false; }      /* 後面必須全是補的空白 */
+    }
+    return true;
 }
 
 /* 相簿的路徑是 "0:/資料夾/檔名.jpg"，清單裡存的是去掉 "0:" 之後的
@@ -258,14 +276,11 @@ uint32_t fav_count(void) { return g_count; }
 
 static uint32_t find_slot(const char *rel)
 {
+    size_t rl = strlen(rel);
+
     for (uint32_t i = 0; i < FAV_MAX; i++) {
         if (rec_empty(i)) { continue; }
-        {
-            char cur[FAV_REC_BYTES];
-
-            rec_get(i, cur, sizeof(cur));
-            if (strcmp(cur, rel) == 0) { return i; }
-        }
+        if (rec_eq(i, rel, rl)) { return i; }
     }
     return FAV_MAX;
 }
