@@ -332,7 +332,7 @@ python compare.py out rings 120 250 90 70 6 <變體...>   # 並排＋數值差�
 會偶發單一位元讀取錯誤 —— framebuffer、播放清單、解碼緩衝區全在 PSRAM 裡，
 症狀是畫面閃爍、照片路徑字串莫名其妙壞掉（`FR_NO_PATH`）。
 
-`app_src/xspi_psram.c` 覆寫 BSP 的 `__weak MX_XSPI_RAM_Init()` 把時脈減半成
+`shared/xspi_psram.c` 覆寫 BSP 的 `__weak MX_XSPI_RAM_Init()` 把時脈減半成
 100MHz。實測掃描 16MB：200MHz 有一百多萬個字出錯、0 個乾淨區塊；100MHz 是
 零錯誤、256/256 全乾淨。**沒有效能代價**，LTDC 只需要約 46 MB/s。
 
