@@ -253,7 +253,8 @@ def main():
   video2bin.py a.mkv out.bin --fps 30 --quality 4
   video2bin.py a.mov --start 60 --duration 30    只取第 60 秒起的 30 秒
 """)
-    ap.add_argument("src", help="影片檔（ffmpeg 讀得懂的都行）或影格目錄")
+    ap.add_argument("src", nargs="?",
+                    help="影片檔（ffmpeg 讀得懂的都行）或影格目錄")
     ap.add_argument("dst", nargs="?", help="輸出的 .bin（預設同名同目錄）")
     ap.add_argument("--fps", type=float, default=24, help="目的格率（預設 24）")
     ap.add_argument("--quality", type=int, default=5,
@@ -267,7 +268,38 @@ def main():
     ap.add_argument("--preview", action="store_true",
                     help="只產生三張預覽 PNG 確認方向，不轉檔")
     ap.add_argument("--keep-frames", action="store_true", help="保留中間的 JPEG")
+    # 給拖放用的 .bat 在沒收到檔案時呼叫。訊息放這裡而不是 .bat 裡，
+    # 是因為 cmd 用「解析當下」的字碼頁讀 .bat，中文會被切斷。
+    ap.add_argument("--dropinfo", action="store_true", help=argparse.SUPPRESS)
+    ap.add_argument("--preview-hint", action="store_true", help=argparse.SUPPRESS)
     args = ap.parse_args()
+
+    if args.dropinfo:
+        if args.preview_hint:
+            print("")
+            print("  把影片檔拖到這個 .bat 上面，會在影片旁邊產生三張 PNG，")
+            print("  分別是影片 10% / 50% / 90% 的畫面，尺寸就是面板實際顯示的 800x480。")
+            print("")
+            print("  方向平常不用管：直式自動轉 ccw、橫向不轉，兩種都在板子上驗過。")
+            print("  只有遇到怪素材（例如來源本身就錄反了）才需要看預覽，")
+            print("  然後用 --rotate 180 / --flip / --mirror 調。")
+        else:
+            print("")
+            print("  把影片檔拖到這個 .bat 上面，就會轉成同名的 .bin。")
+            print("  一次可以拖多個。")
+            print("")
+            print("  方向自動處理：直式來源轉 ccw、橫向不轉 —— 兩種都在板子上驗過，")
+            print("  平常不用給任何參數。")
+            print("")
+            print("  轉好的 .bin 複製到 SD 卡根目錄，相簿選單的「影片」就會列出來。")
+            print("")
+            print("  要調參數就開命令列：")
+            print("      python video2bin.py 影片.mp4 --quality 4")
+            print("      python video2bin.py --help")
+        return
+
+    if not args.src:
+        ap.error("要給一個影片檔或影格目錄")
 
     if not os.path.exists(args.src):
         sys.exit("找不到檔案：%s" % args.src)
