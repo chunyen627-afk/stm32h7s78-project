@@ -2723,9 +2723,25 @@ void album_run(void)
             continue;
         }
         if (!mount_and_scan()) {
-            /* 掛不起來或沒照片：等使用者換一張卡再試。 */
+            /* 掛不起來或沒照片：等使用者換一張卡再試。
+             *
+             * 但除錯旗標在這裡也要看得到 —— 拿一張沒有照片的卡來做寫入
+             * 測試是很正常的事（比對不同卡片時就是這樣），只在正常路徑上
+             * 檢查的話那些卡永遠測不到。 */
             while (sd_present()) {
                 watchdog_feed();
+                if (g_dbg_wrtest) {
+                    uint32_t n = g_dbg_wrtest;
+
+                    g_dbg_wrtest = 0;
+                    show_message("寫入壓力測試", "進行中");
+                    fav_stress(n);
+                    continue;
+                }
+                if (g_dbg_cardreinit) {
+                    g_dbg_cardreinit = 0;
+                    break;              /* 跳出去重新掛載 */
+                }
                 HAL_Delay(200);
             }
             continue;

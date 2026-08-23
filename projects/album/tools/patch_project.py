@@ -140,6 +140,10 @@ def patch_ffconf():
     changes = {
         r"#define FF_CODE_PAGE\s+\d+": "#define FF_CODE_PAGE    950",
         r"#define FF_USE_LFN\s+\d+": "#define FF_USE_LFN      1",
+        # exFAT：大容量卡（>32GB）出廠幾乎都是 exFAT，關著就直接掛不起來。
+        # 多約 10KB，而外部 Flash 有 128MB、目前只用 1.5MB，不痛。
+        # 需要 FF_USE_LFN >= 1（上面已經開了）。
+        r"#define FF_FS_EXFAT\s+\d+": "#define FF_FS_EXFAT     1",
         r"#define FF_LFN_UNICODE\s+\d+": "#define FF_LFN_UNICODE  2",
         # FF_FS_LOCK=2 表示同時最多只能開 2 個檔案或目錄。遞迴掃描時每一層
         # 都佔一個 DIR，第三層再開檔案讀 JPEG 檔頭就會拿到

@@ -7,7 +7,7 @@
 | 專案 | 說明 |
 |---|---|
 | [projects/tetris](projects/tetris) | 直立版俄羅斯方塊，繁體中文介面，超任風格觸控手把 |
-| [projects/album](projects/album) | 電子相簿，讀 SD 卡照片輪播，全觸控操作、我的最愛，也能播 MJPEG 影片 |
+| [projects/album](projects/album) | 電子相簿，讀 SD 卡照片輪播（FAT32／exFAT），全觸控操作、我的最愛，也能播 MJPEG 影片 |
 | [projects/video](projects/video) | MJPEG 影片播放與工具鏈：mp4 轉檔、SD 卡／外部 Flash 兩種來源、透過 ST-LINK 寫卡 |
 
 ## 目錄結構
