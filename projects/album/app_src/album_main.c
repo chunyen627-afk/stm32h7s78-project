@@ -618,11 +618,7 @@ static void scan(uint32_t depth)
                 g_cur_top = g_top_count;
                 strncpy(g_top[g_cur_top].name, fi->fname, NAME_MAX - 1U);
                 g_top[g_cur_top].name[NAME_MAX - 1U] = 0;
-                /* 預設全選，但**最愛資料夾例外**：它裝的是別的資料夾裡
-                 * 那些照片的副本，一起選中的話同一張會在隨機播放裡出現
-                 * 兩次。要看最愛就自己去勾它（通常會把別的取消）。 */
-                g_top[g_cur_top].selected =
-                    (strcmp(fi->fname, FAV_DIR_NAME) != 0);
+                g_top[g_cur_top].selected = true;   /* 預設全選 */
                 g_top_count++;
             }
             scan(depth + 1U);
@@ -657,14 +653,26 @@ static uint32_t selected_photo_count(void)
 }
 
 /* 依目前的勾選建立播放順序，然後洗牌。 */
+/* true = 播放清單來自最愛，不是勾選的資料夾。
+ *
+ * 一定要是**狀態**而不是「建一次就好」：播完一輪會再呼叫 build_order()
+ * 重洗牌，沒有這個旗標的話播完最愛就會偷偷跳回全部資料夾。 */
+static bool g_fav_mode;
+
 static void build_order(void)
 {
     g_order_count = 0;
     for (uint32_t i = 0; i < g_photo_count; i++) {
-        uint32_t t = TOPIDX_BASE[i];
-        if (t < g_top_count && g_top[t].selected) {
-            g_order[g_order_count++] = (uint16_t)i;
+        if ((i & 0xFFu) == 0u) {
+            watchdog_feed();    /* 最愛模式每張都要比對，四千張要一點時間 */
         }
+        if (g_fav_mode) {
+            if (!fav_is(PLAYLIST_BASE + i * PATH_MAX)) { continue; }
+        } else {
+            uint32_t t = TOPIDX_BASE[i];
+            if (!(t < g_top_count && g_top[t].selected)) { continue; }
+        }
+        g_order[g_order_count++] = (uint16_t)i;
     }
 
     if (!g_shuffle) {
@@ -1078,10 +1086,39 @@ static void video_list_screen(void)
 #define IV_GAP       10
 #define BTN_GO_Y     708
 #define BTN_GO_H     62
-/* 有影片時底下那列拆成「開始播放」＋「影片」兩顆。 */
-#define BTN_GO_W     280
-#define BTN_VID_X    304
-#define BTN_VID_W    160
+/* 底下那一列是 1~3 顆按鈕，等寬平分 16..GFX_W-16：
+ *
+ *   0 = 開始播放（一定有）
+ *   1 = 最愛（收藏數 > 0 才出現）
+ *   2 = 影片（卡上有影格包才出現）
+ *
+ * 原本是寫死的兩組座標（BTN_GO_W / BTN_VID_X），加第三顆之後組合變成四種，
+ * 改成算的比較不會漏掉某一種。 */
+#define BOT_GAP      12
+
+static int bottom_slots(void)
+{
+    return 1 + ((fav_count() > 0u) ? 1 : 0) + (g_vid_count ? 1 : 0);
+}
+
+static int bottom_fav_idx(void)
+{
+    return (fav_count() > 0u) ? 1 : -1;
+}
+
+static int bottom_vid_idx(void)
+{
+    if (!g_vid_count)         { return -1; }
+    return (fav_count() > 0u) ? 2 : 1;
+}
+
+static void bottom_rect(int idx, int *x, int *w)
+{
+    int n = bottom_slots();
+
+    *w = ((int)GFX_W - 32 - BOT_GAP * (n - 1)) / n;
+    *x = 16 + idx * (*w + BOT_GAP);
+}
 
 static const char *const ORIENT_NAME[PHOTO_ORIENT_COUNT] = {
     "直立", "橫向", "自動"
@@ -1190,27 +1227,33 @@ static void draw_select_screen(void)
     }
 
     {
-        uint32_t n  = selected_photo_count();
-        /* 卡上有影格包時，底下那一列拆成兩顆按鈕。沒有影片就維持原樣佔滿
-         * 整列 —— 大部分使用者不會放影片，不該為此犧牲照片按鈕的寬度。 */
-        int      gw = g_vid_count ? BTN_GO_W : (GFX_W - 32);
+        uint32_t n = selected_photo_count();
+        int      x, w;
 
-        gfx_pill(16, BTN_GO_Y, gw, BTN_GO_H, n ? COL_ACCENT : COL_PANEL);
+        bottom_rect(0, &x, &w);
+        gfx_pill(x, BTN_GO_Y, w, BTN_GO_H, n ? COL_ACCENT : COL_PANEL);
         if (n) {
-            gfx_text_center(16 + gw / 2, BTN_GO_Y + 12, "開始播放", COL_BG);
-            if (!g_vid_count) {
+            gfx_text_center(x + w / 2, BTN_GO_Y + 12, "開始播放", COL_BG);
+            if (bottom_slots() == 1) {      /* 只有一顆時才擠得下張數 */
                 gfx_number_right(GFX_W - 40, BTN_GO_Y + 12, n, COL_BG);
             }
         } else {
-            gfx_text_center(16 + gw / 2, BTN_GO_Y + 20,
-                            g_vid_count ? "無照片" : "沒有選取任何資料夾",
+            gfx_text_center(x + w / 2, BTN_GO_Y + 20,
+                            (bottom_slots() > 1) ? "無照片"
+                                                 : "沒有選取任何資料夾",
                             COL_DIM);
         }
 
-        if (g_vid_count) {
-            gfx_pill(BTN_VID_X, BTN_GO_Y, BTN_VID_W, BTN_GO_H, COL_PANEL);
-            gfx_text_center(BTN_VID_X + BTN_VID_W / 2, BTN_GO_Y + 12,
-                            "影片", COL_ACCENT);
+        /* 收藏數是 0 就不畫這顆 —— 沒有內容的入口只會讓人按了失望。 */
+        if (bottom_fav_idx() >= 0) {
+            bottom_rect(bottom_fav_idx(), &x, &w);
+            gfx_pill(x, BTN_GO_Y, w, BTN_GO_H, COL_PANEL);
+            gfx_text_center(x + w / 2, BTN_GO_Y + 12, "最愛", COL_HEART);
+        }
+        if (bottom_vid_idx() >= 0) {
+            bottom_rect(bottom_vid_idx(), &x, &w);
+            gfx_pill(x, BTN_GO_Y, w, BTN_GO_H, COL_PANEL);
+            gfx_text_center(x + w / 2, BTN_GO_Y + 12, "影片", COL_ACCENT);
         }
     }
 }
@@ -1349,14 +1392,39 @@ static bool select_screen(void)
                 }
             }
         } else if (y >= BTN_GO_Y && y < BTN_GO_Y + BTN_GO_H) {
-            if (g_vid_count && x >= BTN_VID_X && x < BTN_VID_X + BTN_VID_W) {
-                wait_release();
-                video_list_screen();
-                dirty = true;
-                continue;
+            int bx, bw;
+
+            if (bottom_vid_idx() >= 0) {
+                bottom_rect(bottom_vid_idx(), &bx, &bw);
+                if (x >= bx && x < bx + bw) {
+                    wait_release();
+                    video_list_screen();
+                    dirty = true;
+                    continue;
+                }
             }
-            if ((!g_vid_count || x < BTN_GO_W + 16) &&
-                selected_photo_count() > 0U) {
+            if (bottom_fav_idx() >= 0) {
+                bottom_rect(bottom_fav_idx(), &bx, &bw);
+                if (x >= bx && x < bx + bw) {
+                    g_fav_mode = true;
+                    build_order();
+                    if (g_order_count > 0u) {
+                        wait_release();
+                        return true;
+                    }
+                    /* 清單裡的照片一張都對不上：換過卡，或檔案被搬走了。 */
+                    g_fav_mode = false;
+                    show_message("最愛的照片都不在卡上",
+                                 "可能換過卡或移動過檔案");
+                    nap(2000);
+                    dirty = true;
+                    wait_release();
+                    continue;
+                }
+            }
+            bottom_rect(0, &bx, &bw);
+            if (x >= bx && x < bx + bw && selected_photo_count() > 0U) {
+                g_fav_mode = false;
                 build_order();
                 wait_release();
                 return true;
@@ -1594,15 +1662,14 @@ static void flash_orient(void)
 static uint32_t g_ov_index;      /* 疊加層要顯示的張數（由 pause_session 給） */
 static uint32_t g_seek_target;   /* 拖曳拉桿結束時停在哪一張 */
 
-/* 愛心的狀態，進 paused_loop() 之前由 pause_session 算好。
+/* 愛心的狀態，進 paused_loop() 之前由 pause_session 算好（純記憶體查表）。
  *
- * LOCKED 是「這張本身就在最愛資料夾裡」：刪掉的就是正在看的檔案，而且
- * 沒有來源可以再複製回來 —— 整個功能裡唯一會真的遺失資料的情況，
- * 所以那顆按鈕不接受點擊（favorites.c 裡還會再擋一次）。 */
+ * LOCKED 是清單檔載入失敗（讀不到也建不起來）的情況 —— 收藏會存不下來，
+ * 所以那顆按鈕不接受點擊，免得使用者以為收藏成功了。 */
 typedef enum {
-    FAVBTN_OFF = 0,              /* 未收藏，點了會複製 */
-    FAVBTN_ON,                   /* 已收藏，點了會刪除副本 */
-    FAVBTN_LOCKED,               /* 正在看的就是副本，不可按 */
+    FAVBTN_OFF = 0,              /* 未收藏 */
+    FAVBTN_ON,                   /* 已收藏 */
+    FAVBTN_LOCKED,               /* 清單檔不可用 */
 } favbtn_t;
 
 static favbtn_t g_ov_fav;
@@ -1746,36 +1813,6 @@ static void ov_refresh_fav(void)
     gfx_set_orientation(was_ls);
 }
 
-/* 複製進度：畫在拉桿那條橫帶上（同樣已經備份過）。
- *
- * 複製 2MB 大約幾百毫秒，中間沒有回饋看起來像當機。這裡也是餵看門狗的
- * 地方 —— 一次 64KB，2MB 的照片會進來約 32 次，遠比 16 秒的間隔密。 */
-static void ov_draw_copy_progress(uint32_t done, uint32_t total)
-{
-    uint16_t *back   = gfx_framebuffer();
-    uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
-    bool      was_ls = gfx_is_landscape();
-    uint32_t  w      = total ? ((uint32_t)PB_W * done / total) : 0u;
-
-    watchdog_feed();
-
-    gfx_set_orientation(false);
-    gfx_set_framebuffer(front);
-
-    /* 所有座標都必須落在 OV_BOT_Y..+OV_BOT_H（684..780）這條**已備份**的
-     * 橫帶裡，否則 ov_hide() 擦不掉，字就永久烙在那塊 buffer 上。
-     * 拉桿在 700，文字借用原本顯示張數的那一行（730）。 */
-    gfx_fill_rect(0, OV_BOT_Y, (int)GFX_W, OV_BOT_H, COL_BG);
-    gfx_fill_rect(PB_X, PB_Y, PB_W, PB_H, COL_LINE);
-    gfx_text_center((int)GFX_W / 2, PB_Y + 30, "加入最愛中", COL_TEXT);
-    if (w != 0u) {
-        gfx_fill_rect(PB_X, PB_Y, (int)w, PB_H, COL_HEART);
-    }
-
-    gfx_set_framebuffer(back);
-    gfx_set_orientation(was_ls);
-}
-
 /* 在拉桿那條橫帶上顯示一行字（成功／失敗的回饋）。 */
 static void ov_draw_note(const char *msg, uint16_t color)
 {
@@ -1786,7 +1823,8 @@ static void ov_draw_note(const char *msg, uint16_t color)
     gfx_set_orientation(false);
     gfx_set_framebuffer(front);
 
-    /* 同樣要待在已備份的橫帶內（684..780）。 */
+    /* 座標必須落在 OV_BOT_Y..+OV_BOT_H（684..780）這條**已備份**的橫帶裡，
+     * 否則 ov_hide() 擦不掉，字就永久烙在那塊 buffer 上（board-notes 18.6）。 */
     gfx_fill_rect(0, OV_BOT_Y, (int)GFX_W, OV_BOT_H, COL_BG);
     gfx_text_center((int)GFX_W / 2, PB_Y + 20, msg, color);
 
@@ -1803,12 +1841,14 @@ static const char *cur_photo_path(void)
     return PLAYLIST_BASE + g_order[g_ov_index] * PATH_MAX;
 }
 
-/* 切換收藏。**在疊加層還蓋著的時候做** —— 進度條與訊息都畫在
- * ctl_backup() 存過的橫帶裡，ov_hide() 才還原得乾淨（board-notes 18.6：
- * 疊加層的存還原必須成對，漏一次控制列就永久烙在那塊 buffer 上）。 */
+/* 切換收藏。
+ *
+ * 清單版只寫一格（一個磁區），幾毫秒就回來，所以不需要進度條 ——
+ * 第一版是複製整張照片才需要。失敗訊息仍然畫在 ctl_backup() 存過的
+ * 橫帶裡，ov_hide() 才還原得乾淨（board-notes 18.6）。 */
 static void fav_toggle_current(void)
 {
-    const char  *p     = cur_photo_path();
+    const char  *p = cur_photo_path();
     bool         was_on;
     fav_result_t r;
 
@@ -1816,29 +1856,20 @@ static void fav_toggle_current(void)
         return;
     }
     was_on = (g_ov_fav == FAVBTN_ON);
-
-    if (was_on) {
-        ov_draw_note("移出最愛中", COL_TEXT);
-        r = fav_remove(p);
-    } else {
-        ov_draw_copy_progress(0, 1);
-        r = fav_add(p, ov_draw_copy_progress);
-    }
+    r      = was_on ? fav_remove(p) : fav_add(p);
 
     if (r == FAV_OK) {
         g_ov_fav = was_on ? FAVBTN_OFF : FAVBTN_ON;
-    } else if (r == FAV_ERR_NODIR) {
-        /* 資料夾要在電腦上建，韌體不做 f_mkdir（理由見 favorites.h）。
-         * 這是使用者可以自己解決的情況，所以講清楚該做什麼、也留久一點。 */
-        ov_draw_note("請先在電腦建立「我的最愛」資料夾", COL_TEXT);
-        nap(2500);
+    } else if (r == FAV_ERR_FULL) {
+        ov_draw_note("最愛已滿（上限 256 張）", COL_HEART);
+        nap(1800);
     } else {
         ov_draw_note(was_on ? "移出最愛失敗" : "加入最愛失敗", COL_HEART);
         nap(1500);
     }
 
     ov_refresh_fav();
-    ov_draw_bar(g_ov_index);        /* 把進度條／訊息蓋回張數顯示 */
+    ov_draw_bar(g_ov_index);        /* 把訊息蓋回張數顯示 */
 }
 
 /* 回傳動作代碼；-1 = 疊加層以外（＝繼續播放）。
@@ -2194,16 +2225,14 @@ static int pause_session(int32_t *cur)
         /* 疊加層的拉桿要顯示目前是第幾張。 */
         g_ov_index = (uint32_t)((*cur < 0) ? 0 : *cur);
 
-        /* 愛心的狀態要在畫疊加層之前算好（f_stat 一次，很便宜）。
-         * 正在看的就是最愛資料夾裡那份副本時鎖起來 —— 刪掉它就沒有
-         * 來源可以復原了。 */
+        /* 愛心的狀態要在畫疊加層之前算好。清單在記憶體裡，純查表不碰卡片。 */
         {
             const char *p = cur_photo_path();
 
-            if (p == NULL || fav_source_is_in_folder(p)) {
+            if (p == NULL || !fav_ready()) {
                 g_ov_fav = FAVBTN_LOCKED;
             } else {
-                g_ov_fav = fav_exists(p) ? FAVBTN_ON : FAVBTN_OFF;
+                g_ov_fav = fav_is(p) ? FAVBTN_ON : FAVBTN_OFF;
             }
         }
 
@@ -2368,9 +2397,8 @@ static bool mount_and_scan(void)
         return false;
     }
 
-    /* 掛好了才知道 FATFS 物件是活的。最愛的寫入要靠重新掛載切換讀寫，
-     * 所以它得拿到同一個 g_fs 與磁碟機字串。 */
-    fav_init(&g_fs, g_drive);
+    /* 掛好了才能讀清單檔。放在掃描之前，這樣選單畫出來就知道有幾張最愛。 */
+    fav_init(g_drive);
 
     g_stage = 4;
     strncpy(g_scan_path, g_drive, SCAN_PATH_LEN - 1U);
