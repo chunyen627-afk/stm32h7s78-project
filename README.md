@@ -15,6 +15,7 @@
 ```
 docs/board-notes.md   板子層級的坑（所有專案共用，遇到問題先翻這裡）
 tools/sd-check.ps1    SD 卡好壞的快速判斷（見下）
+projects/video/tools/video2bin.py   影片轉板子能播的 .bin（含拖放用的 .bat）
 shared/               跨專案共用的程式碼
   gfx.c / gfx.h         直立繪圖層（面板 800x480 橫式，轉成 480x800 用）
   xspi_psram.c          PSRAM 降頻（這塊板子的個體差異補償，見下）
