@@ -96,7 +96,7 @@ STM32_Programmer_CLI -c port=SWD mode=UR \
 
 漏掉 `-el` 就燒不進外部 Flash。
 
-**硬體前提**：BOOT0 滑動開關要在 SW1 位置。Option Bytes 需要
+**硬體前提**：SW1（BOOT0 滑動開關）要在 **0** 的位置。Option Bytes 需要
 `XSPI1_HSLV=1`、`XSPI2_HSLV=1`、`VDDIO_HSLV=0`（出廠通常已正確，可用
 `-ob displ` 確認）。
 

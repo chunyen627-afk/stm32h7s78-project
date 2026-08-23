@@ -27,7 +27,8 @@ ST 韌體包與 CubeIDE）。
 
 ## 新板子的硬體前提
 
-- **BOOT0 滑動開關在 SW1 位置**
+- **SW1（BOOT0 滑動開關）在 0 的位置**（撥到 1 會停在 ST 原廠 bootloader，
+  程式本體永遠不會執行）
 - Option Bytes：`XSPI1_HSLV=1`、`XSPI2_HSLV=1`、`VDDIO_HSLV=0`
   （出廠通常已正確，用 `STM32_Programmer_CLI -c port=SWD -ob displ` 確認）
 
