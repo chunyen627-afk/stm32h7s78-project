@@ -12,7 +12,11 @@ wmv / flv / ts / gif，甚至一個裝滿 JPEG 的資料夾。這支程式本身
 面板是橫式 800x480。直式影片不轉的話只能縮成 270x480，兩側大片黑
 （只用到 34% 的寬度）；轉 90 度可以填滿，代價是看的時候板子要側著擺。
 
-預設 auto = 直式來源自動轉成橫式。方向不對就自己指定：
+**直式來源要 ccw，不是 cw。** 兩個方向都能填滿，但只有 ccw 跟板子實際的
+擺放對得上 —— cw 轉出來跟相簿直立模式差 180 度，放上去是上下顛倒的
+（實測踩過）。所以 auto 對直式選的是 **ccw**。
+
+方向不對就自己指定：
 
     --rotate none    不轉
     --rotate cw      順時針 90 度
@@ -95,7 +99,16 @@ def build_filter(src_w, src_h, rotate, flip, mirror, fps):
     """
     steps = []
     if rotate == "auto":
-        rotate = "cw" if src_h > src_w else "none"
+        # **直式來源要 ccw，不是 cw。**
+        #
+        # 兩個方向都能把直式填滿 800x480，但只有一個跟板子實際的擺放
+        # 對得上：cw 轉出來的畫面跟相簿直立模式**差 180 度**，
+        # 放上去是上下顛倒的（實測踩過，使用者手上能正常播的那部
+        # VIDEO.BIN 就是 ccw 轉的）。
+        #
+        # 這不是美觀偏好，是硬體事實 —— 所以直接把它做進預設值，
+        # 而不是只寫在文件裡等人去讀。
+        rotate = "ccw" if src_h > src_w else "none"
     if rotate == "cw":
         steps.append("transpose=1")
     elif rotate == "ccw":
