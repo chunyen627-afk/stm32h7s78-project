@@ -34,6 +34,9 @@ ST 韌體包與 CubeIDE）。
 ## 內容不在這裡的東西
 
 - **照片**：放進 SD 卡（FAT32），相簿會遞迴掃描
+- **`我的最愛` 資料夾**：要用「加入最愛」的話，先在電腦上於卡的根目錄建好
+  這個資料夾。韌體刻意不呼叫 `f_mkdir`（board-notes 20.3），沒建的話
+  點愛心會提示你去建
 - **影片**：`video.bin` 放 SD 卡根目錄，用 `projects/video/tools/mp4pack.py`
   從 mp4 轉出來。太大（動輒上百 MB）不進版控
 - **中文字型** `font_zh.c`：6.4MB 的產生物，`scripts/setup.sh` 會現場產生

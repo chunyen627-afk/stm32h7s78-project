@@ -70,7 +70,8 @@ FATFS_SOURCES = [
 # 路徑。相簿只讀不寫，掛載那幾行自己寫，把誤格式化的可能性從根本移除。
 APP_SOURCES = []
 
-ALBUM_SOURCES = ["album_main.c", "photo.c", "video.c", "sd_bsp_diskio.c", "xspi_psram.c",
+ALBUM_SOURCES = ["album_main.c", "photo.c", "video.c", "favorites.c",
+                 "sd_bsp_diskio.c", "xspi_psram.c",
                  "gfx.c", "font_zh.c"]   # gfx/xspi_psram 來自 repo 的 shared/
 
 # ST 的 YCbCr -> RGB 轉換工具，處理 JPEG 解碼器那種 MCU 區塊輸出格式。

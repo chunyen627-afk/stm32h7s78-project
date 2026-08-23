@@ -21,12 +21,16 @@
 #include "gfx.h"
 #include "photo.h"
 #include "video.h"
+#include "favorites.h"
 
 #include <string.h>
 #include <stdbool.h>
 #include <stdio.h>
 
 extern const Diskio_drvTypeDef SD_BSP_Driver;
+
+/* 磁碟層在等卡片時會呼叫這個，讓長時間的等待不會被看門狗打掉。 */
+void sd_bsp_set_keepalive(void (*fn)(void));
 
 /* 1 = 開機解一張就停住，方便用 SWD 把緩衝區讀出來對照。 */
 #define DEBUG_ONE_SHOT  0
@@ -40,6 +44,7 @@ extern const Diskio_drvTypeDef SD_BSP_Driver;
 #define COL_ACCENT      RGB565(78, 154, 241)
 #define COL_PANEL       RGB565(30, 34, 44)
 #define COL_LINE        RGB565(54, 60, 74)
+#define COL_HEART       RGB565(232, 72, 96)
 
 #define MAX_TOP         64U
 #define MAX_PHOTOS      8192U
@@ -613,7 +618,11 @@ static void scan(uint32_t depth)
                 g_cur_top = g_top_count;
                 strncpy(g_top[g_cur_top].name, fi->fname, NAME_MAX - 1U);
                 g_top[g_cur_top].name[NAME_MAX - 1U] = 0;
-                g_top[g_cur_top].selected = true;   /* 預設全選 */
+                /* 預設全選，但**最愛資料夾例外**：它裝的是別的資料夾裡
+                 * 那些照片的副本，一起選中的話同一張會在隨機播放裡出現
+                 * 兩次。要看最愛就自己去勾它（通常會把別的取消）。 */
+                g_top[g_cur_top].selected =
+                    (strcmp(fi->fname, FAV_DIR_NAME) != 0);
                 g_top_count++;
             }
             scan(depth + 1U);
@@ -1528,6 +1537,7 @@ static void flash_orient(void)
 #define PAUSE_PREV   2
 #define PAUSE_NEXT   3
 #define PAUSE_ROTATE 4
+#define PAUSE_FAV    6           /* 愛心：加入／移出最愛（5 是拉桿）*/
 
 /* ---- 暫停中的疊加層（覆刻影片播放器）----------------------------
  *
@@ -1551,12 +1561,18 @@ static void flash_orient(void)
  * 畫面才去解碼**，兩者不會互相踩到。 */
 #define CTL_SAVE     ((uint16_t *)0x90600000u)
 
+/* 上排四顆：返回 / 方向 / 愛心 / 暫停。
+ *
+ * 原本是三顆 120px 剛好排滿 480。加愛心之後改成 4x100 + 5x16 的間距，
+ * 也是剛好 480 —— 不必動 OV_TOP_H，存還原的橫帶範圍完全不變。 */
 #define OV_TOP_Y     36
 #define OV_TOP_H     56
-#define OV_PILL_W    120
-#define OV_BACK_X    20
-#define OV_ORIENT_X  ((int)GFX_W / 2 - OV_PILL_W / 2)
-#define OV_PAUSE_X   ((int)GFX_W - 20 - OV_PILL_W)
+#define OV_PILL_W    100
+#define OV_GAP       16
+#define OV_BACK_X    OV_GAP                                  /* 16  */
+#define OV_ORIENT_X  (OV_BACK_X   + OV_PILL_W + OV_GAP)      /* 132 */
+#define OV_FAV_X     (OV_ORIENT_X + OV_PILL_W + OV_GAP)      /* 248 */
+#define OV_PAUSE_X   (OV_FAV_X    + OV_PILL_W + OV_GAP)      /* 364 */
 
 /* 拉桿與翻書手勢是**互補**的，不是二選一：
  *
@@ -1577,6 +1593,19 @@ static void flash_orient(void)
 
 static uint32_t g_ov_index;      /* 疊加層要顯示的張數（由 pause_session 給） */
 static uint32_t g_seek_target;   /* 拖曳拉桿結束時停在哪一張 */
+
+/* 愛心的狀態，進 paused_loop() 之前由 pause_session 算好。
+ *
+ * LOCKED 是「這張本身就在最愛資料夾裡」：刪掉的就是正在看的檔案，而且
+ * 沒有來源可以再複製回來 —— 整個功能裡唯一會真的遺失資料的情況，
+ * 所以那顆按鈕不接受點擊（favorites.c 裡還會再擋一次）。 */
+typedef enum {
+    FAVBTN_OFF = 0,              /* 未收藏，點了會複製 */
+    FAVBTN_ON,                   /* 已收藏，點了會刪除副本 */
+    FAVBTN_LOCKED,               /* 正在看的就是副本，不可按 */
+} favbtn_t;
+
+static favbtn_t g_ov_fav;
 
 /* 剛恢復播放的時刻。恢復之後短時間內不理會觸控 —— 否則同一次觸碰
  * （或放開瞬間的彈跳）會立刻又被播放迴圈判成「暫停」，症狀是
@@ -1636,6 +1665,43 @@ static void ov_draw_bar(uint32_t idx)
     gfx_set_orientation(was_ls);
 }
 
+/* 愛心。字型裡沒有這個符號，而且用畫的才能同時表達實心／空心／不可按，
+ * 所以直接用原語組：兩個圓當上緣，一個倒三角當下緣。
+ *
+ * 空心是「先畫大的、再用底色畫小一號的」挖出來的，不必另外寫外框演算法。 */
+static void draw_heart(int cx, int cy, int r, uint16_t color)
+{
+    int i, span = r + r / 3;
+
+    gfx_disc(cx - r / 2, cy - r / 3, r / 2, color);
+    gfx_disc(cx + r / 2, cy - r / 3, r / 2, color);
+    for (i = 0; i < span; i++) {
+        int half = r - (i * r) / span;
+
+        if (half > 0) {
+            gfx_fill_rect(cx - half, cy - r / 3 + i, half * 2, 1, color);
+        }
+    }
+}
+
+/* 畫愛心那一格。ctl_draw() 與收藏狀態改變之後都會呼叫。
+ *
+ * 只重畫這一顆藥丸，範圍完全落在 ctl_backup() 存過的上排橫帶裡，
+ * 所以 ov_hide() 照樣還原得乾淨 —— 不會多出一條沒被備份的區域。 */
+static void ctl_draw_fav(void)
+{
+    uint16_t fg = (g_ov_fav == FAVBTN_LOCKED) ? COL_LINE : COL_HEART;
+    int      cx = OV_FAV_X + OV_PILL_W / 2;
+    int      cy = OV_TOP_Y + OV_TOP_H / 2;
+
+    gfx_pill(OV_FAV_X, OV_TOP_Y, OV_PILL_W, OV_TOP_H, COL_PANEL);
+    draw_heart(cx, cy, 15, fg);
+    if (g_ov_fav != FAVBTN_ON) {
+        /* 挖空：小一號的底色愛心蓋上去就剩下外框。 */
+        draw_heart(cx, cy, 10, COL_PANEL);
+    }
+}
+
 static void ctl_draw(void)
 {
     uint16_t *back   = gfx_framebuffer();
@@ -1647,6 +1713,8 @@ static void ctl_draw(void)
 
     gfx_pill(OV_BACK_X, OV_TOP_Y, OV_PILL_W, OV_TOP_H, COL_PANEL);
     gfx_text_center(OV_BACK_X + OV_PILL_W / 2, OV_TOP_Y + 16, "返回", COL_TEXT);
+
+    ctl_draw_fav();
 
     /* 方向那顆直接顯示目前模式（自動／直立／橫向），按下去之前就知道狀態。 */
     gfx_pill(OV_ORIENT_X, OV_TOP_Y, OV_PILL_W, OV_TOP_H, COL_PANEL);
@@ -1663,6 +1731,116 @@ static void ctl_draw(void)
     ov_draw_bar(g_ov_index);
 }
 
+/* 收藏狀態改變之後只重畫愛心那一顆，不整個疊加層重畫（跟 ov_draw_bar
+ * 同一個模式）。範圍在已備份的上排橫帶內，還原不受影響。 */
+static void ov_refresh_fav(void)
+{
+    uint16_t *back   = gfx_framebuffer();
+    uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    bool      was_ls = gfx_is_landscape();
+
+    gfx_set_orientation(false);
+    gfx_set_framebuffer(front);
+    ctl_draw_fav();
+    gfx_set_framebuffer(back);
+    gfx_set_orientation(was_ls);
+}
+
+/* 複製進度：畫在拉桿那條橫帶上（同樣已經備份過）。
+ *
+ * 複製 2MB 大約幾百毫秒，中間沒有回饋看起來像當機。這裡也是餵看門狗的
+ * 地方 —— 一次 64KB，2MB 的照片會進來約 32 次，遠比 16 秒的間隔密。 */
+static void ov_draw_copy_progress(uint32_t done, uint32_t total)
+{
+    uint16_t *back   = gfx_framebuffer();
+    uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    bool      was_ls = gfx_is_landscape();
+    uint32_t  w      = total ? ((uint32_t)PB_W * done / total) : 0u;
+
+    watchdog_feed();
+
+    gfx_set_orientation(false);
+    gfx_set_framebuffer(front);
+
+    /* 所有座標都必須落在 OV_BOT_Y..+OV_BOT_H（684..780）這條**已備份**的
+     * 橫帶裡，否則 ov_hide() 擦不掉，字就永久烙在那塊 buffer 上。
+     * 拉桿在 700，文字借用原本顯示張數的那一行（730）。 */
+    gfx_fill_rect(0, OV_BOT_Y, (int)GFX_W, OV_BOT_H, COL_BG);
+    gfx_fill_rect(PB_X, PB_Y, PB_W, PB_H, COL_LINE);
+    gfx_text_center((int)GFX_W / 2, PB_Y + 30, "加入最愛中", COL_TEXT);
+    if (w != 0u) {
+        gfx_fill_rect(PB_X, PB_Y, (int)w, PB_H, COL_HEART);
+    }
+
+    gfx_set_framebuffer(back);
+    gfx_set_orientation(was_ls);
+}
+
+/* 在拉桿那條橫帶上顯示一行字（成功／失敗的回饋）。 */
+static void ov_draw_note(const char *msg, uint16_t color)
+{
+    uint16_t *back   = gfx_framebuffer();
+    uint16_t *front  = (uint16_t *)(g_front ? FB1_ADDR : FB0_ADDR);
+    bool      was_ls = gfx_is_landscape();
+
+    gfx_set_orientation(false);
+    gfx_set_framebuffer(front);
+
+    /* 同樣要待在已備份的橫帶內（684..780）。 */
+    gfx_fill_rect(0, OV_BOT_Y, (int)GFX_W, OV_BOT_H, COL_BG);
+    gfx_text_center((int)GFX_W / 2, PB_Y + 20, msg, color);
+
+    gfx_set_framebuffer(back);
+    gfx_set_orientation(was_ls);
+}
+
+/* 目前顯示的那張照片的完整路徑。沒有有效照片時回傳 NULL。 */
+static const char *cur_photo_path(void)
+{
+    if (g_order_count == 0u || g_ov_index >= g_order_count) {
+        return NULL;
+    }
+    return PLAYLIST_BASE + g_order[g_ov_index] * PATH_MAX;
+}
+
+/* 切換收藏。**在疊加層還蓋著的時候做** —— 進度條與訊息都畫在
+ * ctl_backup() 存過的橫帶裡，ov_hide() 才還原得乾淨（board-notes 18.6：
+ * 疊加層的存還原必須成對，漏一次控制列就永久烙在那塊 buffer 上）。 */
+static void fav_toggle_current(void)
+{
+    const char  *p     = cur_photo_path();
+    bool         was_on;
+    fav_result_t r;
+
+    if (p == NULL || g_ov_fav == FAVBTN_LOCKED) {
+        return;
+    }
+    was_on = (g_ov_fav == FAVBTN_ON);
+
+    if (was_on) {
+        ov_draw_note("移出最愛中", COL_TEXT);
+        r = fav_remove(p);
+    } else {
+        ov_draw_copy_progress(0, 1);
+        r = fav_add(p, ov_draw_copy_progress);
+    }
+
+    if (r == FAV_OK) {
+        g_ov_fav = was_on ? FAVBTN_OFF : FAVBTN_ON;
+    } else if (r == FAV_ERR_NODIR) {
+        /* 資料夾要在電腦上建，韌體不做 f_mkdir（理由見 favorites.h）。
+         * 這是使用者可以自己解決的情況，所以講清楚該做什麼、也留久一點。 */
+        ov_draw_note("請先在電腦建立「我的最愛」資料夾", COL_TEXT);
+        nap(2500);
+    } else {
+        ov_draw_note(was_on ? "移出最愛失敗" : "加入最愛失敗", COL_HEART);
+        nap(1500);
+    }
+
+    ov_refresh_fav();
+    ov_draw_bar(g_ov_index);        /* 把進度條／訊息蓋回張數顯示 */
+}
+
 /* 回傳動作代碼；-1 = 疊加層以外（＝繼續播放）。
  * 「暫停」那顆只是指示，點它跟點空白處一樣。 */
 static int ctl_hit(int x, int y)
@@ -1673,6 +1851,12 @@ static int ctl_hit(int x, int y)
         }
         if (x >= OV_ORIENT_X && x < OV_ORIENT_X + OV_PILL_W) {
             return PAUSE_ROTATE;
+        }
+        /* 不可按的時候當成沒點到，讓它落到「整片畫面」那條去 —— 使用者
+         * 會看到繼續播放而不是一顆沒反應的按鈕。 */
+        if (g_ov_fav != FAVBTN_LOCKED &&
+            x >= OV_FAV_X && x < OV_FAV_X + OV_PILL_W) {
+            return PAUSE_FAV;
         }
     }
     if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
@@ -1784,6 +1968,19 @@ static int paused_loop_inner(void)
             int hit = g_dbg_inject;
 
             g_dbg_inject = -1;
+            /* 收藏要走跟觸控**同一條**路：就地做完、留在暫停。
+             * 直接 return 的話會掉到下面翻頁的預設值去（dir 算出 +1），
+             * 症狀是「注入 6 卻換了一張照片」。
+             *
+             * 疊加層可能已經自己收起來了，而進度條畫在它備份過的橫帶上，
+             * 所以先確保它蓋著（ov_show 本身是冪等的）。 */
+            if (hit == PAUSE_FAV) {
+                ov_show();
+                fav_toggle_current();
+                ov_until          = HAL_GetTick() + OV_MS;
+                g_dbg_last_action = hit;
+                continue;
+            }
             if (hit != PAUSE_ROTATE) {
                 g_paused = 0u;
             }
@@ -1866,6 +2063,19 @@ static int paused_loop_inner(void)
                 g_seek_target     = tgt;
                 g_dbg_last_action = PAUSE_SEEK;
                 return PAUSE_SEEK;
+            }
+
+            /* 收藏就地處理，不離開這個迴圈 —— 疊加層必須維持蓋著，
+             * 進度條才畫得進已備份的橫帶（board-notes 18.6）。
+             * 而且使用者當場就看到愛心變實心，不必等重畫。 */
+            if (hit == PAUSE_FAV) {
+                fav_toggle_current();
+                ov_until = HAL_GetTick() + OV_MS;
+                /* 手指還在螢幕上的話，下一圈會把同一次觸碰再算一次 ——
+                 * 症狀是「按一下卻收藏又取消」（board-notes 18.1 那個
+                 * 一次觸碰被吃兩次的家族）。 */
+                wait_release();
+                continue;
             }
 
             if (hit >= 0) {
@@ -1983,6 +2193,20 @@ static int pause_session(int32_t *cur)
 
         /* 疊加層的拉桿要顯示目前是第幾張。 */
         g_ov_index = (uint32_t)((*cur < 0) ? 0 : *cur);
+
+        /* 愛心的狀態要在畫疊加層之前算好（f_stat 一次，很便宜）。
+         * 正在看的就是最愛資料夾裡那份副本時鎖起來 —— 刪掉它就沒有
+         * 來源可以復原了。 */
+        {
+            const char *p = cur_photo_path();
+
+            if (p == NULL || fav_source_is_in_folder(p)) {
+                g_ov_fav = FAVBTN_LOCKED;
+            } else {
+                g_ov_fav = fav_exists(p) ? FAVBTN_ON : FAVBTN_OFF;
+            }
+        }
+
         a = paused_loop();
         int dir;
         uint32_t target, tries;
@@ -2144,6 +2368,10 @@ static bool mount_and_scan(void)
         return false;
     }
 
+    /* 掛好了才知道 FATFS 物件是活的。最愛的寫入要靠重新掛載切換讀寫，
+     * 所以它得拿到同一個 g_fs 與磁碟機字串。 */
+    fav_init(&g_fs, g_drive);
+
     g_stage = 4;
     strncpy(g_scan_path, g_drive, SCAN_PATH_LEN - 1U);
     g_scan_path[SCAN_PATH_LEN - 1U] = 0;
@@ -2302,6 +2530,12 @@ void album_run(void)
     }
 
     watchdog_start();
+
+    /* 磁碟層等卡片的迴圈最長會佔住好幾秒（寫入逾時是 2 秒、還會重試），
+     * 而看門狗只有 16 秒。第一版沒接這條，卡片一拒絕寫入就被重開，
+     * 開機看到 IWDGRST 又停在「請拔出記憶卡再重新插入」—— 使用者看到的
+     * 是「加入最愛失敗，然後連播放跟返回都不行」。 */
+    sd_bsp_set_keepalive(watchdog_feed);
 
     g_stage = 3;
     show_message("讀取記憶卡", "載入中");
