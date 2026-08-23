@@ -38,6 +38,24 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+
+# 讀回來比對一定要繞過作業系統的快取，否則**讀到的是 RAM 不是卡片**。
+# 這個 bug 我自己踩過：一張讀取只有 23 MB/s 的卡，驗證階段卻跑出 139 MB/s ——
+# 3GB 全部命中快取，等於什麼都沒驗到。假容量卡會直接騙過去。
+#
+# .NET 的 FileStream 沒有安全的方式開 FILE_FLAG_NO_BUFFERING（緩衝區必須
+# 對齊磁區，而 byte[] 不保證），所以直接叫 Win32。
+if (-not ('Native.IO' -as [type])) {
+Add-Type -Namespace Native -Name IO -MemberDefinition @'
+[DllImport("kernel32.dll", SetLastError=true, CharSet=CharSet.Unicode)]
+public static extern IntPtr CreateFileW(string p, uint access, uint share, IntPtr sec,
+                                        uint disp, uint flags, IntPtr tmpl);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool ReadFile(IntPtr h, IntPtr buf, uint n, out uint got, IntPtr ov);
+[DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool CloseHandle(IntPtr h);
+'@
+}
 $blk  = 4MB
 $fail = @()
 
@@ -104,34 +122,49 @@ if (-not (Vol)) {
 }
 
 if ($fail.Count -eq 0) {
-    Write-Host "[3/3] 讀回來逐位元組比對..." -ForegroundColor Cyan
+    Write-Host "[3/3] 讀回來逐位元組比對（繞過快取）..." -ForegroundColor Cyan
+
+    # PowerShell 會把 0x80000000 當成有號 Int32（=-2147483648），轉不成 UInt32，
+    # 所以直接寫十進位的無號值。
+    $GENERIC_READ           = [uint32]2147483648   # 0x80000000
+    $FILE_SHARE_READ        = [uint32]1
+    $OPEN_EXISTING          = [uint32]3
+    $FILE_FLAG_NO_BUFFERING = [uint32]536870912    # 0x20000000
+
+    # 緩衝區要對齊磁區，所以多配一頁再自己對齊到 4096
+    $raw = [Runtime.InteropServices.Marshal]::AllocHGlobal($blk + 4096)
+    $al  = [IntPtr]((([int64]$raw) + 4095) -band (-4096))
     $chk = New-Object byte[] $blk
-    $sw2 = [Diagnostics.Stopwatch]::StartNew()
-    $read = 0L
-    try {
-        $fs = [IO.File]::OpenRead($path)
+    $h   = [Native.IO]::CreateFileW($path, $GENERIC_READ, $FILE_SHARE_READ,
+                                    [IntPtr]::Zero, $OPEN_EXISTING,
+                                    $FILE_FLAG_NO_BUFFERING, [IntPtr]::Zero)
+    if ($h -eq [IntPtr](-1)) {
+        $fail += "無法以不快取模式開檔（Win32 錯誤 {0}）" -f [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+    } else {
+        $sw2 = [Diagnostics.Stopwatch]::StartNew()
+        $read = 0L
         for ($i = 0; $i -lt $n; $i++) {
             $got = 0
-            while ($got -lt $blk) {
-                $k = $fs.Read($chk, $got, $blk - $got)
-                if ($k -le 0) { break }
-                $got += $k
+            if (-not [Native.IO]::ReadFile($h, $al, [uint32]$blk, [ref]$got, [IntPtr]::Zero)) {
+                $fail += "讀取在 {0:N2} GB 處失敗（Win32 錯誤 {1}）" -f ($read/1GB), [Runtime.InteropServices.Marshal]::GetLastWin32Error()
+                break
             }
             if ($got -ne $blk) { $fail += "第 $i 塊讀不完整"; break }
+            [Runtime.InteropServices.Marshal]::Copy($al, $chk, 0, $blk)
             [BitConverter]::GetBytes([int]$i).CopyTo($buf, 0)
-            if ([Linq.Enumerable]::SequenceEqual([byte[]]$chk, [byte[]]$buf) -eq $false) {
-                $fail += "第 $i 塊內容對不上（位移 {0:N2} GB）—— 可能是假容量卡或壞區塊" -f ($i*$blk/1GB)
+            if (-not [Linq.Enumerable]::SequenceEqual([byte[]]$chk, [byte[]]$buf)) {
+                $fail += "第 {0} 塊內容對不上（位移 {1:N2} GB）—— 可能是假容量卡或壞區塊" -f $i, ($i*$blk/1GB)
                 break
             }
             $read += $blk
         }
-        $fs.Close()
-    } catch {
-        $fail += "讀取在 {0:N2} GB 處失敗：{1}" -f ($read/1GB), $_.Exception.Message
-        try { $fs.Close() } catch { }
+        [void][Native.IO]::CloseHandle($h)
+        $sw2.Stop()
+        $rsec = [Math]::Max($sw2.Elapsed.TotalSeconds, 0.001)
+        Write-Host ("   讀取 {0:N2} GB，{1:N1} 秒，{2:N1} MB/s（未經快取，這才是卡片的真實速度）" -f `
+            ($read/1GB), $sw2.Elapsed.TotalSeconds, ($read/1MB/$rsec))
     }
-    $sw2.Stop()
-    Write-Host ("   讀取 {0:N2} GB，{1:N1} 秒，{2:N1} MB/s" -f ($read/1GB), $sw2.Elapsed.TotalSeconds, ($read/1MB/[Math]::Max($sw2.Elapsed.TotalSeconds,0.001)))
+    [Runtime.InteropServices.Marshal]::FreeHGlobal($raw)
 } else {
     Write-Host "[3/3] 略過讀取比對（前面已經失敗）" -ForegroundColor Yellow
 }
