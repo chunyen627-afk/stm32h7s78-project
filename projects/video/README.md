@@ -3,6 +3,26 @@
 **狀態：可以播。** 影格來源支援 SD 卡與外部 Flash 兩條路，開機自動判斷。
 實測 800x480 @ 24fps、0 解碼失敗、0 個跟不上的影格。
 
+## 轉檔工具
+
+```bash
+python tools/mp4pack.py 影片.mp4                  # 輸出 影片.bin，方向自動
+python tools/mp4pack.py 影片.mp4 --preview        # 只產生三張 800x480 預覽圖看方向
+python tools/mp4pack.py 影片.mkv --rotate 180     # 來源上下顛倒時
+python tools/mp4pack.py --help
+```
+
+**輸入吃 ffmpeg 讀得懂的任何格式** —— mp4 / mkv / avi / mov / webm / wmv /
+flv / ts / gif，或一個裝滿 JPEG 的資料夾。
+
+轉向：`auto`（預設，直式自動轉橫式）／`none` ／ `cw` ／ `ccw` ／ `180`，
+另有 `--flip`（上下鏡像）與 `--mirror`（左右鏡像）。
+
+**先 `--preview` 再轉整片。** 預覽幾秒就好，轉一部五分鐘的片要好幾分鐘、
+輸出可能上百 MB —— 沒必要轉完才發現躺反了。
+
+使用者桌面上有一份複本（`video2bin.py`）與兩個拖放用的批次檔。
+
 ## 為什麼是 MJPEG（不是 H.264）
 
 這顆的編解碼週邊只有 **JPEG**（`dcmipp` 是相機輸入、`gpu2d`/`dma2d`/`ltdc` 是繪圖），
