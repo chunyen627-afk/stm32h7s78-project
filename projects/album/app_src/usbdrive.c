@@ -1,13 +1,18 @@
-/* 狀態：**尚未完成，刻意不編進韌體**（patch_project.py 沒有登記這個檔案）。
+/* 狀態：**可用**（2026-08-24 實測）。插上 USB1 自動變隨身碟、拔線自動回相簿。
  *
- * 保留下來是為了裡面記的那些踩坑過程 —— 相簿自己跳過去為什麼不行、
- * 從 bootloader 跳又碰到什麼。要接手這個功能的人先讀完這裡，
- * 可以省下我今天花掉的那些燒錄循環。
+ * 這個檔案只負責「留暗號 + 重置」。真正的跳轉在相簿的 main() 第一行
+ * （cube 的 Templates/Album/Appli/Src/main.c，由 patch_project.py 植入）。
  *
- * 真正的根因見 docs 與 boot 的 SystemClock_Config：隨身碟 app 沒有自己的
- * 時脈設定，而相簿的 bootloader 只開 HSI，USB HS 的 PHY 需要 HSE。
- * 補開 HSE 之後 RCC->CR 的 HSEON/HSERDY 確實亮了，但仍未列舉 ——
- * 兩顆 bootloader 的 PLL 樹整組不同（HSI 對 HSE），還有別的差異沒查完。
+ * 讓這件事成立的兩個根因，都不在這個檔案裡，找了很久：
+ *
+ * 1. **HSE**。MSC_Standalone 沒有自己的 SystemClock_Config，時脈全靠
+ *    bootloader；它原廠的走 HSE，相簿的只開 HSI —— 而 USB HS 的 PHY 需要
+ *    RCC_USBPHYCCLKSOURCE_HSE。已在相簿 bootloader 補開 HSE，PLL 來源
+ *    仍是 HSI，所以相簿的時序完全不變。
+ *
+ * 2. **快取一致性**。usbd_storage_if.c 的 SD 讀寫沒有快取維護。症狀是磁碟
+ *    列舉正常、容量正確、MBR 也讀得出來（第一次讀時快取是冷的），
+ *    但檔案系統掛不上。讀後 InvalidateDCache、寫前 CleanDCache 就好了。
  */
 #include "usbdrive.h"
 #include "vbus.h"
