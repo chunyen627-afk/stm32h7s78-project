@@ -92,6 +92,14 @@ void vbus_init(void)
     if (HAL_ADCEx_Calibration_Start(&g_adc, ADC_SINGLE_ENDED) != HAL_OK) { g_vbus_initfail = 3u; return; }
     if (HAL_ADC_Start(&g_adc) != HAL_OK) { g_vbus_initfail = 4u; return; }
 
+    /* **等第一次轉換完成再算數。** HAL_ADC_Start 只是把轉換啟動起來，資料
+     * 暫存器在第一次轉換完成前是 0 —— 緊接著讀會得到「沒插線」的假答案。
+     *
+     * 這個坑的後果不是讀錯一次而已：開機時 usbdrive_dispatch() 讀到假的 0
+     * 就不跳，相簿跑起來後才讀到真的 5V 又要求切換 -> 重置 -> 再讀到假的 0，
+     * 變成無限重置迴圈。實際踩過。 */
+    (void)HAL_ADC_PollForConversion(&g_adc, 10u);
+
     g_ready = true;
 }
 
@@ -108,6 +116,19 @@ uint32_t vbus_mv(void)
     g_vbus_raw     = raw;
     g_vbus_last_mv = vadc * (VBUS_RA + VBUS_RB) / VBUS_RB;
     return g_vbus_last_mv;
+}
+
+void vbus_deinit(void)
+{
+    if (!g_ready) { return; }
+
+    (void)HAL_ADC_Stop(&g_adc);
+    (void)HAL_ADC_DeInit(&g_adc);
+    __HAL_RCC_ADC12_FORCE_RESET();
+    __HAL_RCC_ADC12_RELEASE_RESET();
+    __HAL_RCC_ADC12_CLK_DISABLE();
+
+    g_ready = false;
 }
 
 bool vbus_present(void)

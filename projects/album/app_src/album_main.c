@@ -385,16 +385,21 @@ static void watchdog_start(void)
 }
 
 /* 所有可能久留的迴圈裡都要餵，否則會被誤判成當機而重置。 */
+volatile uint32_t g_usb_pending;   /* VBUS 出現了，等安全點再切換 */
+
 static void watchdog_feed(void)
 {
     if (g_wdt_on) {
         (void)HAL_IWDG_Refresh(&g_iwdg);
     }
 
-    /* 順便更新 VBUS。這裡只是讀一個暫存器（連續轉換模式一直在跑），
+    /* 順便偵測 USB 線插上沒。這裡只是讀一個暫存器（連續轉換模式一直在跑），
      * 而 watchdog_feed 本來就是全域最常被呼叫的地方 —— 不必另外找地方輪詢。
-     * 目前只記錄數值，還沒有拿它做模式切換。 */
-    (void)vbus_mv();
+     *
+     * **這裡只舉旗，不切換。** watchdog_feed 會從很深的地方被呼叫，包含
+     * 正在寫「我的最愛」的當下 —— 在那裡重置會把清單檔寫壞。真正的切換
+     * 放在主迴圈頂端，那裡保證不在寫卡。 */
+    g_usb_pending = vbus_present() ? 1u : 0u;   /* 跟著 VBUS 走，不要單向鎖住 */
 }
 
 static bool sd_present(void)
@@ -2365,6 +2370,7 @@ static void slideshow(void)
         uint32_t t0;
 
         watchdog_feed();
+
         if (!sd_present() || g_card_sick || !wait_screen_on()) {
             return;
         }
