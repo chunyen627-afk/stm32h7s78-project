@@ -1,27 +1,39 @@
 /**
- * 把 PSRAM（XSPI1）的介面時脈減半：200MHz -> 100MHz。
+ * PSRAM（XSPI1）介面時脈：滿速 200MHz，或減半成 100MHz。
  *
  * BSP 把時脈設在 APS256xx 的規格上限 200MHz，而時序餘裕會隨 PCB 走線、晶片
- * 批次、溫度而有板子個體差異。這塊板子落在錯誤側，200MHz 下讀取會偶發單一
- * 位元錯誤 —— 實測整片 16MB 掃描有 0 個乾淨區塊、一百多萬個字出錯，降到
- * 100MHz 之後是 256/256 全乾淨、零錯誤。
+ * 批次、溫度而有板子個體差異 —— **這是板子的個體差異，不是型號的通性**。
  *
- * 對相簿的殺傷力特別大，因為 PSRAM 裡放的東西全都怕錯一個位元：
- *   - 播放清單的路徑字串 -> 檔名錯一個位元組就 FR_NO_PATH，照片開不起來
- *   - 解碼後的影像       -> 畫面出現雜點
- *   - framebuffer        -> LTDC 每秒讀 60 次，錯誤位元變成閃爍的像素
+ * 第一塊板子落在錯誤側：200MHz 下整片 16MB 掃描有 0 個乾淨區塊、一百多萬個
+ * 字出錯，降到 100MHz 之後是 256/256 全乾淨、零錯誤（board-notes 10）。
+ *
+ * 代價是格率差一倍：100MHz 只有 30.4 fps，200MHz 是 60.8 fps —— 60 就是面板
+ * 上限（board-notes 19）。瓶頸在 DMA2D 的轉色，不在 LTDC。
+ *
+ * 換板子時要自己確認撐不撐得住，撐不住的症狀是：
+ *   - framebuffer 壞位元 -> 畫面出現閃爍的細線，**畫面靜止也照閃**
+ *   - 路徑字串壞位元     -> FR_NO_PATH，照片開不起來
+ *   - 解碼後的影像壞位元 -> 畫面出現雜點
+ * 要確定的話照 board-notes 10.4 掃整片：測試區設 non-cacheable，
+ * 而且一定要有內部 SRAM 的對照組。
+ *
+ * 有上述症狀就把 PSRAM_HALF_CLOCK 改成 1。
  *
  * MX_XSPI_RAM_Init 在 BSP 裡是 __weak，這裡定義同名函式就會取代它，
  * 不必改到韌體包內的任何檔案（重跑 setup.sh 也不會被蓋掉）。
  *
- * 內容與 BSP 版相同，只有兩處不同：prescaler 加倍，以及 Refresh 依新的分頻
- * 重算 —— Refresh 是「2us 換算成幾個時脈」，時脈改了不跟著改就會違反 PSRAM
- * 的 tCEM 上限，反而更糟。
+ * 與 BSP 版唯一的差異就是 ClockPrescaler 那一行（逐行比對確認過）。
+ * Refresh 是「2us 換算成幾個時脈」，公式直接從 ClockPrescaler 推導，
+ * 所以會自動跟著分頻走 —— 不要把它拆開來寫死，否則減半時會違反 tCEM 上限，
+ * 反而比不改更糟。
  *
  * 只影響 PSRAM。程式碼在外部 NOR Flash 上（XSPI2），不受影響。
  */
 #include "main.h"
 #include "stm32h7s78_discovery_xspi.h"
+
+/* 0 = 滿速 200MHz（與 BSP 相同），1 = 減半成 100MHz。 */
+#define PSRAM_HALF_CLOCK  0
 
 HAL_StatusTypeDef MX_XSPI_RAM_Init(XSPI_HandleTypeDef *hxspi,
                                    MX_XSPI_InitTypeDef *Init)
@@ -38,8 +50,12 @@ HAL_StatusTypeDef MX_XSPI_RAM_Init(XSPI_HandleTypeDef *hxspi,
     hxspi->Init.ChipSelectHighTimeCycle = 5U;      /* tCPH = 24 ns min */
     hxspi->Init.ClockMode               = HAL_XSPI_CLOCK_MODE_0;
 
+#if PSRAM_HALF_CLOCK
     /* 分頻 = prescaler + 1，所以這樣寫等於時脈減半。 */
     hxspi->Init.ClockPrescaler          = (Init->ClockPrescaler + 1U) * 2U - 1U;
+#else
+    hxspi->Init.ClockPrescaler          = Init->ClockPrescaler;
+#endif
 
     hxspi->Init.SampleShifting          = Init->SampleShifting;
     hxspi->Init.DelayHoldQuarterCycle   = HAL_XSPI_DHQC_DISABLE;
