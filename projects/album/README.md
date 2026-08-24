@@ -461,3 +461,19 @@ tools/       genfont.py（字型產生）、patch_project.py（改 CubeIDE 專�
 方向可在執行期切換，預設直立所以 tetris 行為不變）、
 `xspi_psram.c`（PSRAM 降頻，板子個體差異的補償）。`scripts/build.sh` 會把
 兩邊同步進 CubeIDE 專案。
+
+## 照片放不出來？先用 checkpic 檢查
+
+硬體 JPEG 解碼器**只吃 baseline JPEG**。progressive JPEG 副檔名一樣是
+`.jpg`、電腦上也打得開，但板子解不開 —— 而症狀是**畫面看起來像卡住**
+（相簿在幾十毫秒內一張張失敗，螢幕上沒有東西可換），完全看不出原因。
+
+2026-08-24 使用者丟了一個資料夾進去，66 張裡有 64 張是 progressive。
+
+```bash
+python tools/checkpic.py 資料夾        # 只檢查
+python tools/checkpic.py --fix 資料夾  # 順便轉成 baseline（原地覆蓋）
+```
+
+會一併檢查其他限制：檔案 2MB 上限、寬度 3413、像素總量、CMYK。
+使用者桌面的 `影像轉檔工具\` 有一份複本與拖放用的 `.bat`。
