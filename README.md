@@ -9,6 +9,7 @@
 | [projects/tetris](projects/tetris) | 直立版俄羅斯方塊，繁體中文介面，超任風格觸控手把 |
 | [projects/album](projects/album) | 電子相簿，讀 SD 卡照片輪播（FAT32／exFAT），全觸控操作、我的最愛，也能播 MJPEG 影片 |
 | [projects/video](projects/video) | MJPEG 影片播放與工具鏈：mp4 轉檔、SD 卡／外部 Flash 兩種來源、透過 ST-LINK 寫卡 |
+| [projects/usbdrive](projects/usbdrive) | 隨身碟模式：USB1 插上電腦就把 SD 卡直接掛給電腦，不用拔卡 |
 
 ## 目錄結構
 
@@ -16,6 +17,7 @@
 docs/board-notes.md   板子層級的坑（所有專案共用，遇到問題先翻這裡）
 tools/sd-check.ps1    SD 卡好壞的快速判斷（見下）
 projects/video/tools/video2bin.py   影片轉板子能播的 .bin（含拖放用的 .bat）
+projects/usbdrive/                  隨身碟模式（相簿的第二個 app，燒在 0x71000000）
 shared/               跨專案共用的程式碼
   gfx.c / gfx.h         直立繪圖層（面板 800x480 橫式，轉成 480x800 用）
   xspi_psram.c          PSRAM 降頻（這塊板子的個體差異補償，見下）
