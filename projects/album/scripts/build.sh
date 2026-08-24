@@ -23,6 +23,18 @@ cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$PROJ/Appli/Album/" 2>/dev/null || true
 DEBUG_DIR="$PROJ/STM32CubeIDE/Appli/Debug"
 GCC_BIN="/c/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools.gnu-tools-for-stm32.13.3.rel1.win32_1.0.100.202509120712/tools/bin"
 
+# bootloader 也要建一次。patch_project.py 會在它的 SystemClock_Config 補開
+# HSE，而隨身碟模式需要那個（USB HS 的 PHY 要 HSE）。沒有自建版的話
+# flash.sh --boot 只能燒 Binary/ 底下的預編 hex，那顆沒有 HSE ——
+# 症狀是相簿一切正常、USB 也會切換，但電腦完全看不到磁碟機，毫無錯誤訊息。
+BOOT_ELF="$PROJ/STM32CubeIDE/Boot/Debug/Template_XIP_Boot.elf"
+if [ ! -f "$BOOT_ELF" ] || [ -n "$FORCE_IDE" ]; then
+    echo "==> 建置 bootloader（含 HSE）"
+    BWS=$(cygpath -w "${ALBUM_WS:-C:/STM32CubeIDE/ws_headless_album}" 2>/dev/null || echo "C:/STM32CubeIDE/ws_headless_album")
+    BIMP=$(cygpath -w "$PROJ/STM32CubeIDE/Boot" 2>/dev/null || echo "$PROJ\STM32CubeIDE\Boot")
+    "$IDE" --launcher.suppressErrors -nosplash -application org.eclipse.cdt.managedbuilder.core.headlessbuild -data "$BWS" -import "$BIMP" -build 'Template_XIP_Boot/Debug' 2>&1 | grep -iE "error|Build Finished|Build Failed" || true
+fi
+
 if [ -f "$DEBUG_DIR/makefile" ] && [ -z "$FORCE_IDE" ]; then
     echo "==> 編譯（make）"
     PATH="$GCC_BIN:$PATH" make -C "$DEBUG_DIR" -j8 all 2>&1 |

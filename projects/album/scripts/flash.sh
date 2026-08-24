@@ -26,8 +26,24 @@ ELF="$PROJ/STM32CubeIDE/Appli/Debug/Album_Appli.elf"
 [ -f "$ELF" ] || { echo "找不到 $ELF，請先跑 scripts/build.sh"; exit 1; }
 
 if [ "$1" = "--boot" ]; then
-    echo "==> 燒錄 bootloader 到內部 Flash"
-    "$CLI" -c port=SWD mode=UR -w "$PROJ/Binary/Boot_XIP.hex" -v
+    # **優先燒自己建的那顆，不是 Binary/ 底下的預編 hex。**
+    #
+    # 預編的那顆沒有 patch_project.py 植入的 HSE，而隨身碟模式需要它
+    # （USB HS 的 PHY 要 RCC_USBPHYCCLKSOURCE_HSE）。燒錯的症狀非常難查：
+    # 相簿一切正常、USB 插上去也會切換過去，**但電腦完全看不到磁碟機**，
+    # 而且沒有任何錯誤訊息。實際踩過，浪費了一輪。
+    BOOTELF="$PROJ/STM32CubeIDE/Boot/Debug/Template_XIP_Boot.elf"
+    if [ -f "$BOOTELF" ]; then
+        echo "==> 燒錄 bootloader 到內部 Flash（自建，含 HSE）"
+        "$CLI" -c port=SWD mode=UR -w "$BOOTELF" | grep -iE "error|complete" || true
+    else
+        echo "==> 燒錄 bootloader 到內部 Flash（預編版）"
+        echo "    注意：預編版沒有 HSE，隨身碟模式會不列舉。"
+        echo "    要用隨身碟模式的話，先建一次 Boot 專案："
+        echo "      cd projects/album && FORCE_IDE=1 ./scripts/build.sh   # 產生 Appli"
+        echo "      然後用 CubeIDE headless 建 Template_XIP_Boot/Debug"
+        "$CLI" -c port=SWD mode=UR -w "$PROJ/Binary/Boot_XIP.hex" -v
+    fi
 fi
 
 echo "==> 燒錄相簿到外部 Flash"
