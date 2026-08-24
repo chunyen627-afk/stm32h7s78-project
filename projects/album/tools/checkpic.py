@@ -9,9 +9,10 @@
 
 用法：
     python checkpic.py 資料夾或檔案 ...       只檢查
-    python checkpic.py --fix 資料夾 ...        順便把 progressive 轉成 baseline
+    python checkpic.py --fix 資料夾 ...        順便就地修好能修的
 
 --fix 會**原地覆蓋**，轉檔前請確認原檔另有備份。
+它處理 progressive、檔案過大、尺寸過大三種；不是 JPEG 與 CMYK 修不動。
 """
 import argparse
 import os
@@ -87,22 +88,48 @@ def judge(path):
     return True, "", info
 
 
-def to_baseline(path):
-    """原地轉成 baseline。回傳有沒有成功。"""
+def fix_photo(path):
+    """就地修好一張照片，回傳有沒有成功。
+
+    處理三種修得動的問題：
+      - progressive  -> 重存成 baseline
+      - 檔案超過 2MB -> 降品質、必要時縮小，直到過關
+      - 尺寸超限     -> 縮小
+
+    **縮小幾乎沒有代價**：面板只有 800x480，一張 12MP 的手機照片在上面用不到
+    那些細節。長邊限 2048 已經遠超過顯示所需（相簿還會再縮一次），
+    但能讓檔案大小掉一個量級。
+    """
     try:
         from PIL import Image
     except ImportError:
         print("  !! 需要 Pillow 才能轉檔：pip install pillow")
         return False
 
+    LONG_EDGE = 2048
+
     try:
         im = Image.open(path)
+        im.load()
         if im.mode not in ("RGB", "L"):
             im = im.convert("RGB")
-        # progressive=False 就是 baseline。quality 95 對已經壓過的圖夠用，
-        # 再高只會讓檔案變大而看不出差別。
-        im.save(path, "JPEG", quality=95, progressive=False, optimize=True)
-        return True
+
+        # 先把過大的尺寸壓下來（同時解決寬度與像素總量兩個限制）
+        w, h = im.size
+        if max(w, h) > LONG_EDGE or w > MAX_WIDTH or w * h > MAX_PIXELS:
+            scale = min(LONG_EDGE / float(max(w, h)),
+                        MAX_WIDTH / float(w),
+                        (MAX_PIXELS / float(w * h)) ** 0.5,
+                        1.0)
+            im = im.resize((max(1, int(w * scale)), max(1, int(h * scale))),
+                           Image.LANCZOS)
+
+        # 再降品質直到檔案過關。95 對已經壓過的圖夠用；真的太大才往下調。
+        for q in (95, 90, 85, 80, 75, 70):
+            im.save(path, "JPEG", quality=q, progressive=False, optimize=True)
+            if os.path.getsize(path) <= MAX_FILE_BYTES:
+                return True
+        return os.path.getsize(path) <= MAX_FILE_BYTES
     except Exception as e:
         print("  !! 轉檔失敗：%s" % e)
         return False
@@ -126,7 +153,7 @@ def main():
         description="檢查照片能不能在電子相簿上播")
     ap.add_argument("src", nargs="*", help="資料夾或檔案")
     ap.add_argument("--fix", action="store_true",
-                    help="把 progressive 轉成 baseline（原地覆蓋）")
+                    help="就地修好能修的（progressive、太大、尺寸超限）")
     args = ap.parse_args()
 
     if not args.src:
@@ -171,23 +198,29 @@ def main():
 
     if not args.fix:
         print()
-        print("加上 --fix 可以把 progressive 的自動轉成 baseline（原地覆蓋）。")
-        print("其他原因（太大、CMYK、不是 JPEG）要自己處理。")
+        print("加上 --fix 可以就地修好 progressive、檔案太大、尺寸超限這三種。")
+        print("（原地覆蓋，先備份原檔。不是 JPEG 與 CMYK 修不動。）")
         return 1
 
     print()
     print("開始轉檔…")
+    fixable = [(p, w) for p, w, _i in bad if "不是 JPEG" not in w and "CMYK" not in w]
+    skipped = len(bad) - len(fixable)
+
     fixed = 0
-    for p, why, _info in bad:
-        if "progressive" not in why and "extended" not in why:
-            continue          # 只有這兩種轉得動
-        if to_baseline(p):
+    for p, _why in fixable:
+        if fix_photo(p):
             fixed += 1
 
     print("轉好 %d 張。" % fixed)
-    still = sum(1 for p in files if not judge(p)[0])
+    if skipped:
+        print("跳過 %d 張（不是 JPEG 或 CMYK，這兩種修不動）。" % skipped)
+
+    still = [p for p in files if not judge(p)[0]]
     if still:
-        print("還有 %d 張仍然播不了（原因不是 progressive）。" % still)
+        print("還有 %d 張仍然播不了：" % len(still))
+        for p in still[:5]:
+            print("  %s  %s" % (os.path.basename(p), judge(p)[1]))
     return 0
 
 
