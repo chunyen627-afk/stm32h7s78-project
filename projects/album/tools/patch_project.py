@@ -29,7 +29,8 @@ SRC = "PARENT-2-PROJECT_LOC"
 
 # 沒有這些模組，BSP 的 LCD/觸控/PSRAM/SD 都編不過。
 HAL_MODULES = ["LTDC", "I2C", "DMA2D", "XSPI", "LPTIM", "SDRAM",
-               "GFXTIM", "RAMCFG", "MDF", "CRC", "SD", "JPEG", "IWDG"]
+               "GFXTIM", "RAMCFG", "MDF", "CRC", "SD", "JPEG", "IWDG",
+               "ADC"]   # ADC 只為了量 VBUS（偵測 USB 線插上沒），見 vbus.c
 
 HAL_SOURCES = [
     "stm32h7rsxx_hal_ltdc.c", "stm32h7rsxx_hal_ltdc_ex.c",
@@ -42,6 +43,8 @@ HAL_SOURCES = [
     "stm32h7rsxx_hal_iwdg.c",
     # 影片用 JPEG 硬體解碼的 DMA 模式（HPDMA），照片的輪詢解碼不需要。
     "stm32h7rsxx_hal_dma.c", "stm32h7rsxx_hal_dma_ex.c",
+    # 量 CN18 的 VBUS 用（ADC2 通道 6），校正程序在 _ex 裡。
+    "stm32h7rsxx_hal_adc.c", "stm32h7rsxx_hal_adc_ex.c",
 ]
 
 BSP_SOURCES = [
@@ -71,6 +74,7 @@ FATFS_SOURCES = [
 APP_SOURCES = []
 
 ALBUM_SOURCES = ["album_main.c", "photo.c", "video.c", "favorites.c",
+                 "vbus.c",
                  "sd_bsp_diskio.c", "xspi_psram.c",
                  "gfx.c", "font_zh.c"]   # gfx/xspi_psram 來自 repo 的 shared/
 

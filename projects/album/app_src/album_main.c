@@ -22,6 +22,7 @@
 #include "photo.h"
 #include "video.h"
 #include "favorites.h"
+#include "vbus.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -389,6 +390,11 @@ static void watchdog_feed(void)
     if (g_wdt_on) {
         (void)HAL_IWDG_Refresh(&g_iwdg);
     }
+
+    /* 順便更新 VBUS。這裡只是讀一個暫存器（連續轉換模式一直在跑），
+     * 而 watchdog_feed 本來就是全域最常被呼叫的地方 —— 不必另外找地方輪詢。
+     * 目前只記錄數值，還沒有拿它做模式切換。 */
+    (void)vbus_mv();
 }
 
 static bool sd_present(void)
@@ -2637,6 +2643,10 @@ void album_run(void)
     /* 開啟週期計數器，rnd_mix() 拿它當高解析度的熵來源。 */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
+
+    /* 量 CN18 的 VBUS，用來判斷 USB 線插到電腦了沒（見 vbus.c）。
+     * 失敗不影響相簿：vbus_mv() 之後一律回 0，就是「永遠沒插線」。 */
+    vbus_init();
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
     /* 上一輪是被看門狗打掉的嗎？旗標要在這裡讀，之後會被清掉。 */
