@@ -221,14 +221,51 @@ def add_includes():
     print(f"  include 路徑新增: {len(missing)}")
 
 
+def patch_boot_hse():
+    """bootloader 的 SystemClock_Config 順便把 HSE 打開。
+
+    PLL 來源仍然是 HSI，所以相簿的時序完全不變 —— 多開 HSE 純粹是為了 USB：
+    USB HS 的 PHY 需要 RCC_USBPHYCCLKSOURCE_HSE，而隨身碟 app
+    （MSC_Standalone）**沒有自己的 SystemClock_Config**，時脈完全繼承
+    bootloader。它原廠的 bootloader 走 HSE 所以沒事，這顆走 HSI，HSE 從頭到尾
+    沒人開 -> PHY 沒有時脈 -> USB 完全不列舉。
+
+    症狀極度誤導：app 跑得好好的、中斷正常、SD 也讀得到，就是電腦看不到裝置。
+    從 app 那邊事後補開沒有用（PLL 已經在跑，HAL 會拒絕），一定要在這裡。
+    """
+    path = os.path.join(PROJ, "Boot", "Src", "main.c")
+    s = io.open(path, encoding="utf-8").read()
+
+    if "RCC_OSCILLATORTYPE_HSE" in s:
+        print("  Boot main.c 已改過")
+        return
+
+    old = ("  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI;\n"
+           "  RCC_OscInitStruct.HSIState = RCC_HSI_ON;\n")
+    if old not in s:
+        print("  !! Boot main.c 找不到振盪器設定，沒有套用 HSE")
+        return
+
+    s = s.replace(old,
+        "  /* HSE 也一起開起來。PLL 來源仍是 HSI，相簿的時序完全不變 ——\n"
+        "   * 多開 HSE 是給 USB 的 PHY 用（見 patch_project.py 的說明）。 */\n"
+        "  RCC_OscInitStruct.OscillatorType = RCC_OSCILLATORTYPE_HSI | RCC_OSCILLATORTYPE_HSE;\n"
+        "  RCC_OscInitStruct.HSIState = RCC_HSI_ON;\n"
+        "  RCC_OscInitStruct.HSEState = RCC_HSE_ON;\n")
+
+    io.open(path, "w", encoding="utf-8").write(s)
+    print("  Boot main.c 已補上 HSE（USB PHY 需要）")
+
+
 def patch_main():
     """把範本的 LED 閃爍主迴圈換成呼叫相簿。"""
     path = os.path.join(PROJ, "Appli", "Src", "main.c")
     s = io.open(path, encoding="utf-8").read()
+    before = s
 
-    if "album_run();" in s:
-        print("  main.c 已改過")
-        return
+    # 不用「已改過就整段跳出」的防護：那樣之後新增的植入永遠套不上去
+    # （加隨身碟跳轉時就踩到）。每個 replace 的樣式在套用後都不再匹配，
+    # 本身就是冪等的。
 
     s = s.replace(
         "/* USER CODE BEGIN Includes */\n\n/* USER CODE END Includes */",
@@ -250,8 +287,59 @@ def patch_main():
         "  /* 交給相簿主迴圈，不會返回。 */\n  album_run();\n"
         "  /* USER CODE END 2 */")
 
+    # 隨身碟模式的跳轉。**一定要是 main() 的第一件事** —— 再往下就會設定 MPU、
+    # 快取與一堆周邊，而隨身碟 app 假設自己是從 bootloader 剛交棒的狀態開始跑。
+    # 放在 album_run() 裡試過，跳轉會成功（VTOR 讀出來就是新位址、中斷也正常）
+    # 但 USB 完全不列舉。
+    s = s.replace(
+        "  /* USER CODE BEGIN 1 */\n  MPU_Config();",
+        "  /* USER CODE BEGIN 1 */\n"
+        "  /* ---- 隨身碟模式：在動任何東西之前先判斷要不要讓位 ------------------\n"
+        "   *\n"
+        "   * 外部 Flash 放兩個 app：0x70000000 相簿、0x71000000 MSC_Standalone。\n"
+        "   * 相簿偵測到 USB 線插上時（見 app_src/usbdrive.c），會在 AXI SRAM 頂端\n"
+        "   * 留下暗號再重置；這裡看到暗號就跳過去。\n"
+        "   *\n"
+        "   * 暗號一次有效（跳之前就清掉），所以隨身碟 app 之後不管是拔線重置還是\n"
+        "   * 當掉重置，下一次開機一定回到相簿，不會卡在隨身碟模式。\n"
+        "   */\n"
+        "  {\n"
+        "    volatile uint32_t *flag = (volatile uint32_t *)0x24071BF0u;\n"
+        "\n"
+        "    if (*flag == 0x55534244u)   /* \"USBD\" */\n"
+        "    {\n"
+        "      uint32_t sp     = *(volatile uint32_t *)0x71000000u;\n"
+        "      uint32_t region = sp & 0xFF000000u;\n"
+        "\n"
+        "      *flag = 0u;\n"
+        "      __DSB();\n"
+        "\n"
+        "      /* 那個位址真的有 app 才跳。沒燒過會讀到 0xFFFFFFFF，照跳直接進\n"
+        "       * HardFault，症狀是「插上 USB 就變磚」。\n"
+        "       * DTCM / AXI SRAM / AHB SRAM 都是合法的堆疊位置 —— 隨身碟 app 的\n"
+        "       * 堆疊在 DTCM(0x20010000)，跟相簿不同，不要只認自己那一種。 */\n"
+        "      if (region == 0x20000000u || region == 0x24000000u || region == 0x30000000u)\n"
+        "      {\n"
+        "        typedef void (*pFunction)(void);\n"
+        "        pFunction jump_to_usb =\n"
+        "            (pFunction)(*(volatile uint32_t *)(0x71000000u + 4u));\n"
+        "\n"
+        "        SCB->VTOR = 0x71000000u;\n"
+        "        __set_MSP(sp);\n"
+        "        jump_to_usb();\n"
+        "      }\n"
+        "    }\n"
+        "  }\n"
+        "  /* -------------------------------------------------------------------- */\n"
+        "\n"
+        "  MPU_Config();")
+
+    if s == before:
+        print("  main.c 已改過")
+        return
+
     io.open(path, "w", encoding="utf-8").write(s)
-    print("  main.c 已接上 album_run()")
+    print("  main.c 已接上 album_run() 與隨身碟跳轉")
 
 
 def main():
@@ -266,6 +354,7 @@ def main():
     add_sources()
     add_includes()
     patch_main()
+    patch_boot_hse()
     return 0
 
 
