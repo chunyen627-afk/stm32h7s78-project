@@ -144,16 +144,77 @@ def patch_cache_maintenance():
     ], "SD 讀寫的快取維護", marker="SCB_InvalidateDCache")
 
 
-def note_no_auto_return():
-    """留個記號說明「拔線不會自動回相簿」是已知且刻意的。
+def patch_auto_return():
+    """拔掉 USB 線就重置回相簿。
 
-    試過三種都不成，細節見 memory 的 h7s78dk-usb-msc-findings：
+    **事件要用 Suspend，條件要用「主機真的讀過資料」。** 這兩件事都是量出來的，
+    不是猜的（2026-08-24，在同一次開機裡記錄所有 PCD 回呼的觸發次數與時間）：
+
+        Disconnect  0 次            <- 這條路是死的，拔線根本不觸發
+        Reset       1 次            <- 列舉時的匯流排重置
+        Suspend     2 次：
+            第 1 次  開機後   182 ms，host_active=0   <- 列舉期
+            第 2 次  開機後 70812 ms，host_active=1   <- 拔線
+
+    所以同一支回呼會收到兩種完全不同的事件，只能靠 host_active 分辨。
+    只看時間（例如「開機十秒後才算數」）是脆的，而且第一版直接無條件重置，
+    結果 app 一啟動就被列舉期那次 Suspend 重置掉 —— 電腦連磁碟機代號都出不來。
+
+    另外兩條走不通的路，別再試：
+      - 主迴圈輪詢 VBUS：拔線後 PD 堆疊把主迴圈卡住（迴圈計數不動、uwTick 照跳）
+      - SysTick 裡讀 ADC：斷線後 ADC 不再轉換，讀到的值沒有意義
+    只有 OTG 中斷這條路在斷線後還活著。
+    """
+    # 1) 主機真的讀過資料才立旗標
+    path = os.path.join(PROJ, "Appli", "Src", "usbd_storage_if.c")
+    _edit(path, [
+        ("/* USER CODE BEGIN PRIVATE_DEFINES */\n"
+         "__IO uint32_t writestatus, readstatus = 0;",
+         "/* USER CODE BEGIN PRIVATE_DEFINES */\n"
+         "__IO uint32_t writestatus, readstatus = 0;\n"
+         "\n"
+         "/* 主機是否真的讀過資料。**這是「列舉完成、磁碟已掛上」的證據**，\n"
+         " * 拔線偵測拿它當閘門 —— 否則列舉過程中的 Suspend 會被誤判成拔線。 */\n"
+         "__IO uint32_t g_msc_host_active = 0;"),
+        ("    ret = USBD_OK;\n"
+         "  }\n"
+         "  return (ret);\n"
+         "  /* USER CODE END 13 */",
+         "    g_msc_host_active = 1u;   /* 主機讀到資料了 */\n"
+         "    ret = USBD_OK;\n"
+         "  }\n"
+         "  return (ret);\n"
+         "  /* USER CODE END 13 */"),
+    ], "主機活躍旗標", marker="g_msc_host_active")
+
+    # 2) Suspend 時若主機曾活躍過就重置
+    path = os.path.join(PROJ, "Appli", "Src", "usbd_conf.c")
+    _edit(path, [
+        ("  /* USER CODE BEGIN HAL_PCD_SuspendCallback_PostTreatment */\n"
+         "\n"
+         "  /* USER CODE END HAL_PCD_SuspendCallback_PostTreatment */",
+         "  /* USER CODE BEGIN HAL_PCD_SuspendCallback_PostTreatment */\n"
+         "  /* 拔掉 USB 線就重置回相簿。條件與事件的選擇見 patch_project.py 的\n"
+         "   * patch_auto_return()，那裡記了實測數據。 */\n"
+         "  {\n"
+         "    extern __IO uint32_t g_msc_host_active;\n"
+         "\n"
+         "    if (g_msc_host_active != 0u)\n"
+         "    {\n"
+         "      NVIC_SystemReset();\n"
+         "    }\n"
+         "  }\n"
+         "  /* USER CODE END HAL_PCD_SuspendCallback_PostTreatment */"),
+    ], "拔線自動回相簿", marker="g_msc_host_active")
+
+
+def _unused_note():
+    """（保留）拔線自動回程的三次失敗嘗試，別再走同樣的路：
       - 主迴圈輪詢 VBUS：拔線後 PD 堆疊把主迴圈卡住
       - SysTick 讀 ADC：斷線後 ADC 不再轉換
-      - USB Suspend 回呼重置：Suspend 在列舉過程中也會觸發，開機就重置
-    使用者決定接受「拔線後按一下 reset」。
+      - Suspend 無條件重置：列舉期也會觸發，變成開機就重置
+    最後成功的做法在 patch_auto_return()。
     """
-    print("  （拔線不會自動回相簿，需按 reset —— 刻意如此，見 tools 的說明）")
 
 
 def main():
@@ -166,7 +227,7 @@ def main():
     patch_link_address()
     patch_media_packet()
     patch_cache_maintenance()
-    note_no_auto_return()
+    patch_auto_return()
     return 0
 
 

@@ -387,6 +387,7 @@ static void watchdog_start(void)
 
 /* 所有可能久留的迴圈裡都要餵，否則會被誤判成當機而重置。 */
 volatile uint32_t g_scan_ms;       /* 掃卡耗時，毫秒 */
+volatile uint32_t g_usb_since;     /* VBUS 從何時開始持續有電 */
 volatile uint32_t g_usb_pending;   /* VBUS 出現了，等安全點再切換 */
 
 bool sd_bsp_write_unlocked(void);   /* 定義在 core/sd_bsp_diskio.c */
@@ -413,8 +414,17 @@ static void watchdog_feed(void)
      *
      * 唯一不能重置的時機是正在寫卡（會把「我的最愛」寫壞）。直接問既有的
      * 寫入鎖，不另外發明一個要同步的旗標。 */
+    /* **要連續一秒讀到才算數。** 原本是讀到一次就切，但切過去是單向的
+     * （隨身碟 app 沒有自動回程），所以任何一次誤判都會黏住 ——
+     * 症狀是「拔掉線按 reset 回不來」。最可能的誤判來源是拔線瞬間
+     * 線材與板子上的電容還殘留著 5V，這時開機就會讀到「有電」。 */
     if (g_usb_pending && !sd_bsp_write_unlocked()) {
-        usbdrive_request_switch();
+        uint32_t now = HAL_GetTick();
+
+        if (g_usb_since == 0u) { g_usb_since = now; }
+        else if ((now - g_usb_since) > 1000u) { usbdrive_request_switch(); }
+    } else {
+        g_usb_since = 0u;
     }
 }
 

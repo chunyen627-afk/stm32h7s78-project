@@ -45,8 +45,21 @@ volatile uint32_t g_usbd_switch_req;   /* 除錯：有沒有要求過切換 */
  * 完全乾淨的狀態下跳過去 —— 隨身碟 app 因此跟「單獨燒進去開機」時
  * 一模一樣，那個情況是實測會動的。
  */
+/* 決定切換的當下留下證據。放在相簿變數區之外，開機的 .bss 清零不會洗掉，
+ * 所以重置後（甚至跳去隨身碟 app 之後）都還讀得到。
+ *   0x24071BE0  當時的 VBUS（mV）
+ *   0x24071BE4  當時的 HAL_GetTick()
+ *   0x24071BE8  切換次數 */
+#define DBG_MV    (*(volatile uint32_t *)0x24071BE0u)
+#define DBG_TICK  (*(volatile uint32_t *)0x24071BE4u)
+#define DBG_CNT   (*(volatile uint32_t *)0x24071BE8u)
+
 void usbdrive_request_switch(void)
 {
+    DBG_MV   = vbus_mv();
+    DBG_TICK = HAL_GetTick();
+    DBG_CNT  = DBG_CNT + 1u;
+
     *USBD_FLAG_ADDR   = USBD_FLAG_MAGIC;
     g_usbd_switch_req = 1u;
 
@@ -54,6 +67,7 @@ void usbdrive_request_switch(void)
      * 所以上面那行很可能只寫進快取。`__DSB()` 只保證指令順序，**不會**把快取
      * 內容推到記憶體 —— 重置後 bootloader 從 SRAM 讀到的會是舊值，暗號等於
      * 沒留。這種 bug 的症狀是「偶爾才切換成功」，最難查。 */
+    SCB_CleanDCache_by_Addr((uint32_t *)0x24071BE0u, 64);
     SCB_CleanDCache_by_Addr((uint32_t *)USBD_FLAG_ADDR, 32);
     __DSB();
 
