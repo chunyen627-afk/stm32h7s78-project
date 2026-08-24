@@ -75,6 +75,7 @@ APP_SOURCES = []
 
 ALBUM_SOURCES = ["album_main.c", "photo.c", "video.c", "favorites.c",
                  "vbus.c",
+                 "usbdrive.c",
                  "sd_bsp_diskio.c", "xspi_psram.c",
                  "gfx.c", "font_zh.c"]   # gfx/xspi_psram 來自 repo 的 shared/
 

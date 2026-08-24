@@ -23,6 +23,7 @@
 #include "video.h"
 #include "favorites.h"
 #include "vbus.h"
+#include "usbdrive.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -2371,6 +2372,10 @@ static void slideshow(void)
 
         watchdog_feed();
 
+        /* USB 線插上了 —— 讓位給隨身碟。這裡是安全點：上一張已經顯示完、
+         * 下一張還沒開始解，也沒有寫卡進行中。 */
+        if (g_usb_pending) { usbdrive_request_switch(); }
+
         if (!sd_present() || g_card_sick || !wait_screen_on()) {
             return;
         }
@@ -2800,6 +2805,9 @@ void album_run(void)
                     first = false;
                     continue;
                 }
+                /* 選單裡也要有一份：使用者可能停在選單而不是在播。 */
+                if (g_usb_pending) { usbdrive_request_switch(); }
+
                 /* 改完 g_dbg_sdclkdiv 之後用這個讓新時脈生效，不必重燒。 */
                 if (g_dbg_cardreinit) {
                     g_dbg_cardreinit = 0;
