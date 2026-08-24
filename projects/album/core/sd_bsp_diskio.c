@@ -115,6 +115,14 @@ void sd_bsp_unlock_write(void)
     g_allow_write = SD_WRITE_MAGIC;
 }
 
+/* 現在是不是正在寫卡。給隨身碟模式判斷「可不可以安全重置」用 ——
+ * 重置在寫「我的最愛」的當下會把清單檔寫壞。
+ * 直接沿用既有的解鎖旗標，不另外發明一個要同步的狀態。 */
+bool sd_bsp_write_unlocked(void)
+{
+    return g_allow_write == SD_WRITE_MAGIC;
+}
+
 void sd_bsp_lock_write(void)
 {
     g_allow_write = 0u;

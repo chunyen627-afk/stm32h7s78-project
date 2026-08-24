@@ -386,7 +386,10 @@ static void watchdog_start(void)
 }
 
 /* 所有可能久留的迴圈裡都要餵，否則會被誤判成當機而重置。 */
+volatile uint32_t g_scan_ms;       /* 掃卡耗時，毫秒 */
 volatile uint32_t g_usb_pending;   /* VBUS 出現了，等安全點再切換 */
+
+bool sd_bsp_write_unlocked(void);   /* 定義在 core/sd_bsp_diskio.c */
 
 static void watchdog_feed(void)
 {
@@ -401,6 +404,18 @@ static void watchdog_feed(void)
      * 正在寫「我的最愛」的當下 —— 在那裡重置會把清單檔寫壞。真正的切換
      * 放在主迴圈頂端，那裡保證不在寫卡。 */
     g_usb_pending = vbus_present() ? 1u : 0u;   /* 跟著 VBUS 走，不要單向鎖住 */
+
+    /* 插上 USB 就讓位給隨身碟（不會返回）。
+     *
+     * **動作放在這裡，不是放在各個迴圈裡。** 先前只在播放迴圈與選單迴圈
+     * 放檢查點，結果相簿停在第三種狀態時就不會切換 —— 一個一個補是打地鼠。
+     * watchdog_feed 是全域最常被呼叫的地方，涵蓋所有狀態。
+     *
+     * 唯一不能重置的時機是正在寫卡（會把「我的最愛」寫壞）。直接問既有的
+     * 寫入鎖，不另外發明一個要同步的旗標。 */
+    if (g_usb_pending && !sd_bsp_write_unlocked()) {
+        usbdrive_request_switch();
+    }
 }
 
 static bool sd_present(void)
@@ -2372,10 +2387,6 @@ static void slideshow(void)
 
         watchdog_feed();
 
-        /* USB 線插上了 —— 讓位給隨身碟。這裡是安全點：上一張已經顯示完、
-         * 下一張還沒開始解，也沒有寫卡進行中。 */
-        if (g_usb_pending) { usbdrive_request_switch(); }
-
         if (!sd_present() || g_card_sick || !wait_screen_on()) {
             return;
         }
@@ -2488,7 +2499,11 @@ static bool mount_and_scan(void)
         }
     }
     g_cur_top = MAX_TOP;
-    scan(0);
+    {   /* 掃描耗時（毫秒）。使用者反映拔線後等太久，先量準再談怎麼改。 */
+        uint32_t t0 = HAL_GetTick();
+        scan(0);
+        g_scan_ms = HAL_GetTick() - t0;
+    }
     watchdog_feed();
 
     /* 測試捲動用：假裝有這麼多資料夾。**只存在記憶體**，不會動到卡片，
@@ -2805,9 +2820,6 @@ void album_run(void)
                     first = false;
                     continue;
                 }
-                /* 選單裡也要有一份：使用者可能停在選單而不是在播。 */
-                if (g_usb_pending) { usbdrive_request_switch(); }
-
                 /* 改完 g_dbg_sdclkdiv 之後用這個讓新時脈生效，不必重燒。 */
                 if (g_dbg_cardreinit) {
                     g_dbg_cardreinit = 0;
