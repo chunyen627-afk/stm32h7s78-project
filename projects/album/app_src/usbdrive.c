@@ -18,13 +18,18 @@
 #include "vbus.h"
 #include "main.h"
 
-/* 跟 bootloader 約定的暗號，放 AXI SRAM 的頂端。
+/* 跟相簿 main() 約定的暗號，放 DTCM。
  *
- * 原本放 BKPSRAM(0x38800000)，但那在這顆晶片上光開時脈不夠 —— 備援網域
- * 還要解除寫入保護，直接存取會讓 bootloader 當在那裡，連相簿都開不起來
- * （VTOR 停在 0x08000000）。AXI SRAM 不需要任何設定，熱重置後內容照樣
- * 留著，而相簿的 .bss 只到約 0x24042000，離這裡很遠。 */
-#define USBD_FLAG_ADDR   ((volatile uint32_t *)0x24071BF0u)
+ * **不能放 AXI SRAM。** 原本放 0x24071BF0，那裡在 bootloader 堆疊頂端
+ * （SP = 0x24072000）下面只有 1040 bytes —— bootloader 跑外部記憶體初始化
+ * 就會把它踩掉。症狀是「有時候回得來、有時候回不來」，查了整晚。
+ * 實測：寫 0xA5A5A5A5 進去、重置，讀回來變成別的值。
+ *
+ * DTCM 是緊耦合記憶體，bootloader 完全不碰（它的堆疊在 AXI SRAM），
+ * 實測寫進去重置後原封不動。**而且 DTCM 不經過快取**，所以也不再需要
+ * SCB_CleanDCache_by_Addr —— 今天那個「寫入卡在快取被 InvalidateDCache
+ * 丟掉」的整類問題一併消失。 */
+#define USBD_FLAG_ADDR   ((volatile uint32_t *)0x20004000u)
 #define USBD_FLAG_MAGIC  0x55534244u   /* "USBD" */
 
 volatile uint32_t g_usbd_switch_req;   /* 除錯：有沒有要求過切換 */
@@ -45,30 +50,15 @@ volatile uint32_t g_usbd_switch_req;   /* 除錯：有沒有要求過切換 */
  * 完全乾淨的狀態下跳過去 —— 隨身碟 app 因此跟「單獨燒進去開機」時
  * 一模一樣，那個情況是實測會動的。
  */
-/* 決定切換的當下留下證據。放在相簿變數區之外，開機的 .bss 清零不會洗掉，
- * 所以重置後（甚至跳去隨身碟 app 之後）都還讀得到。
- *   0x24071BE0  當時的 VBUS（mV）
- *   0x24071BE4  當時的 HAL_GetTick()
- *   0x24071BE8  切換次數 */
-#define DBG_MV    (*(volatile uint32_t *)0x24071BE0u)
-#define DBG_TICK  (*(volatile uint32_t *)0x24071BE4u)
-#define DBG_CNT   (*(volatile uint32_t *)0x24071BE8u)
 
 void usbdrive_request_switch(void)
 {
-    DBG_MV   = vbus_mv();
-    DBG_TICK = HAL_GetTick();
-    DBG_CNT  = DBG_CNT + 1u;
-
     *USBD_FLAG_ADDR   = USBD_FLAG_MAGIC;
     g_usbd_switch_req = 1u;
 
-    /* **一定要把快取寫回去。** 相簿的 D-Cache 是開的，AXI SRAM 又是可快取的，
-     * 所以上面那行很可能只寫進快取。`__DSB()` 只保證指令順序，**不會**把快取
-     * 內容推到記憶體 —— 重置後 bootloader 從 SRAM 讀到的會是舊值，暗號等於
-     * 沒留。這種 bug 的症狀是「偶爾才切換成功」，最難查。 */
-    SCB_CleanDCache_by_Addr((uint32_t *)0x24071BE0u, 64);
-    SCB_CleanDCache_by_Addr((uint32_t *)USBD_FLAG_ADDR, 32);
+    /* DTCM 不經過快取，寫進去就是寫進去了 —— 不必 SCB_CleanDCache_by_Addr。
+     * 放 AXI SRAM 的時候還得防「寫入卡在快取、被隨身碟 app 的
+     * SCB_InvalidateDCache() 丟掉」，換到 DTCM 之後那整類問題就消失了。 */
     __DSB();
 
     NVIC_SystemReset();
