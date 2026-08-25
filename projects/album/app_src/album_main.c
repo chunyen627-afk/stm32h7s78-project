@@ -498,11 +498,9 @@ static void bbox_audio_snapshot(void)
     BBOX[19] = g_dbg_aud_pll;
     BBOX[20] = g_dbg_aud_sel;
     BBOX[21] = g_dbg_aud_play;
-    if (g_dbg_aud_step != 0u) {     /* 這一輪真的跑過音訊才更新 */
-        BBOX[22] = g_dbg_aud_half;
-        BBOX[23] = g_dbg_aud_full;
-        BBOX[24] = g_dbg_aud_err;
-    }
+    BBOX[22] = g_dbg_aud_half;
+    BBOX[23] = g_dbg_aud_full;
+    BBOX[24] = g_dbg_aud_err;
     BBOX[25] = HAL_GetTick();
 
     /* 時脈的現場。音訊唯一動到的全域資源就是時脈樹（PLL3 + SPI6 選源），
@@ -514,16 +512,6 @@ static void bbox_audio_snapshot(void)
     BBOX[34] = RCC->CFGR;
     BBOX[35] = XSPI1->SR;
 
-    /* PSRAM 探針：show_message() 一畫東西就是寫 framebuffer（PSRAM），
-     * 而板子正好掛在那裡。先自己戳一下，把「掛在存取 PSRAM」這件事
-     * 變成可以看見的：停在 0xAA 就代表讀不回來。 */
-    BBOX[36] = 0xAAu;
-    BBOX[37] = *(volatile uint32_t *)0x90000000u;
-    BBOX[36] = 0xBBu;
-    *(volatile uint32_t *)0x90000010u = 0x5A5A1234u;
-    BBOX[36] = 0xCCu;
-    BBOX[38] = *(volatile uint32_t *)0x90000010u;
-    BBOX[36] = 0xDDu;
 }
 
 static void watchdog_start(void)
@@ -558,10 +546,24 @@ static void watchdog_feed(void)
 
     /* 音訊的回呼計數要**持續**更新，不能只在測試當下拍一次快照 ——
      * DMA 有沒有真的在跑，看的就是這兩個數字會不會一直往上跳。
-     * 「聽起來好像有聲音」不可靠，這個可靠。 */
-    BBOX[22] = g_dbg_aud_half;
-    BBOX[23] = g_dbg_aud_full;
-    BBOX[24] = g_dbg_aud_err;
+     * 「聽起來好像有聲音」不可靠，這個可靠。
+     *
+     * **只在這一輪真的跑過音訊時才更新。** 沒跑音訊的那一輪會用 0 把上一輪
+     * 的數字蓋掉，於是「DMA 沒在跑」跟「數字被洗掉」長得一模一樣 ——
+     * 這個量測污染實際害我誤判過一次。 */
+    if (g_dbg_aud_step != 0u) {
+        BBOX[22] = g_dbg_aud_half;
+        BBOX[23] = g_dbg_aud_full;
+        BBOX[24] = g_dbg_aud_err;
+    }
+
+    /* 影片的分項計時也鏡射一份：.bss 一重置就沒了，而唯一連得上的
+     * mode=UR 一定會重置 —— 不鏡射就等於量不到。 */
+    BBOX[120] = g_vdbg_decoded;
+    BBOX[121] = g_vdbg_us_read;
+    BBOX[122] = g_vdbg_us_dec;
+    BBOX[123] = g_vdbg_us_cc;
+    BBOX[124] = g_vdbg_fail;
 
     /* 順便偵測 USB 線插上沒。這裡只是讀一個暫存器（連續轉換模式一直在跑），
      * 而 watchdog_feed 本來就是全域最常被呼叫的地方 —— 不必另外找地方輪詢。
@@ -2793,45 +2795,61 @@ static void wait_for_card(void)
 
 /* 從卡片根目錄找第一個 .wav。**不要寫死檔名** —— 交接文件寫的是
  * MOVIE10.wav，實際掃到的影片卻叫 video1.bin，猜錯就是白跑一輪燒錄。 */
-static bool find_wav(char *out, size_t cap)
+/* 影片的音軌是**同名的 .wav**（`video1.bin` -> `video1.wav`）。
+ *
+ * 用配對而不是「根目錄第一個 .wav」：卡上會有好幾部影片，之後做音畫同步時
+ * 必須確定聲音就是這一部的，抓錯一部的話畫面與聲音從第一秒就對不起來，
+ * 而那個症狀看起來會像「同步演算法寫錯了」。 */
+static bool wav_path_of(const char *video_path, char *out, size_t cap)
 {
-    DIR     dir;
+    size_t n = strlen(video_path);
     FILINFO fno;
-    bool    found = false;
 
-    if (f_opendir(&dir, g_drive) != FR_OK) { return false; }
-    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
-        size_t n = strlen(fno.fname);
+    if (n < 5u || n + 1u > cap) { return false; }
+    memcpy(out, video_path, n + 1u);
 
-        if ((fno.fattrib & AM_DIR) == 0u && n >= 4u &&
-            fno.fname[n - 4] == '.' && (fno.fname[n - 3] | 32) == 'w' &&
-            (fno.fname[n - 2] | 32) == 'a' && (fno.fname[n - 1] | 32) == 'v') {
-            (void)snprintf(out, cap, "%s%s", g_drive, fno.fname);
-            found = true;
-            break;
-        }
-    }
-    (void)f_closedir(&dir);
-    return found;
+    /* 換掉副檔名（.bin -> .wav）。找最後一個點，而且不能跨過目錄分隔符。 */
+    while (n > 0u && out[n - 1u] != '/' && out[n - 1u] != '.') { n--; }
+    if (n == 0u || out[n - 1u] != '.' || n + 3u >= cap) { return false; }
+    out[n] = 'w'; out[n + 1u] = 'a'; out[n + 2u] = 'v'; out[n + 3u] = 0;
+
+    return f_stat(out, &fno) == FR_OK;
 }
 
 /* 第二步的驗證：從卡上串流一整個 WAV。
  *
  * 只驗音訊，不碰影片 —— 一次只加一個沒驗證過的東西（board-notes 第八章）。
  * 欠載次數（g_dbg_wav_under）比「聽起來有沒有卡」可靠得多。 */
-static void wav_test(void)
+/* volume 是 0~100。請求裡帶得進來（0x5A5B00nn），這樣換音量不必重編、
+ * 重燒一輪 —— 音量是要用耳朵判斷的東西，來回會很多次。 */
+static void wav_test(uint32_t volume)
 {
     char path[PATH_MAX];
 
-    if (!find_wav(path, sizeof(path))) {
-        BBOX[112] = 0xE0000001u;   /* 卡上沒有 .wav */
-        show_message("卡上找不到 .wav", 0);
-        HAL_Delay(2000);
-        return;
+    /* 挑**第一部有音軌的影片**，不是第一部影片。卡上大部分影片沒有 .wav，
+     * 寫死第 0 部只會得到「找不到音軌」，而那看起來會像配對邏輯壞掉。 */
+    {
+        uint32_t i;
+        bool     ok = false;
+
+        for (i = 0; i < g_vid_count; i++) {
+            if (wav_path_of(g_vids[i].path, path, sizeof(path))) {
+                BBOX[125] = i;      /* 配到第幾部，之後同步要用同一部 */
+                ok = true;
+                break;
+            }
+        }
+        if (!ok) {
+            BBOX[112] = 0xE0000001u;
+            show_message("找不到影片的音軌", "要有同名的 .wav");
+            HAL_Delay(2000);
+            return;
+        }
     }
     show_message("音訊串流測試", path);
 
-    BBOX[112] = audio_wav_start(path, 90u) ? 1u : 0u;
+    BBOX[112] = audio_wav_start(path, volume) ? 1u : 0u;
+    BBOX[126] = volume;
     BBOX[113] = g_dbg_wav_step;
     BBOX[114] = g_dbg_wav_rate;
     BBOX[115] = g_dbg_wav_fmt;
@@ -3033,6 +3051,16 @@ void album_run(void)
      * 放在這裡是因為顯示與觸控（含 I2C）已經好了，而卡片還沒開始掛 ——
      * 音訊跟卡片是兩件獨立的事，先驗音訊就不必等掃卡。
      * 不寫請求就完全等於不存在（board-notes 16.3 的旗標觸發原則）。 */
+    /* 0x5A5C = 測試音 + 自動播影片（量音訊 DMA 對輪詢解碼的干擾，A 組）
+     * 0x5A5D = 只播影片（B 組對照）。**同一份韌體用旗標切換**，
+     *          重編一版再比會混進別的差異。 */
+    if ((BBOX[16] >> 16) == 0x5A5Cu || (BBOX[16] >> 16) == 0x5A5Du) {
+        g_dbg_autovideo = 1u;
+        BBOX[16] = ((BBOX[16] >> 16) == 0x5A5Du)
+                 ? 0u                                     /* B 組：不播音 */
+                 : (0x5A5A0000u | (BBOX[16] & 0xFFFFu));  /* A 組：接著播測試音 */
+    }
+
     if ((BBOX[16] >> 16) == 0x5A5Au && (BBOX[16] & 0xFFFFu) <= 20000u) {
         uint32_t hz = BBOX[16] & 0xFFFFu;
 
@@ -3170,8 +3198,10 @@ void album_run(void)
                  * 標籤跟測試音分開 —— 這一個需要卡片已經掛好，所以不能在
                  * 開機那條路上做。 */
                 if ((BBOX[16] >> 16) == 0x5A5Bu) {
+                    uint32_t vol = BBOX[16] & 0xFFFFu;
+
                     BBOX[16] = 0u;
-                    wav_test();
+                    wav_test((vol == 0u || vol > 100u) ? 40u : vol);
                     first = false;
                     continue;
                 }
