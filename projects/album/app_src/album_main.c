@@ -24,6 +24,7 @@
 #include "favorites.h"
 #include "vbus.h"
 #include "usbdrive.h"
+#include "audio_out.h"
 
 #include <string.h>
 #include <stdbool.h>
@@ -796,6 +797,7 @@ static void build_order(void)
 static video_info_t g_vids[MAX_VIDEOS];
 static uint32_t     g_vid_count;
 volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
+volatile uint32_t   g_dbg_audiotest;   /* SWD 寫入頻率（Hz）就播測試音 */
 volatile uint32_t   g_dbg_autoplay;    /* SWD 可寫，直接開始放照片 */
 volatile uint32_t   g_dbg_fakedirs;    /* SWD 可寫，測試資料夾清單捲動 */
 volatile uint32_t   g_dbg_fakevids;    /* SWD 可寫，測試影片清單捲動 */
@@ -2884,6 +2886,20 @@ void album_run(void)
                     first = false;
                     continue;
                 }
+                /* 音訊第一步的驗證：SWD 寫 g_dbg_audiotest = 440 就播 A4。
+                 * 只證明 BSP + I2S6 + WM8904 這條鏈路通不通，不碰 SD。 */
+                if (g_dbg_audiotest) {
+                    uint32_t hz = g_dbg_audiotest;
+
+                    g_dbg_audiotest = 0;
+                    show_message("音訊測試", "耳機孔 CN16");
+                    if (audio_init(48000u, 40u)) {
+                        (void)audio_tone(hz);
+                    }
+                    first = false;
+                    continue;
+                }
+
                 /* 改完 g_dbg_sdclkdiv 之後用這個讓新時脈生效，不必重燒。 */
                 if (g_dbg_cardreinit) {
                     g_dbg_cardreinit = 0;

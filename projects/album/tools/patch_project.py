@@ -30,7 +30,8 @@ SRC = "PARENT-2-PROJECT_LOC"
 # 沒有這些模組，BSP 的 LCD/觸控/PSRAM/SD 都編不過。
 HAL_MODULES = ["LTDC", "I2C", "DMA2D", "XSPI", "LPTIM", "SDRAM",
                "GFXTIM", "RAMCFG", "MDF", "CRC", "SD", "JPEG", "IWDG",
-               "ADC"]   # ADC 只為了量 VBUS（偵測 USB 線插上沒），見 vbus.c
+               "ADC",   # ADC 只為了量 VBUS（偵測 USB 線插上沒），見 vbus.c
+               "I2S"]   # I2S 給音訊（WM8904 走 I2S6）
 
 HAL_SOURCES = [
     "stm32h7rsxx_hal_ltdc.c", "stm32h7rsxx_hal_ltdc_ex.c",
@@ -45,6 +46,8 @@ HAL_SOURCES = [
     "stm32h7rsxx_hal_dma.c", "stm32h7rsxx_hal_dma_ex.c",
     # 量 CN18 的 VBUS 用（ADC2 通道 6），校正程序在 _ex 裡。
     "stm32h7rsxx_hal_adc.c", "stm32h7rsxx_hal_adc_ex.c",
+    # 音訊：WM8904 掛在 I2S6（SPI6 的 I2S 模式）。
+    "stm32h7rsxx_hal_i2s.c",
 ]
 
 BSP_SOURCES = [
@@ -53,11 +56,13 @@ BSP_SOURCES = [
     "stm32h7s78_discovery_bus.c",
     "stm32h7s78_discovery_xspi.c",
     "stm32h7s78_discovery_sd.c",
+    "stm32h7s78_discovery_audio.c",
 ]
 
 COMPONENTS = [
     "gt911/gt911.c", "gt911/gt911_reg.c",
     "aps256xx/aps256xx.c", "mx66uw1g45g/mx66uw1g45g.c",
+    "wm8904/wm8904.c", "wm8904/wm8904_reg.c",
 ]
 
 # FatFs 中介層。sd_diskio.c 把 FatFs 接到 BSP_SD_*。
@@ -76,6 +81,7 @@ APP_SOURCES = []
 ALBUM_SOURCES = ["album_main.c", "photo.c", "video.c", "favorites.c",
                  "vbus.c",
                  "usbdrive.c",
+                 "audio_out.c",
                  "sd_bsp_diskio.c", "xspi_psram.c",
                  "gfx.c", "font_zh.c"]   # gfx/xspi_psram 來自 repo 的 shared/
 
@@ -89,6 +95,7 @@ INCLUDES = [
     f"{'../' * 7}Drivers/BSP/Components/rk050hr18",
     f"{'../' * 7}Drivers/BSP/Components/aps256xx",
     f"{'../' * 7}Drivers/BSP/Components/mx66uw1g45g",
+    f"{'../' * 7}Drivers/BSP/Components/wm8904",
     f"{'../' * 7}Middlewares/Third_Party/FatFs/source",
     f"{'../' * 7}Middlewares/Third_Party/FatFs/source/drivers/sd",
     f"{'../' * 7}Utilities/Fonts",
