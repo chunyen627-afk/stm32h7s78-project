@@ -344,6 +344,13 @@ bool audio_tone(uint32_t hz)
 static FIL      g_wav;
 static bool     g_wav_open;
 static uint32_t g_wav_left;        /* data 區塊還剩幾 bytes 沒讀 */
+static uint32_t g_wav_data0;       /* data 區塊在檔案裡的起始位移 */
+static uint32_t g_wav_total;       /* data 區塊總長，換算時間用 */
+static bool     g_wav_paused;
+
+/* 48kHz 立體聲 16-bit = 每秒 192000 bytes。所有時間換算都走這個常數，
+ * 不要在各處各寫一次 —— 這種常數散開之後改取樣率就會漏掉一處。 */
+#define WAV_BYTES_PER_SEC   192000u
 
 static volatile uint32_t g_ht_cnt; /* 回呼加的 */
 static volatile uint32_t g_tc_cnt;
@@ -357,6 +364,10 @@ volatile uint32_t g_dbg_wav_fed;   /* 已經餵給 DMA 幾 bytes */
 volatile uint32_t g_dbg_wav_under; /* 補不上的次數（欠載）*/
 volatile uint32_t g_dbg_wav_rderr; /* f_read 失敗次數 */
 volatile uint32_t g_dbg_wav_step;  /* 開檔失敗時停在哪一步 */
+/* 補資料花掉多少時間。**這段不在影片任何一個計時區間裡** —— 影片的分項
+ * 加起來只有 20ms 卻跑不到 24fps，差的就是這裡，所以一定要單獨量。 */
+volatile uint32_t g_dbg_wav_us;    /* 累計的 f_read 耗時（微秒）*/
+volatile uint32_t g_dbg_wav_reads; /* 讀了幾次 */
 
 /* 把某一半補滿。不夠就補靜音（結尾那一段），這樣不會播到上一圈的殘響。 */
 static void wav_fill(uint32_t half)
@@ -366,12 +377,16 @@ static void wav_fill(uint32_t half)
     UINT     got  = 0;
 
     if (want != 0u) {
+        uint32_t c0 = DWT->CYCCNT;
+
         if (f_read(&g_wav, dst, want, &got) != FR_OK) {
             got = 0;
             g_dbg_wav_rderr++;
         }
         g_wav_left      -= got;
         g_dbg_wav_fed   += got;
+        g_dbg_wav_us    += (DWT->CYCCNT - c0) / (SystemCoreClock / 1000000u);
+        g_dbg_wav_reads++;
     }
     if (got < WAV_HALF) {
         memset(dst + got, 0, WAV_HALF - got);
@@ -417,6 +432,8 @@ static bool wav_parse(void)
             }
         } else if (memcmp(ck, "data", 4) == 0) {
             g_wav_left      = len;
+            g_wav_total     = len;
+            g_wav_data0     = (uint32_t)f_tell(&g_wav);
             g_dbg_wav_bytes = len;
             return true;                      /* 檔案指標正好停在資料開頭 */
         } else {
@@ -485,6 +502,53 @@ void audio_wav_pump(void)
     while (g_tc_done != g_tc_cnt) { wav_fill(1u); g_tc_done++; }
 }
 
+/* 目前播到第幾毫秒。
+ *
+ * 用「已經餵給 DMA 的量」減掉「還在緩衝裡沒播出去的量」——
+ * 只算餵進去的會超前一整個緩衝（170ms），拿它來對時就會固定偏一格多。 */
+uint32_t audio_wav_pos_ms(void)
+{
+    uint32_t fed = g_dbg_wav_fed;
+
+    if (fed < AUDIO_BUF_BYTES) { return 0u; }
+    return (uint32_t)(((uint64_t)(fed - AUDIO_BUF_BYTES) * 1000u) /
+                      WAV_BYTES_PER_SEC);
+}
+
+uint32_t audio_wav_len_ms(void)
+{
+    return (uint32_t)(((uint64_t)g_wav_total * 1000u) / WAV_BYTES_PER_SEC);
+}
+
+/* 跳到指定的時間點。拖曳進度條之後聲音要跟著跳，否則畫面對了聲音沒對。 */
+bool audio_wav_seek_ms(uint32_t ms)
+{
+    uint32_t off;
+
+    if (!g_wav_open) { return false; }
+
+    off = (uint32_t)(((uint64_t)ms * WAV_BYTES_PER_SEC) / 1000u);
+    off &= ~3u;                                  /* 對齊到一個取樣框 */
+    if (off > g_wav_total) { off = g_wav_total; }
+
+    if (f_lseek(&g_wav, g_wav_data0 + off) != FR_OK) { return false; }
+    g_wav_left    = g_wav_total - off;
+    g_dbg_wav_fed = off + AUDIO_BUF_BYTES;       /* 讓 pos_ms 跟著跳 */
+
+    /* 兩半都重填，否則會先播出跳之前的殘留（聽起來像「跳完先閃一段舊的」）。*/
+    wav_fill(0u);
+    wav_fill(1u);
+    return true;
+}
+
+void audio_wav_pause(bool on)
+{
+    if (!g_wav_open || on == g_wav_paused) { return; }
+    if (on) { (void)BSP_AUDIO_OUT_Pause(0); }
+    else    { (void)BSP_AUDIO_OUT_Resume(0); }
+    g_wav_paused = on;
+}
+
 bool audio_wav_active(void)
 {
     /* 資料讀完之後還要讓 DMA 把緩衝裡剩下的播完（最多兩個半區）。 */
@@ -500,7 +564,8 @@ void audio_wav_stop(void)
         (void)f_close(&g_wav);
         g_wav_open = false;
     }
-    g_wav_left = 0u;
+    g_wav_left   = 0u;
+    g_wav_paused = false;
 }
 
 void audio_stop(void)

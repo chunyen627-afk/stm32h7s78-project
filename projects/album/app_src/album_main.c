@@ -339,6 +339,13 @@ static bool screen_poll(void);
 static void show_message(const char *line1, const char *line2);
 static void draw_name_clipped(int x, int y, const char *s, int limit,
                               uint16_t color);
+static bool wav_path_of(const char *video_path, char *out, size_t cap);
+static uint32_t autovideo_index(void);
+
+/* 影片的音量（0~100）。之後控制列的 +/- 會改它 —— 先放一個明確的預設值，
+ * 不做記憶體外的設定檔（使用者要的是「每次開機預設值就好」）。
+ * 實測 40 太小聲（-24 dB），60 約 -14 dB。 */
+static uint32_t g_audio_vol = 60u;
 
 /* 觸控座標換成直立座標。
  * gfx 把邏輯 (x,y) 映到實體 offset (GFX_W-1-x)*PHYS_W + y，
@@ -558,12 +565,26 @@ static void watchdog_feed(void)
     }
 
     /* 影片的分項計時也鏡射一份：.bss 一重置就沒了，而唯一連得上的
-     * mode=UR 一定會重置 —— 不鏡射就等於量不到。 */
-    BBOX[120] = g_vdbg_decoded;
-    BBOX[121] = g_vdbg_us_read;
-    BBOX[122] = g_vdbg_us_dec;
-    BBOX[123] = g_vdbg_us_cc;
-    BBOX[124] = g_vdbg_fail;
+     * mode=UR 一定會重置 —— 不鏡射就等於量不到。
+     *
+     * **同樣要擋掉沒播影片的那一輪**，否則它會用 0 把上一輪的數字蓋掉 ——
+     * 這個坑我在音訊那邊已經踩過一次，影片這邊又踩了一次。
+     * 「重置後那一輪會覆寫黑盒子」是這套機制的通病，每加一組欄位都要想。 */
+    if (g_vdbg_decoded != 0u) {
+        BBOX[120] = g_vdbg_decoded;
+        BBOX[121] = g_vdbg_us_read;
+        BBOX[122] = g_vdbg_us_dec;
+        BBOX[123] = g_vdbg_us_cc;
+        BBOX[124] = g_vdbg_fail;
+    }
+    if (g_dbg_wav_step != 0u) {
+        BBOX[132] = g_dbg_wav_fed;      /* 串流了多少 -> 換算得出播了幾秒 */
+        BBOX[133] = g_dbg_wav_under;
+        BBOX[134] = g_dbg_wav_rderr;
+        BBOX[135] = audio_wav_pos_ms();
+        BBOX[138] = g_dbg_wav_us;
+        BBOX[139] = g_dbg_wav_reads;
+    }
 
     /* 順便偵測 USB 線插上沒。這裡只是讀一個暫存器（連續轉換模式一直在跑），
      * 而 watchdog_feed 本來就是全域最常被呼叫的地方 —— 不必另外找地方輪詢。
@@ -1080,6 +1101,20 @@ static void play_video(const video_info_t *v)
         return;
     }
 
+    /* 有同名的 .wav 就一起播。沒有就照舊只放畫面 —— 卡上八部影片只有一部
+     * 有音軌，音訊不該變成播放的前提。 */
+    {
+        char wav[PATH_MAX];
+        bool has = wav_path_of(v->path, wav, sizeof(wav));
+
+        BBOX[136] = HAL_GetTick();   /* 開始播的時刻。沒有它就只能用推的，
+                                      * 而我剛才就推錯了一次。 */
+        BBOX[128] = has ? 1u : 0u;
+        BBOX[129] = has ? (audio_wav_start(wav, g_audio_vol) ? 1u : 0u) : 0xFFu;
+        BBOX[130] = g_dbg_wav_step;
+        BBOX[131] = g_audio_vol;
+    }
+
     /* 疊加層用直立座標畫，跟選單一致 —— 影格本身已經在 PC 上轉成
      * 「直立看正確」的方向，所以兩者的上下左右是同一套。 */
     gfx_set_orientation(false);
@@ -1094,6 +1129,7 @@ static void play_video(const video_info_t *v)
         bool touched;
 
         watchdog_feed();
+        audio_wav_pump();
         if (!sd_present()) {
             break;
         }
@@ -1130,11 +1166,15 @@ static void play_video(const video_info_t *v)
                 if (px > PB_W) { px = PB_W; }
                 idx = (uint32_t)((uint64_t)px * v->count / PB_W);
                 if (idx >= v->count) { idx = v->count - 1u; }
+                /* 聲音也要跳。只跳畫面的話拖完就永遠對不上了。 */
+                (void)audio_wav_seek_ms((uint32_t)((uint64_t)idx * 100000u /
+                                                   (v->fps_x100 ? v->fps_x100 : 2400u)));
                 ov_until = HAL_GetTick() + OV_MS;
                 next_ms  = HAL_GetTick();     /* 跳完重新對時 */
                 acc      = 0;
             } else {
                 paused   = !paused;
+                audio_wav_pause(paused);
                 ov_until = HAL_GetTick() + OV_MS;
                 wait_release();
             }
@@ -1164,15 +1204,41 @@ static void play_video(const video_info_t *v)
             next_ms += 1u;
         }
         if ((int32_t)(next_ms - HAL_GetTick()) > 0) {
-            while ((int32_t)(next_ms - HAL_GetTick()) > 0) { }
+            /* **等待期間一定要繼續補音訊。** 這個忙等一等就是幾十毫秒，
+             * 而緩衝只有 170ms —— 不補的話等個幾格就欠載了。 */
+            while ((int32_t)(next_ms - HAL_GetTick()) > 0) {
+                audio_wav_pump();
+            }
         } else {
             next_ms = HAL_GetTick();          /* 跟不上就重新對時 */
         }
     }
 
+    BBOX[137] = HAL_GetTick();       /* 離開播放的時刻 */
+    audio_wav_stop();
+
     /* **一定要走這裡。** DMA 解碼整合進相簿正式路徑曾經把週邊弄壞
      * （board-notes 16.6），video_close() 會做完整拆除並把解碼器還給照片。 */
     video_close();
+}
+
+/* g_dbg_autovideo 要播哪一部：1 = 第一部；2 = **第一部有音軌的**。
+ *
+ * 抽成函式是因為 g_dbg_autovideo 有**兩個**檢查點（主迴圈與選單），
+ * 而主迴圈那個先跑 —— 只改一處完全沒有效果，症狀卻是「音訊整合失敗」。
+ * 這跟 18.3 那條「畫面上寫著功能、程式裡沒有做」是同一個家族：
+ * 同一件事散在兩個地方，改了一個就以為改完了。 */
+static uint32_t autovideo_index(void)
+{
+    char     wav[PATH_MAX];
+    uint32_t k;
+
+    if (g_dbg_autovideo == 2u) {
+        for (k = 0; k < g_vid_count; k++) {
+            if (wav_path_of(g_vids[k].path, wav, sizeof(wav))) { return k; }
+        }
+    }
+    return 0u;
 }
 
 /* 影片清單。沒有影片時不會走到這裡（選單上的按鈕會是暗的）。 */
@@ -1539,7 +1605,8 @@ static bool select_screen(void)
             return false;               /* 交回主迴圈去跑測試 */
         }
         if (g_dbg_autovideo && g_vid_count > 0u) {
-            play_video(&g_vids[0]);
+            BBOX[127] = autovideo_index();
+            play_video(&g_vids[BBOX[127]]);
             dirty = true;
             continue;
         }
@@ -3055,7 +3122,7 @@ void album_run(void)
      * 0x5A5D = 只播影片（B 組對照）。**同一份韌體用旗標切換**，
      *          重編一版再比會混進別的差異。 */
     if ((BBOX[16] >> 16) == 0x5A5Cu || (BBOX[16] >> 16) == 0x5A5Du) {
-        g_dbg_autovideo = 1u;
+        g_dbg_autovideo = 2u;   /* 挑有音軌的那一部 */
         BBOX[16] = ((BBOX[16] >> 16) == 0x5A5Du)
                  ? 0u                                     /* B 組：不播音 */
                  : (0x5A5A0000u | (BBOX[16] & 0xFFFFu));  /* A 組：接著播測試音 */
@@ -3238,7 +3305,8 @@ void album_run(void)
                  * 影片問題只能靠點螢幕重現，這個旗標讓遠端也追得動。
                  * 不寫就完全等於不存在（board-notes 16.3 的旗標觸發原則）。 */
                 if (g_dbg_autovideo && g_vid_count > 0u) {
-                    play_video(&g_vids[0]);
+                    BBOX[127] = autovideo_index();
+                    play_video(&g_vids[BBOX[127]]);
                     continue;
                 }
                 if (select_screen()) {

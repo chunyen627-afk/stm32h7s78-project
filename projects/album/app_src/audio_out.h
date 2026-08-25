@@ -70,6 +70,10 @@ bool audio_wav_start(const char *path, uint32_t volume);
 void audio_wav_pump(void);
 bool audio_wav_active(void);
 void audio_wav_stop(void);
+void audio_wav_pause(bool on);
+bool audio_wav_seek_ms(uint32_t ms);
+uint32_t audio_wav_pos_ms(void);   /* 已經播出去的毫秒數（扣掉緩衝裡的）*/
+uint32_t audio_wav_len_ms(void);
 
 extern volatile uint32_t g_dbg_wav_rate;   /* 檔頭讀到的取樣率 */
 extern volatile uint32_t g_dbg_wav_fmt;    /* (聲道 << 16) | 位元數 */
@@ -77,6 +81,8 @@ extern volatile uint32_t g_dbg_wav_bytes;  /* data 區塊總長 */
 extern volatile uint32_t g_dbg_wav_fed;    /* 已經餵給 DMA 幾 bytes */
 extern volatile uint32_t g_dbg_wav_under;  /* 補不上的次數（欠載）*/
 extern volatile uint32_t g_dbg_wav_rderr;  /* f_read 失敗次數 */
-extern volatile uint32_t g_dbg_wav_step;   /* 開檔流程走到哪 */
+extern volatile uint32_t g_dbg_wav_step;
+extern volatile uint32_t g_dbg_wav_us;     /* 補資料累計耗時（us）*/
+extern volatile uint32_t g_dbg_wav_reads;  /* 補了幾次 */   /* 開檔流程走到哪 */
 
 #endif /* AUDIO_OUT_H */
