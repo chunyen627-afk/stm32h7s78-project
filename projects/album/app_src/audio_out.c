@@ -568,6 +568,23 @@ void audio_wav_stop(void)
     g_wav_paused = false;
 }
 
+/* 設定音量（0~100）。**0 是真的靜音，不是最小聲。**
+ *
+ * BSP 的換算是 `暫存器 = 音量/2 + 13`，所以傳 0 進去得到的是 -44dB ——
+ * 還聽得見。使用者把音量調到 0 卻還聽得到一點聲音是很糟的體驗，
+ * 所以 0 走 BSP 的靜音（它會下 WM8904 的 DAC_MUTE），其餘才走音量。 */
+void audio_set_volume(uint32_t pct)
+{
+    if (pct > 100u) { pct = 100u; }
+
+    if (pct == 0u) {
+        (void)BSP_AUDIO_OUT_Mute(0);
+    } else {
+        (void)BSP_AUDIO_OUT_UnMute(0);
+        g_dbg_aud_vol = (uint32_t)BSP_AUDIO_OUT_SetVolume(0, (uint8_t)pct);
+    }
+}
+
 void audio_stop(void)
 {
     if (g_ready) {

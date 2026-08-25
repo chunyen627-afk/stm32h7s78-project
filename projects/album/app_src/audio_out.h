@@ -61,6 +61,9 @@ bool audio_tone(uint32_t hz);
 
 void audio_stop(void);
 
+/* 0~100，**0 是真的靜音**（BSP 的 0 只是 -44dB，還聽得見）。 */
+void audio_set_volume(uint32_t pct);
+
 /* 從卡上串流 WAV（48kHz / 16-bit / 立體聲，其他格式直接回 false）。
  *
  * audio_wav_pump() **一定要從主迴圈定期呼叫**，補資料就是它在做 ——

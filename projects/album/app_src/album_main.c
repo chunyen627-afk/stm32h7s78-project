@@ -1041,6 +1041,17 @@ static void scan_videos(void)
 #define BACK_Y       36
 #define BACK_W       120
 #define BACK_H       56
+/* 音量列。放在進度條上方、跟它切齊 —— 使用者叫出控制列之後手指本來就在
+ * 畫面下半部，不必再往上跑。按鈕給 90x64，比返回鈕還大：這是要在
+ * 影片播放中盲按的東西。 */
+#define VOL_Y        608
+#define VOL_H        64
+#define VOL_BTN_W    90
+#define VOL_MINUS_X  PB_X
+#define VOL_PLUS_X   (PB_X + PB_W - VOL_BTN_W)
+#define VOL_STEP     10u
+
+static bool g_vid_has_audio;   /* 這一部有沒有音軌（沒有就不畫音量列）*/
 
 static void draw_time(int x, int y, uint32_t secs, uint16_t col)
 {
@@ -1085,6 +1096,27 @@ static void draw_overlay(const video_info_t *v, uint32_t idx, bool paused)
               COL_TEXT);
     draw_time(PB_X + PB_W - 60, PB_Y + 30,
               (uint32_t)((uint64_t)v->count * 100u / fps100), COL_DIM);
+
+    /* 音量列只在這部片真的有音軌時出現。沒有音軌卻畫一排音量鍵，
+     * 就是 18.3 那條「畫面上寫著功能、程式裡沒有做」的反面 ——
+     * 按了不會有任何事發生，使用者會以為壞了。 */
+    if (g_vid_has_audio) {
+        char buf[24];
+
+        gfx_pill(VOL_MINUS_X, VOL_Y, VOL_BTN_W, VOL_H, COL_PANEL);
+        gfx_text_center(VOL_MINUS_X + VOL_BTN_W / 2, VOL_Y + 20, "－", COL_TEXT);
+
+        gfx_pill(VOL_PLUS_X, VOL_Y, VOL_BTN_W, VOL_H, COL_PANEL);
+        gfx_text_center(VOL_PLUS_X + VOL_BTN_W / 2, VOL_Y + 20, "＋", COL_TEXT);
+
+        if (g_audio_vol == 0u) {
+            (void)snprintf(buf, sizeof(buf), "靜音");
+        } else {
+            (void)snprintf(buf, sizeof(buf), "音量 %u", (unsigned)g_audio_vol);
+        }
+        gfx_text_center(GFX_W / 2, VOL_Y + 20, buf,
+                        (g_audio_vol == 0u) ? COL_DIM : COL_ACCENT);
+    }
 }
 
 /* 播放一部影片，無限循環，直到使用者按返回或卡片被拔掉。 */
@@ -1109,6 +1141,7 @@ static void play_video(const video_info_t *v)
 
         BBOX[136] = HAL_GetTick();   /* 開始播的時刻。沒有它就只能用推的，
                                       * 而我剛才就推錯了一次。 */
+        g_vid_has_audio = has;
         BBOX[128] = has ? 1u : 0u;
         BBOX[129] = has ? (audio_wav_start(wav, g_audio_vol) ? 1u : 0u) : 0xFFu;
         BBOX[130] = g_dbg_wav_step;
@@ -1157,6 +1190,27 @@ static void play_video(const video_info_t *v)
     g_bad_photo_told = false;
     wait_release();
                 break;
+            } else if (g_vid_has_audio &&
+                       y >= VOL_Y && y < VOL_Y + VOL_H &&
+                       ((x >= VOL_MINUS_X && x < VOL_MINUS_X + VOL_BTN_W) ||
+                        (x >= VOL_PLUS_X  && x < VOL_PLUS_X  + VOL_BTN_W))) {
+                /* 音量：按一下調一格。 */
+                if (x < VOL_MINUS_X + VOL_BTN_W) {
+                    g_audio_vol = (g_audio_vol >= VOL_STEP)
+                                ? (g_audio_vol - VOL_STEP) : 0u;
+                } else {
+                    g_audio_vol = (g_audio_vol + VOL_STEP > 100u)
+                                ? 100u : (g_audio_vol + VOL_STEP);
+                }
+                audio_set_volume(g_audio_vol);
+                ov_until = HAL_GetTick() + OV_MS;
+
+                /* **一定要等手指離開**，否則一次點擊會被算成兩次 ——
+                 * 實測就是「點一下跳 20」。原本用 nap(180) 當去抖，
+                 * 但那比一次正常點擊還短（board-notes 18.4 量過約 220ms），
+                 * 手指還在上面就又進了一次判定。
+                 * 這跟 18.1 是同一條：事件要在離開這一輪之前消費掉。 */
+                wait_release();
             } else if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
                 /* 拖曳 seek。位移表讓任何一格都能直接定址，成本跟播下一格
                  * 一模一樣 —— 這是打包成單一檔案順帶換到的好處。 */
@@ -1215,6 +1269,7 @@ static void play_video(const video_info_t *v)
     }
 
     BBOX[137] = HAL_GetTick();       /* 離開播放的時刻 */
+    g_vid_has_audio = false;
     audio_wav_stop();
 
     /* **一定要走這裡。** DMA 解碼整合進相簿正式路徑曾經把週邊弄壞
