@@ -61,4 +61,22 @@ bool audio_tone(uint32_t hz);
 
 void audio_stop(void);
 
+/* 從卡上串流 WAV（48kHz / 16-bit / 立體聲，其他格式直接回 false）。
+ *
+ * audio_wav_pump() **一定要從主迴圈定期呼叫**，補資料就是它在做 ——
+ * 放在回呼裡做會把 SysTick 押後（board-notes 16.13）。
+ * 失敗時停在哪一步看 g_dbg_wav_step。 */
+bool audio_wav_start(const char *path, uint32_t volume);
+void audio_wav_pump(void);
+bool audio_wav_active(void);
+void audio_wav_stop(void);
+
+extern volatile uint32_t g_dbg_wav_rate;   /* 檔頭讀到的取樣率 */
+extern volatile uint32_t g_dbg_wav_fmt;    /* (聲道 << 16) | 位元數 */
+extern volatile uint32_t g_dbg_wav_bytes;  /* data 區塊總長 */
+extern volatile uint32_t g_dbg_wav_fed;    /* 已經餵給 DMA 幾 bytes */
+extern volatile uint32_t g_dbg_wav_under;  /* 補不上的次數（欠載）*/
+extern volatile uint32_t g_dbg_wav_rderr;  /* f_read 失敗次數 */
+extern volatile uint32_t g_dbg_wav_step;   /* 開檔流程走到哪 */
+
 #endif /* AUDIO_OUT_H */

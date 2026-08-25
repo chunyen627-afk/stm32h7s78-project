@@ -21,7 +21,10 @@
 #include "stm32h7s78_discovery_bus.h"   /* WM8904 掛在 I2C1，直接讀它的暫存器 */
 #include "wm8904_reg.h"
 
+#include "ff.h"
+
 #include <math.h>
+#include <string.h>
 
 /* BSP_AUDIO_OUT_Play 的 NbrOfBytes 是 uint16 換算來的，**上限 65535**。
  * 取 32KB：48kHz 立體聲 16-bit 下等於 170ms，夠長到補資料來得及，
@@ -315,6 +318,191 @@ bool audio_tone(uint32_t hz)
     return r == BSP_ERROR_NONE;
 }
 
+/* ------------------------------------------------------------------ */
+/* 從卡上串流 WAV                                                      */
+/* ------------------------------------------------------------------ */
+/**
+ * 做法：把 g_buf 當成一個循環播放的環形緩衝，DMA 一直繞著它跑，
+ * 我們在它「剛播完的那一半」補上新資料。
+ *
+ *   半滿回呼 -> DMA 已經播完**前半** -> 前半可以安全覆寫
+ *   全滿回呼 -> DMA 已經播完**後半** -> 後半可以安全覆寫
+ *
+ * 每半 16KB，48kHz 立體聲 16-bit 下是 85ms，而讀 16KB 只要幾毫秒 ——
+ * 餘裕很大，但還是要量（見 g_dbg_wav_under）。
+ *
+ * **補資料不在回呼裡做。** 讀卡片可能要幾毫秒到幾十毫秒，在中斷裡忙等會把
+ * SysTick 押後、HAL_GetTick() 漏拍，對時與逾時判斷全部失準
+ * （board-notes 16.13 記過這條）。回呼只計次，實際的讀取交給主迴圈的
+ * audio_wav_pump()。
+ *
+ * 計數用「ISR 只加、主迴圈只加」兩個各自單一寫入者的變數，不用旗標 ——
+ * 旗標的 `|=` 與 `&=~` 會互相踩掉（丟更新），而那種 bug 是間歇性的。
+ */
+#define WAV_HALF   (AUDIO_BUF_BYTES / 2u)
+
+static FIL      g_wav;
+static bool     g_wav_open;
+static uint32_t g_wav_left;        /* data 區塊還剩幾 bytes 沒讀 */
+
+static volatile uint32_t g_ht_cnt; /* 回呼加的 */
+static volatile uint32_t g_tc_cnt;
+static uint32_t g_ht_done;         /* 主迴圈加的 */
+static uint32_t g_tc_done;
+
+volatile uint32_t g_dbg_wav_rate;
+volatile uint32_t g_dbg_wav_fmt;   /* (聲道 << 16) | 位元數 */
+volatile uint32_t g_dbg_wav_bytes; /* data 區塊總長 */
+volatile uint32_t g_dbg_wav_fed;   /* 已經餵給 DMA 幾 bytes */
+volatile uint32_t g_dbg_wav_under; /* 補不上的次數（欠載）*/
+volatile uint32_t g_dbg_wav_rderr; /* f_read 失敗次數 */
+volatile uint32_t g_dbg_wav_step;  /* 開檔失敗時停在哪一步 */
+
+/* 把某一半補滿。不夠就補靜音（結尾那一段），這樣不會播到上一圈的殘響。 */
+static void wav_fill(uint32_t half)
+{
+    uint8_t *dst  = (uint8_t *)g_buf + half * WAV_HALF;
+    uint32_t want = (g_wav_left < WAV_HALF) ? g_wav_left : WAV_HALF;
+    UINT     got  = 0;
+
+    if (want != 0u) {
+        if (f_read(&g_wav, dst, want, &got) != FR_OK) {
+            got = 0;
+            g_dbg_wav_rderr++;
+        }
+        g_wav_left      -= got;
+        g_dbg_wav_fed   += got;
+    }
+    if (got < WAV_HALF) {
+        memset(dst + got, 0, WAV_HALF - got);
+    }
+    /* **DMA 讀的是記憶體，不是快取。** 每補一次都要寫回，不能只在開始時做一次
+     * （board-notes 3.1 / 23.3 同一家族）。 */
+    SCB_CleanDCache_by_Addr((uint32_t *)dst, (int32_t)WAV_HALF);
+}
+
+/* WAV 檔頭：不要假設 data 一定在第 44 個位元組。
+ * 很多轉檔工具會塞 LIST/INFO 之類的區塊進去，寫死 44 會直接把雜訊當成音訊播。 */
+static bool wav_parse(void)
+{
+    uint8_t  hdr[12];
+    UINT     got = 0;
+    uint32_t guard;
+
+    if (f_read(&g_wav, hdr, 12u, &got) != FR_OK || got != 12u) { return false; }
+    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
+        return false;
+    }
+
+    for (guard = 0; guard < 32u; guard++) {   /* 有上限，壞檔不會讓它繞不出來 */
+        uint8_t  ck[8];
+        uint32_t len;
+
+        if (f_read(&g_wav, ck, 8u, &got) != FR_OK || got != 8u) { return false; }
+        len = (uint32_t)ck[4] | ((uint32_t)ck[5] << 8) |
+              ((uint32_t)ck[6] << 16) | ((uint32_t)ck[7] << 24);
+
+        if (memcmp(ck, "fmt ", 4) == 0) {
+            uint8_t f[16];
+
+            if (len < 16u || f_read(&g_wav, f, 16u, &got) != FR_OK || got != 16u) {
+                return false;
+            }
+            g_dbg_wav_rate = (uint32_t)f[4] | ((uint32_t)f[5] << 8) |
+                             ((uint32_t)f[6] << 16) | ((uint32_t)f[7] << 24);
+            g_dbg_wav_fmt  = ((uint32_t)((uint32_t)f[2] | ((uint32_t)f[3] << 8)) << 16) |
+                             (uint32_t)((uint32_t)f[14] | ((uint32_t)f[15] << 8));
+            if (len > 16u && f_lseek(&g_wav, f_tell(&g_wav) + (len - 16u)) != FR_OK) {
+                return false;
+            }
+        } else if (memcmp(ck, "data", 4) == 0) {
+            g_wav_left      = len;
+            g_dbg_wav_bytes = len;
+            return true;                      /* 檔案指標正好停在資料開頭 */
+        } else {
+            /* 區塊是偶數對齊的，奇數長度後面會補一個位元組。 */
+            if (f_lseek(&g_wav, f_tell(&g_wav) + len + (len & 1u)) != FR_OK) {
+                return false;
+            }
+        }
+    }
+    return false;
+}
+
+bool audio_wav_start(const char *path, uint32_t volume)
+{
+    g_dbg_wav_step  = 1u;
+    g_dbg_wav_fed   = 0u;
+    g_dbg_wav_under = 0u;
+    g_dbg_wav_rderr = 0u;
+
+    audio_wav_stop();
+
+    if (f_open(&g_wav, path, FA_READ) != FR_OK) { return false; }
+    g_wav_open = true;
+
+    g_dbg_wav_step = 2u;
+    if (!wav_parse()) { audio_wav_stop(); return false; }
+
+    /* **取樣率只支援 48k 這一族。** PLL3Q 固定在 49.152MHz（見
+     * MX_LTDC_ClockConfig 的頻率計畫），44.1k 那一族湊不出來 —— 硬播會音高
+     * 不準而且對影片會持續漂移。與其偷偷播錯，不如當場失敗。 */
+    g_dbg_wav_step = 3u;
+    if (g_dbg_wav_rate != 48000u || (g_dbg_wav_fmt & 0xFFFFu) != 16u ||
+        (g_dbg_wav_fmt >> 16) != 2u) {
+        audio_wav_stop();
+        return false;
+    }
+
+    g_dbg_wav_step = 4u;
+    if (!audio_init(48000u, volume)) { audio_wav_stop(); return false; }
+
+    /* 兩半都先填滿再開始，否則第一圈會播到空的後半。 */
+    g_ht_cnt = 0u; g_tc_cnt = 0u; g_ht_done = 0u; g_tc_done = 0u;
+    wav_fill(0u);
+    wav_fill(1u);
+
+    g_dbg_wav_step = 5u;
+    if (BSP_AUDIO_OUT_Play(0, (uint8_t *)g_buf, AUDIO_BUF_BYTES) != BSP_ERROR_NONE) {
+        audio_wav_stop();
+        return false;
+    }
+    g_dbg_wav_step = 6u;
+    return true;
+}
+
+void audio_wav_pump(void)
+{
+    if (!g_wav_open) { return; }
+
+    /* 差距大於 1 代表上一次還沒補完就又被播過去了 —— 那一段是舊資料，
+     * 會聽到一小段重複。這個數字比「聽起來怪怪的」可靠得多。 */
+    if ((uint32_t)(g_ht_cnt - g_ht_done) > 1u ||
+        (uint32_t)(g_tc_cnt - g_tc_done) > 1u) {
+        g_dbg_wav_under++;
+    }
+    while (g_ht_done != g_ht_cnt) { wav_fill(0u); g_ht_done++; }
+    while (g_tc_done != g_tc_cnt) { wav_fill(1u); g_tc_done++; }
+}
+
+bool audio_wav_active(void)
+{
+    /* 資料讀完之後還要讓 DMA 把緩衝裡剩下的播完（最多兩個半區）。 */
+    return g_wav_open && (g_wav_left != 0u ||
+                          (uint32_t)(g_ht_cnt + g_tc_cnt) < 2u ||
+                          g_dbg_wav_fed == 0u);
+}
+
+void audio_wav_stop(void)
+{
+    if (g_wav_open) {
+        audio_stop();
+        (void)f_close(&g_wav);
+        g_wav_open = false;
+    }
+    g_wav_left = 0u;
+}
+
 void audio_stop(void)
 {
     if (g_ready) {
@@ -364,12 +552,14 @@ void BSP_AUDIO_OUT_HalfTransfer_CallBack(uint32_t Instance)
 {
     (void)Instance;
     g_dbg_aud_half++;
+    g_ht_cnt++;          /* DMA 播完前半 -> 前半可以覆寫了 */
 }
 
 void BSP_AUDIO_OUT_TransferComplete_CallBack(uint32_t Instance)
 {
     (void)Instance;
     g_dbg_aud_full++;
+    g_tc_cnt++;          /* DMA 播完後半 -> 後半可以覆寫了 */
 }
 
 void BSP_AUDIO_OUT_Error_CallBack(uint32_t Instance)

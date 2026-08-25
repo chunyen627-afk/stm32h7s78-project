@@ -1533,7 +1533,7 @@ static bool select_screen(void)
         /* 除錯旗標也要在這裡看：選單這個迴圈在等觸控時不會回到主迴圈，
          * 只在主迴圈檢查的話，SWD 設旗標永遠不會生效。 */
         if (g_dbg_favtest || g_dbg_wrtest || g_dbg_cardreinit ||
-            g_dbg_audiotest) {
+            g_dbg_audiotest || (BBOX[16] >> 16) == 0x5A5Bu) {
             return false;               /* 交回主迴圈去跑測試 */
         }
         if (g_dbg_autovideo && g_vid_count > 0u) {
@@ -2791,6 +2791,70 @@ static void wait_for_card(void)
     show_message("讀取記憶卡", "載入中");
 }
 
+/* 從卡片根目錄找第一個 .wav。**不要寫死檔名** —— 交接文件寫的是
+ * MOVIE10.wav，實際掃到的影片卻叫 video1.bin，猜錯就是白跑一輪燒錄。 */
+static bool find_wav(char *out, size_t cap)
+{
+    DIR     dir;
+    FILINFO fno;
+    bool    found = false;
+
+    if (f_opendir(&dir, g_drive) != FR_OK) { return false; }
+    while (f_readdir(&dir, &fno) == FR_OK && fno.fname[0] != 0) {
+        size_t n = strlen(fno.fname);
+
+        if ((fno.fattrib & AM_DIR) == 0u && n >= 4u &&
+            fno.fname[n - 4] == '.' && (fno.fname[n - 3] | 32) == 'w' &&
+            (fno.fname[n - 2] | 32) == 'a' && (fno.fname[n - 1] | 32) == 'v') {
+            (void)snprintf(out, cap, "%s%s", g_drive, fno.fname);
+            found = true;
+            break;
+        }
+    }
+    (void)f_closedir(&dir);
+    return found;
+}
+
+/* 第二步的驗證：從卡上串流一整個 WAV。
+ *
+ * 只驗音訊，不碰影片 —— 一次只加一個沒驗證過的東西（board-notes 第八章）。
+ * 欠載次數（g_dbg_wav_under）比「聽起來有沒有卡」可靠得多。 */
+static void wav_test(void)
+{
+    char path[PATH_MAX];
+
+    if (!find_wav(path, sizeof(path))) {
+        BBOX[112] = 0xE0000001u;   /* 卡上沒有 .wav */
+        show_message("卡上找不到 .wav", 0);
+        HAL_Delay(2000);
+        return;
+    }
+    show_message("音訊串流測試", path);
+
+    BBOX[112] = audio_wav_start(path, 90u) ? 1u : 0u;
+    BBOX[113] = g_dbg_wav_step;
+    BBOX[114] = g_dbg_wav_rate;
+    BBOX[115] = g_dbg_wav_fmt;
+    BBOX[116] = g_dbg_wav_bytes;
+
+    while (audio_wav_active()) {
+        watchdog_feed();
+        audio_wav_pump();
+        BBOX[117] = g_dbg_wav_fed;
+        BBOX[118] = g_dbg_wav_under;
+        BBOX[119] = g_dbg_wav_rderr;
+        if (!sd_present()) { break; }
+        {   /* 點一下畫面就停，不必等十分鐘或按 reset。 */
+            int x, y;
+            if (read_touch(&x, &y)) { break; }
+        }
+    }
+    audio_wav_stop();
+    BBOX[117] = g_dbg_wav_fed;
+    BBOX[118] = g_dbg_wav_under;
+    BBOX[119] = g_dbg_wav_rderr;
+}
+
 /* ------------------------------------------------------------------ */
 /* 最愛的自動測試                                                      */
 /* ------------------------------------------------------------------ */
@@ -3098,6 +3162,16 @@ void album_run(void)
                         (void)audio_tone(hz);
                     }
                     bbox_audio_snapshot();      /* 結果要活過下一次重置 */
+                    first = false;
+                    continue;
+                }
+
+                /* 音訊第二步：串流卡上的 WAV。請求放 DTCM（見 bbox_boot），
+                 * 標籤跟測試音分開 —— 這一個需要卡片已經掛好，所以不能在
+                 * 開機那條路上做。 */
+                if ((BBOX[16] >> 16) == 0x5A5Bu) {
+                    BBOX[16] = 0u;
+                    wav_test();
                     first = false;
                     continue;
                 }
