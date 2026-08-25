@@ -376,6 +376,17 @@ static void wav_fill(uint32_t half)
     uint32_t want = (g_wav_left < WAV_HALF) ? g_wav_left : WAV_HALF;
     UINT     got  = 0;
 
+    /* 暫停 = 餵靜音，**檔案的位置不動**。
+     *
+     * 這樣恢復時聲音正好接在中斷的地方，暫停多久都不會跟畫面差開；
+     * 而且完全不碰 I2S 與 DMA 的狀態機 —— 那條路踩過一次很貴的坑，見
+     * audio_wav_pause() 的說明。 */
+    if (g_wav_paused) {
+        memset(dst, 0, WAV_HALF);
+        SCB_CleanDCache_by_Addr((uint32_t *)dst, (int32_t)WAV_HALF);
+        return;
+    }
+
     if (want != 0u) {
         uint32_t c0 = DWT->CYCCNT;
 
@@ -541,11 +552,24 @@ bool audio_wav_seek_ms(uint32_t ms)
     return true;
 }
 
+/**
+ * 暫停／恢復。**不要用 BSP_AUDIO_OUT_Pause()。**
+ *
+ * 它會走 HAL_I2S_DMAPause -> 設 CSUSP 再等 CSTART 清掉，而那個等待的逾時是
+ * `I2S_TIMEOUT = 0xFFFF` = **65.5 秒**。相簿的看門狗只有 16 秒 ——
+ * 逾時還沒到，狗就先把板子打掉了。實際症狀是使用者回報的
+ * 「點暫停會卡死，過一段時間 RESET 跳回選單」，而那個畫面看起來像
+ * 「暫停功能寫壞了」，完全不會聯想到是 HAL 裡一個比看門狗還長的逾時。
+ *
+ * 改成讓 DMA 繼續跑、只是餵靜音（見 wav_fill）。好處不只是不會卡：
+ * **檔案位置在暫停期間不動，所以恢復時音畫還是對齊的** ——
+ * 真的去暫停 DMA 的話，恢復後聲音會比畫面少掉暫停的那一段。
+ *
+ * 代價是按下暫停之後，緩衝裡已經排隊的最多 170ms 還是會播出去。
+ */
 void audio_wav_pause(bool on)
 {
-    if (!g_wav_open || on == g_wav_paused) { return; }
-    if (on) { (void)BSP_AUDIO_OUT_Pause(0); }
-    else    { (void)BSP_AUDIO_OUT_Resume(0); }
+    if (!g_wav_open) { return; }
     g_wav_paused = on;
 }
 
