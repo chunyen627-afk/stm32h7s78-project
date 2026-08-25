@@ -5,17 +5,18 @@
  *   0x70000000  相簿（bootloader 永遠跳這裡）
  *   0x71000000  USB 隨身碟（MSC_Standalone）
  *
- * 由 bootloader 決定開哪一個：BKPSRAM 裡有暗號就開隨身碟，否則開相簿。
- * 相簿偵測到 USB 插上時留下暗號並重置。
+ * 由**相簿的 main() 第一行**決定開哪一個：DTCM 0x20004000 有暗號就跳去
+ * 隨身碟，否則照常跑相簿。相簿偵測到 VBUS 時留下暗號並重置。
+ * bootloader 不參與判斷（它永遠跳 0x70000000）。
  */
 #ifndef USBDRIVE_H
 #define USBDRIVE_H
 
 #include <stdbool.h>
 
-/* 偵測到 USB 插入時呼叫：留暗號給 bootloader，然後重置。永不返回。
- * 由 bootloader 在乾淨狀態下跳到隨身碟 app —— 相簿自己跳過去的話
- * USB 不會列舉，原因見 usbdrive.c 的說明。 */
+/* 偵測到 USB 插入時呼叫：留暗號然後重置。永不返回。
+ * 暗號放 DTCM —— 放 AXI SRAM 會被 bootloader 的堆疊踩掉，
+ * 症狀是「時好時壞」，原因見 usbdrive.c 的說明。 */
 void usbdrive_request_switch(void);
 
 #endif /* USBDRIVE_H */

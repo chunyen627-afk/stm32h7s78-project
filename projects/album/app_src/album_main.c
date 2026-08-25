@@ -122,23 +122,43 @@ volatile uint32_t g_decode_fail;
  * 連續失敗超過門檻就判定卡片掛了，跳出去做一次完整的重新初始化。
  * 門檻要大於「偶爾一張壞檔」但遠小於整份清單。 */
 #define CARD_SICK_RUN   24u
+/* 連續幾張「解不開」就跳出來提示。設 8 是因為偶爾一兩張壞檔很正常，
+ * 但連續八張就代表整個資料夾都不對，繼續試下去只是讓畫面看起來當機。 */
+#define BAD_PHOTO_RUN   8u
+
+static uint32_t g_bad_photo_run;   /* 連續解不開幾張（卡片是好的）*/
 static uint32_t g_read_fail_run;
 static bool     g_card_sick;
 
 volatile uint32_t g_dbg_card_sick;      /* 判定過幾次 */
 volatile uint32_t g_dbg_card_recover;   /* 重新初始化過幾次 */
 
-static void note_decode(bool ok)
+/* **「卡片讀不到」與「照片解不開」要分開算。**
+ *
+ * 原本兩種都往同一個計數器加，24 次就判定卡片壞掉去做重新初始化。
+ * 但照片解不開的時候卡片是好的 —— 於是恢復、再失敗、再恢復，無限循環，
+ * 畫面看起來就是當機。使用者實際踩過：一個資料夾 66 張裡 64 張是
+ * progressive JPEG（硬體只吃 baseline），整個相簿像卡死。
+ *
+ * 現在只有 PHOTO_ERR_READ 會累積到卡片壞掉的判定；解不開／太大另外算，
+ * 由播放迴圈顯示訊息並回選單。 */
+static void note_decode(photo_result_t r)
 {
-    if (ok) {
+    if (r == PHOTO_OK) {
         g_decode_ok++;
         g_read_fail_run = 0;
+        g_bad_photo_run = 0;
         return;
     }
     g_decode_fail++;
-    if (++g_read_fail_run >= CARD_SICK_RUN && !g_card_sick) {
-        g_card_sick = true;
-        g_dbg_card_sick++;
+
+    if (r == PHOTO_ERR_READ) {
+        if (++g_read_fail_run >= CARD_SICK_RUN && !g_card_sick) {
+            g_card_sick = true;
+            g_dbg_card_sick++;
+        }
+    } else {
+        g_bad_photo_run++;   /* 卡片沒事，是照片本身 */
     }
 }
 volatile uint32_t g_last_ms;
@@ -2330,7 +2350,7 @@ static int pause_session(int32_t *cur)
                     == PHOTO_OK) {
                 present();
                 *cur = (int32_t)t;
-                note_decode(true);
+                note_decode(PHOTO_OK);
             }
             continue;
         }
@@ -2369,12 +2389,12 @@ static int pause_session(int32_t *cur)
             if (r == PHOTO_OK || r == PHOTO_ABORTED) {
                 break;
             }
-            note_decode(false);
+            note_decode(r);
         }
         if (r == PHOTO_OK) {
             present();
             *cur = (int32_t)target;
-            note_decode(true);
+            note_decode(PHOTO_OK);
         }
     }
 }
@@ -2396,6 +2416,18 @@ static void slideshow(void)
         uint32_t t0;
 
         watchdog_feed();
+
+        /* 連續解不開太多張 —— 卡片是好的，是照片本身的格式不對。
+         * **一定要在螢幕上說話**：不講的話畫面就只是不動，看起來跟當機
+         * 一模一樣（相簿在幾十毫秒內一張張失敗，沒有東西可換）。
+         * 使用者實際踩過，而相框放在桌上時沒有人會接 SWD 去讀計數器。 */
+        if (g_bad_photo_run >= BAD_PHOTO_RUN) {
+            g_bad_photo_run = 0;
+            show_message("這些照片解不開",
+                         "需要 baseline JPEG、單張 2MB 以內");
+            HAL_Delay(4000);
+            return;              /* 回選單，不要繼續空轉 */
+        }
 
         if (!sd_present() || g_card_sick || !wait_screen_on()) {
             return;
@@ -2420,7 +2452,7 @@ static void slideshow(void)
         }
 
         if (r == PHOTO_OK) {
-            note_decode(true);
+            note_decode(PHOTO_OK);
 
             if (cur >= 0) {
                 int w = wait_interval(g_last_ms);
@@ -2442,7 +2474,7 @@ static void slideshow(void)
             cur = (int32_t)pos;
         } else {
             /* 一張壞掉的照片不能讓相框停住，記錄之後直接換下一張。 */
-            note_decode(false);
+            note_decode(r);
         }
 
         pos++;
@@ -2645,10 +2677,10 @@ static void fav_selftest(uint32_t n)
         if (photo_show(PLAYLIST_BASE + g_order[i] * PATH_MAX) == PHOTO_OK) {
             present();
             g_dbg_ft_shown++;
-            note_decode(true);
+            note_decode(PHOTO_OK);
         } else {
             g_dbg_ft_showfail++;
-            note_decode(false);
+            note_decode(PHOTO_ERR_DECODE);
         }
     }
     g_fav_mode = false;
@@ -2801,10 +2833,10 @@ void album_run(void)
         for (uint32_t k = 0; k < 6u && k < g_order_count; k++) {
             watchdog_feed();
             if (photo_show(PLAYLIST_BASE + g_order[k] * PATH_MAX) == PHOTO_OK) {
-                note_decode(true);
+                note_decode(PHOTO_OK);
                 present();
             } else {
-                note_decode(false);
+                note_decode(PHOTO_ERR_DECODE);
             }
             HAL_Delay(300);
         }
