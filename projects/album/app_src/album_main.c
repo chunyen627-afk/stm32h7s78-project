@@ -962,6 +962,15 @@ static void build_order(void)
  * 讀檔頭，深層目錄裡如果有一堆無關的 .bin 會拖很久。照片那邊需要遞迴是
  * 因為使用者的相簿本來就有目錄結構，影片沒有這個需求。 */
 static video_info_t g_vids[MAX_VIDEOS];
+
+/* 每部影片上次看到哪一格。按「返回」離開時記下來，下次進去接著看。
+ *
+ * 用陣列而不是只記最後一部：卡上會有好幾部，看到一半跳去看別部再回來
+ * 是很自然的用法，只記一部的話那個情境就失效了 —— 而成本只差 64 bytes。
+ *
+ * 索引跟 g_vids 一樣，所以**重新掃卡之後就不算數了**（順序可能變）。
+ * 掃卡會把它清掉，寧可從頭播也不要接到別部影片的位置。 */
+static uint32_t g_vid_resume[MAX_VIDEOS];
 static uint32_t     g_vid_count;
 volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
 volatile uint32_t   g_dbg_audiotest;   /* SWD 寫入頻率（Hz）就播測試音 */
@@ -1122,6 +1131,7 @@ static void draw_overlay(const video_info_t *v, uint32_t idx, bool paused)
 /* 播放一部影片，無限循環，直到使用者按返回或卡片被拔掉。 */
 static void play_video(const video_info_t *v)
 {
+    uint32_t vi  = (uint32_t)(v - g_vids);
     uint32_t idx = 0, next_ms, acc = 0;
     uint32_t frame_us, frame_ms, frame_frac;
     uint32_t ov_until = 0;
@@ -1133,6 +1143,20 @@ static void play_video(const video_info_t *v)
         show_message("影片開啟失敗", v->name);
         nap(1500);
         return;
+    }
+
+    /* 接續上次看到的位置。
+     *
+     * **快看完了就從頭播。** 停在最後幾秒的話「接續」等於一進去就結束，
+     * 使用者要的顯然是重看一次 —— 這種邊界不處理的話，最後那幾秒會變成
+     * 一個進不去的狀態。門檻取十秒。 */
+    if (vi < MAX_VIDEOS && g_vid_resume[vi] < v->count) {
+        uint32_t tail = (uint32_t)((uint64_t)v->fps_x100 * 10u / 100u);
+
+        if (g_vid_resume[vi] + tail < v->count) {
+            idx = g_vid_resume[vi];
+        }
+        BBOX[146] = idx;            /* 這次從第幾格開始 */
     }
 
     /* 有同名的 .wav 就一起播。沒有就照舊只放畫面 —— 卡上八部影片只有一部
@@ -1155,6 +1179,10 @@ static void play_video(const video_info_t *v)
     gfx_set_orientation(false);
 
     frame_us   = 100000000u / (v->fps_x100 ? v->fps_x100 : 2400u);
+    /* 聲音也要跳到同一個位置，否則接續播放的第一秒就對不上。 */
+    if (idx != 0u) {
+        (void)audio_wav_seek_ms((uint32_t)((uint64_t)idx * frame_us / 1000u));
+    }
     frame_ms   = frame_us / 1000u;
     frame_frac = frame_us % 1000u;
     next_ms    = HAL_GetTick();
@@ -1305,6 +1333,14 @@ static void play_video(const video_info_t *v)
         } else {
             next_ms = HAL_GetTick();          /* 跟不上就重新對時 */
         }
+    }
+
+    /* 記住離開時的位置。**所有出口都會經過這裡** —— 按返回、卡片被拔掉、
+     * 都走同一條路出來，不必在每個 break 前面各記一次（那種寫法漏掉一個
+     * 就是「有時候記得有時候忘記」，board-notes 14.5 的家族）。 */
+    if (vi < MAX_VIDEOS) {
+        g_vid_resume[vi] = idx;
+        BBOX[147] = idx;            /* 離開時記住第幾格 */
     }
 
     BBOX[137] = HAL_GetTick();       /* 離開播放的時刻 */
@@ -2929,6 +2965,8 @@ static bool mount_and_scan(void)
     watchdog_feed();
 
     BBOX[11] = g_photo_count;
+    /* 影片的順序可能跟上次不一樣，記住的位置就不能再用了。 */
+    memset(g_vid_resume, 0, sizeof(g_vid_resume));
 
     /* 只有影片沒有照片也算可用 —— 使用者可能就是拿它當影片播放器。 */
     if (g_photo_count == 0U && g_vid_count == 0U) {
