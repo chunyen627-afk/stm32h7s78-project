@@ -1125,6 +1125,7 @@ static void play_video(const video_info_t *v)
     uint32_t idx = 0, next_ms, acc = 0;
     uint32_t frame_us, frame_ms, frame_frac;
     uint32_t ov_until = 0;
+    uint32_t vol_lock = 0u;   /* 按過音量之後要連續幾次讀不到觸控才解鎖 */
     bool     paused = false;
 
     if (!video_open(v)) {
@@ -1180,6 +1181,7 @@ static void play_video(const video_info_t *v)
         }
 
         touched = read_touch(&x, &y);
+        if (!touched && vol_lock > 0u) { vol_lock--; }
         if (touched) {
             if (HAL_GetTick() >= ov_until) {
                 /* 第一次碰只叫出疊加層，不會誤觸到底下的按鈕。 */
@@ -1194,23 +1196,32 @@ static void play_video(const video_info_t *v)
                        y >= VOL_Y && y < VOL_Y + VOL_H &&
                        ((x >= VOL_MINUS_X && x < VOL_MINUS_X + VOL_BTN_W) ||
                         (x >= VOL_PLUS_X  && x < VOL_PLUS_X  + VOL_BTN_W))) {
-                /* 音量：按一下調一格。 */
-                if (x < VOL_MINUS_X + VOL_BTN_W) {
-                    g_audio_vol = (g_audio_vol >= VOL_STEP)
-                                ? (g_audio_vol - VOL_STEP) : 0u;
-                } else {
-                    g_audio_vol = (g_audio_vol + VOL_STEP > 100u)
-                                ? 100u : (g_audio_vol + VOL_STEP);
+                /* 音量：按一下調一格。
+                 *
+                 * **不能用 wait_release()。** 它會擋住整個播放迴圈 ——
+                 * 按著的時候畫面不解碼、音訊也沒人補，實測就是
+                 * 「點音量畫面和聲音會停一下、按住會停住」。
+                 *
+                 * 改成不阻塞的閂鎖：按下就調一格，然後要**連續**幾次讀不到
+                 * 觸控才解鎖（一次沒讀到不算 —— 電容觸控本來就會漏報，
+                 * board-notes 14.7）。手指按著時 vol_lock 不會遞減，
+                 * 所以按住不會連跳；而迴圈全程照常跑。
+                 *
+                 * 第一版用 nap(180) 當去抖，實測「一點跳 20」：那比一次
+                 * 正常點擊還短（18.4 量過約 220ms），手指還在上面就又
+                 * 進了一次判定。 */
+                if (vol_lock == 0u) {
+                    if (x < VOL_MINUS_X + VOL_BTN_W) {
+                        g_audio_vol = (g_audio_vol >= VOL_STEP)
+                                    ? (g_audio_vol - VOL_STEP) : 0u;
+                    } else {
+                        g_audio_vol = (g_audio_vol + VOL_STEP > 100u)
+                                    ? 100u : (g_audio_vol + VOL_STEP);
+                    }
+                    audio_set_volume(g_audio_vol);
+                    vol_lock = 3u;
                 }
-                audio_set_volume(g_audio_vol);
-                ov_until = HAL_GetTick() + OV_MS;
-
-                /* **一定要等手指離開**，否則一次點擊會被算成兩次 ——
-                 * 實測就是「點一下跳 20」。原本用 nap(180) 當去抖，
-                 * 但那比一次正常點擊還短（board-notes 18.4 量過約 220ms），
-                 * 手指還在上面就又進了一次判定。
-                 * 這跟 18.1 是同一條：事件要在離開這一輪之前消費掉。 */
-                wait_release();
+                ov_until = HAL_GetTick() + OV_MS;   /* 按著就讓控制列別消失 */
             } else if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
                 /* 拖曳 seek。位移表讓任何一格都能直接定址，成本跟播下一格
                  * 一模一樣 —— 這是打包成單一檔案順帶換到的好處。 */
