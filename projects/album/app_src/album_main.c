@@ -262,9 +262,15 @@ static void screen_init(void)
     gfx_set_framebuffer((uint16_t *)FB1_ADDR);
 }
 
+/* 黑盒子（重置洗不掉的觀察管道）。定義放在這裡是因為 present() 要用，
+ * 完整的欄位說明與「為什麼放 DTCM」寫在下面的 bbox_boot()。 */
+#define BBOX        ((volatile uint32_t *)0x20004020u)
+#define BBOX_MAGIC  0x424F5831u   /* "BOX1" */
+
 static void present(void)
 {
     uint32_t drawn = g_front ? FB0_ADDR : FB1_ADDR;
+    bool     reloaded = false;
 
     /* 只寫 CFBAR 一個暫存器：它是 shadow register，寫入不會立即生效，
      * 等垂直消隱重載時整批原子切換，中間沒有半完成狀態。 */
@@ -272,9 +278,17 @@ static void present(void)
     LTDC->SRCR = LTDC_SRCR_VBR;
     for (uint32_t guard = 0; guard < 2000000u; guard++) {
         if ((LTDC->SRCR & LTDC_SRCR_VBR) == 0u) {
+            reloaded = true;
             break;
         }
     }
+
+    /* **等不到垂直消隱重載 = 面板沒在掃描 = 畫面凍住。**
+     * 這個保險迴圈原本是靜靜地逾時然後往下走，於是「畫面不動但程式還活著」
+     * 完全沒有跡象。數它一次就分得出「相簿卡住」與「相簿好好的、只是
+     * 畫面停在最後一幀」—— 這兩件事在螢幕上長得一模一樣。 */
+    BBOX[15]++;
+    if (!reloaded) { BBOX[14]++; }
 
     g_front ^= 1u;
     gfx_set_framebuffer((uint16_t *)(g_front ? FB0_ADDR : FB1_ADDR));
@@ -291,14 +305,29 @@ static void present(void)
  *
  * 注意：中斷必須是開著的，否則會永遠睡下去。這裡是主迴圈，沒有關中斷的
  * 情況；如果哪天在臨界區裡呼叫就會卡死。 */
+/* **開發期把睡眠關掉。**
+ *
+ * album_run() 裡已經有 HAL_DBGMCU_EnableDBGSleepMode()，理論上睡著也連得上
+ * SWD。但這塊板子上實測不成立：相簿停在選單（每圈 nap(30)，幾乎整段時間
+ * 都在睡）時，mode=HOTPLUG 連續 15 次全部連不上，報 "Unable to get core ID"；
+ * 換頻率、換連線模式都一樣，只有 mode=UR（連線時按住重置，核心還來不及睡）
+ * 連得上 —— 而 UR 會重置，等於把要觀察的狀態洗掉。
+ *
+ * 順帶量到的：`DBGMCU->CR` 讀出來是 0x10036485，**DBGCKEN（bit21）是 0**，
+ * 而且從應用程式寫它也寫不進去。所以那個 HAL 呼叫沒有真的解決問題。
+ *
+ * 沒有 SWD 就沒有任何觀察手段（板子沒有 UART），音訊這一輪每一步都要靠
+ * 讀全域變數驗證，所以開發期一律忙等。這台是插著電的相框，省電不是重點。 */
+#define NAP_USE_WFI   0
+
 static void nap(uint32_t ms)
 {
-    /* 見 album_run() 裡的 HAL_DBGMCU_EnableDBGSleepMode()：沒開的話，
-     * 核心一睡 SWD 就整個連不上（Unable to read device id from ROM table）。 */
     uint32_t t0 = HAL_GetTick();
 
     while ((HAL_GetTick() - t0) < ms) {
+#if NAP_USE_WFI
         __WFI();
+#endif
     }
 }
 
@@ -401,6 +430,102 @@ static bool g_wdt_on;
  *
  * 同一個執行緒沒辦法讓自己跳出無窮迴圈，只能靠硬體。逾時設 16 秒，正常
  * 操作（解一張照片約 0.5 秒、掃描一次約 1 秒）遠遠用不到。 */
+/* ------------------------------------------------------------------ */
+/* 黑盒子：重置洗不掉的觀察管道                                        */
+/* ------------------------------------------------------------------ */
+/**
+ * 為什麼需要這個：SWD 的 mode=HOTPLUG 現在完全連不上（連續 15 次全失敗，
+ * 報 "Unable to get core ID"），只有 mode=UR 連得上 —— 而 UR 會重置板子，
+ * 等於把要觀察的狀態洗掉。全域變數在 .bss，開機就被清成 0，所以「重置之後
+ * 再讀」讀到的永遠是新一輪的初值，看不到上一輪發生了什麼。
+ *
+ * 這塊放 DTCM。board-notes 22.5 已經實測過：bootloader 的堆疊在 AXI SRAM，
+ * 完全不碰 DTCM，寫進去重置後原封不動（那一章就是靠這個發現「暗號被
+ * bootloader 踩掉」的）。連結腳本給相簿的 DTCM 只有 0x20000000 起 4KB
+ * （_estack = 0x20001000），所以 0x20004020 這裡沒有人用。
+ *
+ * 而且啟動碼不會清它 —— 它不是 .data 也不是 .bss。這正是重點：
+ * **上一輪的紀錄活得過重置。**
+ */
+/* [0] 魔術字   [1] 開機次數（累計）
+ * [2] 上一輪最後到達的 g_stage      [3] 上一輪最後一次餵狗的 uwTick
+ * [4] 這一輪開機時的 RCC->RSR       [5] 這一輪的 g_stage（即時）
+ * [6] 這一輪最後一次餵狗的 uwTick   [7] 餵狗次數（這一輪）
+ * [8] mount_and_scan 進來幾次       [9] sd_present() 回報「沒卡」幾次
+ * [10] sd_present() 總共問了幾次    [11] 最後一次掃完的 g_photo_count
+ * [12] select_screen 進來幾次       [13] slideshow 進來幾次
+ * [14] present() 等不到重載幾次     [15] present() 呼叫幾次
+ *
+ * [16] 音訊測試請求（Hz，外面寫、韌體吃掉）
+ * [17..24] 音訊測試結果：step / init / pll / sel / play / half / full / err
+ * [25] 測試跑完時的 uwTick
+ *
+ * **[16] 以後開機不清空。** 請求是在重置點寫進來的（那時韌體還沒跑），
+ * 清掉就等於永遠收不到；結果則要活過下一次重置才讀得到。 */
+static void bbox_boot(uint32_t rsr)
+{
+    if (BBOX[0] != BBOX_MAGIC) {    /* 斷電後第一次：內容是隨機的 */
+        BBOX[0] = BBOX_MAGIC;
+        BBOX[1] = 0u;
+        BBOX[5] = 0u;
+        BBOX[6] = 0u;
+    }
+    BBOX[1]++;                      /* 開機次數：一秒跳好幾次就是重置迴圈 */
+    BBOX[2] = BBOX[5];              /* 把上一輪的即時值搬到「上一輪」欄 */
+    BBOX[3] = BBOX[6];
+    BBOX[4]  = rsr;
+    BBOX[39] = BBOX[26];        /* 上一輪的開機腳印走到哪 */
+    BBOX[26] = 0u;
+    BBOX[5]  = 0u;
+    BBOX[6]  = 0u;
+    BBOX[7]  = 0u;
+    BBOX[8]  = 0u;
+    BBOX[9]  = 0u;
+    BBOX[10] = 0u;
+    BBOX[11] = 0u;
+    BBOX[12] = 0u;
+    BBOX[13] = 0u;
+    BBOX[14] = 0u;
+    BBOX[15] = 0u;
+}
+
+/* 把音訊的診斷變數抄進黑盒子。.bss 活不過重置，DTCM 活得過 ——
+ * 而現在唯一能連上的 mode=UR 一定會重置，所以不抄就讀不到。 */
+static void bbox_audio_snapshot(void)
+{
+    BBOX[17] = g_dbg_aud_step;
+    BBOX[18] = g_dbg_aud_init;
+    BBOX[19] = g_dbg_aud_pll;
+    BBOX[20] = g_dbg_aud_sel;
+    BBOX[21] = g_dbg_aud_play;
+    if (g_dbg_aud_step != 0u) {     /* 這一輪真的跑過音訊才更新 */
+        BBOX[22] = g_dbg_aud_half;
+        BBOX[23] = g_dbg_aud_full;
+        BBOX[24] = g_dbg_aud_err;
+    }
+    BBOX[25] = HAL_GetTick();
+
+    /* 時脈的現場。音訊唯一動到的全域資源就是時脈樹（PLL3 + SPI6 選源），
+     * 而 PSRAM(XSPI1) 與外部 NOR(XSPI2) 都吃 PLL2 —— 所以先確認 PLL2
+     * 還在不在，再去碰任何一塊 PSRAM。順序很重要：這幾行都是讀暫存器，
+     * 不碰 PSRAM，所以就算 PSRAM 已經壞了也記得下來。 */
+    BBOX[32] = RCC->CR;          /* PLL1/2/3 的 ON 與 RDY 位元 */
+    BBOX[33] = RCC->CKPROTR;     /* XSPI 的時脈保護有沒有跳到回復檔位 */
+    BBOX[34] = RCC->CFGR;
+    BBOX[35] = XSPI1->SR;
+
+    /* PSRAM 探針：show_message() 一畫東西就是寫 framebuffer（PSRAM），
+     * 而板子正好掛在那裡。先自己戳一下，把「掛在存取 PSRAM」這件事
+     * 變成可以看見的：停在 0xAA 就代表讀不回來。 */
+    BBOX[36] = 0xAAu;
+    BBOX[37] = *(volatile uint32_t *)0x90000000u;
+    BBOX[36] = 0xBBu;
+    *(volatile uint32_t *)0x90000010u = 0x5A5A1234u;
+    BBOX[36] = 0xCCu;
+    BBOX[38] = *(volatile uint32_t *)0x90000010u;
+    BBOX[36] = 0xDDu;
+}
+
 static void watchdog_start(void)
 {
     g_iwdg.Instance       = IWDG;
@@ -424,6 +549,19 @@ static void watchdog_feed(void)
     if (g_wdt_on) {
         (void)HAL_IWDG_Refresh(&g_iwdg);
     }
+
+    /* 黑盒子的即時欄。watchdog_feed 是全域最常被呼叫的地方（所有可能久留的
+     * 迴圈都會經過），所以這裡記的「最後一次」就是「它活到哪裡為止」。 */
+    BBOX[5] = g_stage;
+    BBOX[6] = HAL_GetTick();
+    BBOX[7]++;
+
+    /* 音訊的回呼計數要**持續**更新，不能只在測試當下拍一次快照 ——
+     * DMA 有沒有真的在跑，看的就是這兩個數字會不會一直往上跳。
+     * 「聽起來好像有聲音」不可靠，這個可靠。 */
+    BBOX[22] = g_dbg_aud_half;
+    BBOX[23] = g_dbg_aud_full;
+    BBOX[24] = g_dbg_aud_err;
 
     /* 順便偵測 USB 線插上沒。這裡只是讀一個暫存器（連續轉換模式一直在跑），
      * 而 watchdog_feed 本來就是全域最常被呼叫的地方 —— 不必另外找地方輪詢。
@@ -457,7 +595,13 @@ static void watchdog_feed(void)
 
 static bool sd_present(void)
 {
-    return BSP_SD_IsDetected(0) == SD_PRESENT;
+    bool present = (BSP_SD_IsDetected(0) == SD_PRESENT);
+
+    /* 這支腳一旦跳一下，播放/選單迴圈就會跳出去重新掛載並重掃 ——
+     * 螢幕上看起來就是「一直停在載入中」。所以要數它，不要只用它。 */
+    BBOX[10]++;
+    if (!present) { BBOX[9]++; }
+    return present;
 }
 
 /* ------------------------------------------------------------------ */
@@ -1372,6 +1516,8 @@ static bool select_screen(void)
 {
     bool dirty = true;
 
+    BBOX[12]++;
+
     for (;;) {
         int x, y;
 
@@ -1386,7 +1532,8 @@ static bool select_screen(void)
         }
         /* 除錯旗標也要在這裡看：選單這個迴圈在等觸控時不會回到主迴圈，
          * 只在主迴圈檢查的話，SWD 設旗標永遠不會生效。 */
-        if (g_dbg_favtest || g_dbg_wrtest || g_dbg_cardreinit) {
+        if (g_dbg_favtest || g_dbg_wrtest || g_dbg_cardreinit ||
+            g_dbg_audiotest) {
             return false;               /* 交回主迴圈去跑測試 */
         }
         if (g_dbg_autovideo && g_vid_count > 0u) {
@@ -1558,15 +1705,22 @@ static void show_scan_progress(void)
 
 static void show_message(const char *line1, const char *line2)
 {
+    /* 腳印切到這裡面：這是開機腳印 5 之後唯一會做事的呼叫，而它做的三件事
+     * （清畫面 = 寫 750KB PSRAM、畫字、等垂直消隱）風險完全不同。 */
+    BBOX[26] = 10u;
     gfx_set_orientation(false);
     for (int i = 0; i < 2; i++) {
+        BBOX[26] = 11u + (uint32_t)i * 10u;
         gfx_clear(COL_BG);
+        BBOX[26] = 12u + (uint32_t)i * 10u;
         gfx_text_center(GFX_W / 2, GFX_H / 2 - 40, line1, COL_TEXT);
         if (line2) {
             gfx_text_center(GFX_W / 2, GFX_H / 2 + 10, line2, COL_DIM);
         }
+        BBOX[26] = 13u + (uint32_t)i * 10u;
         present();
     }
+    BBOX[26] = 30u;
 }
 
 /* 螢幕關著時停在這裡。回傳 false 代表卡片被拔掉。 */
@@ -2419,6 +2573,8 @@ static void slideshow(void)
     uint32_t pos = 0;           /* 下一張要解碼的 g_order 索引 */
     int32_t  cur = -1;          /* 顯示中的索引，-1 = 還沒顯示過 */
 
+    BBOX[13]++;
+
     wait_release();
 
     for (;;) {
@@ -2538,6 +2694,7 @@ static void card_recover(void)
 /* 掛載並掃描一次。回傳 false 代表這輪不能播（沒卡、掛不起來、沒照片）。 */
 static bool mount_and_scan(void)
 {
+    BBOX[8]++;                      /* 一輪開機裡進來很多次 = 在重掃迴圈裡 */
     g_top_count   = 0;
     g_photo_count = 0;
     g_order_count = 0;
@@ -2601,6 +2758,8 @@ static bool mount_and_scan(void)
         g_vid_count = g_dbg_fakevids;
     }
     watchdog_feed();
+
+    BBOX[11] = g_photo_count;
 
     /* 只有影片沒有照片也算可用 —— 使用者可能就是拿它當影片播放器。 */
     if (g_photo_count == 0U && g_vid_count == 0U) {
@@ -2732,6 +2891,17 @@ void album_run(void)
      * 開發板、隨時要用 SWD 讀狀態，值得。真的要壓到最低耗電時再拿掉。 */
     HAL_DBGMCU_EnableDBGSleepMode();
 
+    /* **光是 DBG_SLEEP 不夠**，還要開除錯時脈。
+     *
+     * 實測：DBGMCU->CR 讀出來 0x10036485（DBG_SLEEP 確實是 1），但相簿停在
+     * 選單時 —— 那個迴圈每圈 nap(30)，等於幾乎整段時間都在 __WFI() ——
+     * mode=HOTPLUG 連續 15 次全部連不上，報 "Unable to get core ID"。
+     * 只有 mode=UR（連線時按住重置，核心來不及睡）連得上。
+     *
+     * DBG_SLEEP 只是「睡著時不要把除錯模組關掉」，DBGCKEN 才是給除錯模組
+     * 時脈的那一個，重置後預設是 0。兩個都要。 */
+    DBGMCU->CR |= DBGMCU_CR_DBGCKEN;
+
     /* 開啟週期計數器，rnd_mix() 拿它當高解析度的熵來源。 */
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
     DWT->CYCCNT = 0;
@@ -2741,7 +2911,11 @@ void album_run(void)
     vbus_init();
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 
-    /* 上一輪是被看門狗打掉的嗎？旗標要在這裡讀，之後會被清掉。 */
+    /* 上一輪是被看門狗打掉的嗎？旗標要在這裡讀，之後會被清掉。
+     * 整個 RSR 也一起存進黑盒子 —— 只記「是不是看門狗」分不出
+     * 「軟體重置」（usbdrive_request_switch 會呼叫 NVIC_SystemReset）
+     * 與「按了 reset」與「掉電」，而這三者要用完全不同的方向去查。 */
+    bbox_boot(RCC->RSR);
     wdt_reset = (__HAL_RCC_GET_FLAG(RCC_FLAG_IWDGRST) != 0u);
     __HAL_RCC_CLEAR_RESET_FLAGS();
 
@@ -2785,7 +2959,30 @@ void album_run(void)
         HAL_Delay(10);              /* 讓腳位穩定再開始判斷 */
     }
 
+    /* 開機時的音訊測試：請求放在黑盒子第 16 格（DTCM）。
+     *
+     * 為什麼不是用 g_dbg_audiotest：那個變數在 .bss，要用 SWD 寫它就得在
+     * **執行中**連上板子，而 mode=HOTPLUG 現在完全連不上。在重置點寫的話
+     * 又會被啟動碼清 .bss 的時候一起清掉（實測過，旗標寫進去就不見了）。
+     * DTCM 兩邊都不吃虧：重置點寫得到、啟動碼也不會清它。
+     *
+     * 放在這裡是因為顯示與觸控（含 I2C）已經好了，而卡片還沒開始掛 ——
+     * 音訊跟卡片是兩件獨立的事，先驗音訊就不必等掃卡。
+     * 不寫請求就完全等於不存在（board-notes 16.3 的旗標觸發原則）。 */
+    if ((BBOX[16] >> 16) == 0x5A5Au && (BBOX[16] & 0xFFFFu) <= 20000u) {
+        uint32_t hz = BBOX[16] & 0xFFFFu;
+
+        BBOX[16] = 0u;              /* 吃掉，不會自己重跑 */
+        for (uint32_t i = 17u; i <= 25u; i++) { BBOX[i] = 0u; }  /* 清舊結果 */
+        show_message("音訊測試", "耳機孔 CN16");
+        if (audio_init(48000u, 90u)) {   /* 40 太小聲，實測聽不到 */
+            (void)audio_tone(hz);
+        }
+        bbox_audio_snapshot();
+    }
+
     g_stage = 30;
+    BBOX[26] = 2u;              /* 音訊那段走完了，準備掛磁碟驅動 */
     if (FATFS_LinkDriver(&SD_BSP_Driver, g_drive) != 0) {
         show_message("磁碟介面初始化失敗", 0);
         for (;;) { }
@@ -2807,6 +3004,7 @@ void album_run(void)
     }
 
     watchdog_start();
+    BBOX[26] = 4u;              /* 看門狗起來了，之後掛住會被自動重置 */
 
     /* 磁碟層等卡片的迴圈最長會佔住好幾秒（寫入逾時是 2 秒、還會重試），
      * 而看門狗只有 16 秒。第一版沒接這條，卡片一拒絕寫入就被重開，
@@ -2815,6 +3013,7 @@ void album_run(void)
     sd_bsp_set_keepalive(watchdog_feed);
 
     g_stage = 3;
+    BBOX[26] = 5u;              /* 準備進掛載/掃卡的主迴圈 */
     show_message("讀取記憶卡", "載入中");
 
     for (;;) {
@@ -2892,10 +3091,13 @@ void album_run(void)
                     uint32_t hz = g_dbg_audiotest;
 
                     g_dbg_audiotest = 0;
+                    g_dbg_aud_step |= AUD_STEP_TRIGGER;
+
                     show_message("音訊測試", "耳機孔 CN16");
                     if (audio_init(48000u, 40u)) {
                         (void)audio_tone(hz);
                     }
+                    bbox_audio_snapshot();      /* 結果要活過下一次重置 */
                     first = false;
                     continue;
                 }

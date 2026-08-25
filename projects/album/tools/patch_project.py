@@ -14,6 +14,8 @@ import os
 import re
 import sys
 
+NL = chr(10)   # 產生原始碼時要插入的換行
+
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 CUBE = os.environ.get("CUBE_DIR") or \
     os.path.join(ROOT, "..", "stm32h7s78-tetris", "cube")
@@ -357,6 +359,58 @@ def patch_main():
     print("  main.c 已接上 album_run() 與隨身碟跳轉")
 
 
+def patch_i2s_dma_cache():
+    """I2S 的 DMA 連結串列節點：CPU 寫完要寫回快取，DMA 才看得到。
+
+    GPDMA 是連結串列模式 —— 通道的長度與位址不是 CPU 直接寫進暫存器，而是
+    DMA 自己去記憶體抓一個「節點」。而 HAL_I2S_Transmit_DMA 是在**啟動前
+    一刻**才把 CBR1（長度）/ CSAR（來源）/ CDAR（目的）寫進那個節點，
+    節點落在可快取的 AXI SRAM，那三個寫入就還躺在 D-Cache 裡。
+    DMA 讀記憶體是繞過 D-Cache 的，抓到的是舊值 0。
+
+    症狀離原因非常遠：BSP_AUDIO_OUT_Play **回傳成功**，然後 DMA 一啟動就報
+    USEF（CSR = 0x1001）—— 一個看起來跟快取毫無關係的「使用者設定錯誤」。
+    凍結下來的現場是 CBR1 = 0、CSAR = 0，而同一時刻 CPU 讀那個節點看到的是
+    完全正確的 0x7FBC / 0x24007EC0。**兩邊看到的不一樣，就是快取。**
+
+    實測：清快取之後把連結指標指回同一個節點、重新啟用通道，DMA 立刻開始
+    搬資料（CBR1 從 32700 倒數、半滿/全滿回呼都進來）。
+
+    這是本專案第四次踩到「CPU 寫、DMA 讀」這一類（board-notes 3.1 DMA2D、
+    17.6 SWD 寫 PSRAM、22.3 USB 的 SD 緩衝）。ST 的範例大多沒開 D-Cache，
+    所以這個 bug 在原廠碼裡不會現形。
+    """
+    path = os.path.join(CUBE, "Drivers", "STM32H7RSxx_HAL_Driver", "Src",
+                        "stm32h7rsxx_hal_i2s.c")
+    if not os.path.isfile(path):
+        print("  !! 找不到 stm32h7rsxx_hal_i2s.c，沒有套用 DMA 節點快取修正")
+        return
+    s = io.open(path, encoding="utf-8").read()
+
+    if "音訊 DMA 節點" in s:
+        print("  hal_i2s.c 已改過")
+        return
+
+    old = "      errorcode = HAL_DMAEx_List_Start_IT(hi2s->hdmatx);"
+    if old not in s:
+        print("  !! hal_i2s.c 找不到 List_Start_IT，沒有套用 DMA 節點快取修正")
+        return
+
+    ins = NL.join([
+        "      /* 音訊 DMA 節點：上面三行是 CPU 寫進記憶體裡的節點，而 DMA",
+        "       * 讀它的時候繞過 D-Cache。不寫回的話 DMA 抓到的是舊值 0，",
+        "       * 一啟動就報 USEF —— 而 Play 卻回傳成功，錯誤看起來跟快取",
+        "       * 毫無關係（見 patch_project.py 的說明）。 */",
+        "#if defined (__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)",
+        "      SCB_CleanDCache_by_Addr((uint32_t *)hi2s->hdmatx->LinkedListQueue->Head,",
+        "                              (int32_t)sizeof(DMA_NodeTypeDef));",
+        "#endif",
+        "",
+    ])
+    io.open(path, "w", encoding="utf-8").write(s.replace(old, ins + old, 1))
+    print("  hal_i2s.c 已補上 DMA 節點的快取寫回")
+
+
 def main():
     if not os.path.isdir(PROJ):
         print(f"找不到專案目錄: {PROJ}")
@@ -370,6 +424,7 @@ def main():
     add_includes()
     patch_main()
     patch_boot_hse()
+    patch_i2s_dma_cache()
     return 0
 
 

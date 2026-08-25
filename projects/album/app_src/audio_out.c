@@ -17,6 +17,9 @@
 #include "audio_out.h"
 #include "main.h"
 #include "stm32h7s78_discovery_audio.h"
+#include "stm32h7s78_discovery_lcd.h"   /* MX_LTDC_ClockConfig 的原型 */
+#include "stm32h7s78_discovery_bus.h"   /* WM8904 掛在 I2C1，直接讀它的暫存器 */
+#include "wm8904_reg.h"
 
 #include <math.h>
 
@@ -25,21 +28,168 @@
  * 又不佔太多 AXI SRAM（相簿已經用掉 264KB / 465KB）。 */
 #define AUDIO_BUF_BYTES   (32u * 1024u)
 
-static int16_t  g_buf[AUDIO_BUF_BYTES / 2u];   /* 交錯的 L,R,L,R... */
+/* DMA 直接讀這塊，而且要對它做快取維護 —— 對齊到快取列（32 bytes），
+ * 免得 clean 的範圍連帶動到相鄰資料（board-notes 22.3 踩過）。 */
+static int16_t  g_buf[AUDIO_BUF_BYTES / 2u] __attribute__((aligned(32)));
 static bool     g_ready;
 static uint32_t g_rate;
 
-/* 診斷用，SWD 讀得到。板子沒有 UART，這是唯一的觀察方式。 */
-volatile uint32_t g_dbg_aud_init;     /* BSP_AUDIO_OUT_Init 的回傳值 */
-volatile uint32_t g_dbg_aud_play;     /* BSP_AUDIO_OUT_Play 的回傳值 */
+/* 診斷用，SWD 讀得到。板子沒有 UART，這是唯一的觀察方式。
+ * 意義與哨兵值見 audio_out.h。 */
+volatile uint32_t g_dbg_aud_init = AUDIO_UNSET;
+volatile uint32_t g_dbg_aud_play = AUDIO_UNSET;
+volatile uint32_t g_dbg_aud_step;     /* 位元圖，一路 OR 上去 */
+/* 時脈設定的兩個步驟各留一個回傳值 —— 分得出「PLL 開不起來」與
+ * 「PLL 好了但 SPI6 選不到它」。合成一個就又回到「最後一次的值」那種
+ * 分不清病因與症狀的診斷資料（board-notes 18.2）。 */
+volatile uint32_t g_dbg_aud_pll = AUDIO_UNSET;   /* HAL_RCC_OscConfig */
+volatile uint32_t g_dbg_aud_sel = AUDIO_UNSET;   /* HAL_RCCEx_PeriphCLKConfig */
 volatile uint32_t g_dbg_aud_half;     /* 半滿回呼進來幾次 */
 volatile uint32_t g_dbg_aud_full;     /* 全滿回呼進來幾次 */
 volatile uint32_t g_dbg_aud_err;      /* 錯誤回呼進來幾次 */
+volatile uint32_t g_dbg_aud_vol = AUDIO_UNSET;   /* SetVolume 的回傳值 */
+
+/* **腳印要即時寫進 DTCM，不能只放 .bss。**
+ * 現在唯一連得上的 mode=UR 一定會重置，而 .bss 一重置就被啟動碼清光 ——
+ * 也就是說「掛在哪裡」這個最重要的資訊，正好是重置後讀不到的那種。
+ * DTCM 不被啟動碼清（board-notes 22.5），所以每設一個位元就同步抄過去。
+ * 位置與 album_main.c 的黑盒子同一塊（第 17 格）。 */
+#define AUD_BBOX  ((volatile uint32_t *)0x20004020u)
+
+static void aud_step(uint32_t bit)
+{
+    g_dbg_aud_step |= bit;
+    AUD_BBOX[17] = g_dbg_aud_step;
+}
+
+/**
+ * 覆寫 BSP 的 LTDC 時脈設定，**讓 PLL3 同時餵 LCD 與音訊**。
+ *
+ * 這塊板子上兩顆可用的 PLL 都名花有主：
+ *   PLL2 -> XSPI1（PSRAM）與 XSPI2（外部 NOR，程式就在上面執行）
+ *   PLL3 -> LTDC 的像素時脈（LCD BSP 設 PLL3R=16 得到 25MHz）
+ *
+ * 音訊需要第三個來源，但沒有第三顆 PLL。踩過的兩條路：
+ *
+ * 1. BSP 原本的 MX_I2S6_ClockConfig 去重設 **PLL2** —— 回 -9
+ *    （BSP_ERROR_CLOCK_FAILURE）。XSPI 的時脈保護不讓它停 PLL2，所以失敗。
+ *    **那個失敗其實是保護**：成功的話就是抽掉自己執行中的 Flash 的時脈。
+ * 2. 改成重設 **PLL3** —— 初始化全部回報成功、測試音也啟動了，
+ *    然後**整台掛死在 present() 存取 LTDC 暫存器的那一行**。因為 HAL 要
+ *    重設 PLL3 就得先把它關掉，而 LTDC 正靠它掃描面板。
+ *    症狀是「畫面停在最後一幀、程式看起來還活著」，完全不指向時脈。
+ *
+ * 正解是**不要重設任何正在被使用的 PLL**：開機時就把 PLL3 設成一個
+ * 兩邊都夠用的頻率，之後誰都不再動它。
+ *
+ *   VCO = 16MHz x (24 + 4719/8192) = 393.2168 MHz
+ *   PLL3R = 16 -> LTDC   24.5760 MHz（BSP 原本 25.000，差 1.7%，
+ *                        面板更新率跟著差 1.7%，看不出來）
+ *   PLL3Q = 8  -> 音訊   49.1521 MHz（目標 49.152，差 0.0002%）
+ *                        I2S 再除 4 就是 12.288MHz = 48kHz x 256
+ *
+ * 要用分數分頻是因為 49.152 這個數字本身就不是整數分頻分得出來的 ——
+ * 而 48kHz 這一族的音訊時脈全都是它的倍數，湊不到就會音高不準、
+ * 之後對影片的時候還會持續漂移。
+ *
+ * 這個函式在 LCD BSP 裡是 __weak，在應用層定義同名函式就會蓋過去，
+ * 不必改韌體包裡的任何檔案（board-notes 10.3 的老招）。
+ */
+HAL_StatusTypeDef MX_LTDC_ClockConfig(LTDC_HandleTypeDef *hltdc)
+{
+    RCC_OscInitTypeDef       osc = {0};
+    RCC_PeriphCLKInitTypeDef pc  = {0};
+    HAL_StatusTypeDef        status;
+
+    UNUSED(hltdc);
+
+    osc.OscillatorType      = RCC_OSCILLATORTYPE_HSI;
+    osc.HSIState            = RCC_HSI_ON;
+    osc.HSIDiv              = RCC_HSI_DIV1;
+    osc.HSICalibrationValue = RCC_HSICALIBRATION_DEFAULT;
+    osc.PLL1.PLLState       = RCC_PLL_NONE;   /* 系統時脈，不准碰 */
+    osc.PLL2.PLLState       = RCC_PLL_NONE;   /* XSPI（Flash/PSRAM），不准碰 */
+    osc.PLL3.PLLState       = RCC_PLL_ON;
+    osc.PLL3.PLLSource      = RCC_PLLSOURCE_HSI;
+    osc.PLL3.PLLM           = 4;              /* 64MHz / 4 = 16MHz */
+    osc.PLL3.PLLN           = 24;
+    osc.PLL3.PLLFractional  = 4719;           /* 24 + 4719/8192 = 24.576 */
+    osc.PLL3.PLLP           = 2;              /* 沒用到 */
+    osc.PLL3.PLLQ           = 8;              /* -> 音訊 49.152 MHz */
+    osc.PLL3.PLLR           = 16;             /* -> LTDC 24.576 MHz */
+    osc.PLL3.PLLS           = 1;              /* 沒用到 */
+    osc.PLL3.PLLT           = 1;              /* 沒用到 */
+
+    /* 這裡只設 LTDC 的來源。音訊那邊（SPI6 <- PLL3Q）留給
+     * MX_I2S6_ClockConfig，它只動選擇器、不動 PLL。 */
+    pc.PeriphClockSelection = RCC_PERIPHCLK_LTDC;
+    pc.LtdcClockSelection   = RCC_LTDCCLKSOURCE_PLL3R;
+
+    status = HAL_RCC_OscConfig(&osc);
+    if (status != HAL_OK) { return status; }
+
+    return HAL_RCCEx_PeriphCLKConfig(&pc);
+}
+
+/**
+ * 覆寫 BSP 的音訊時脈設定：**只切選擇器，一顆 PLL 都不重設。**
+ *
+ * PLL3 已經在 MX_LTDC_ClockConfig（開機時、LCD 初始化那一步）設好了，
+ * PLL3Q 就是給音訊準備的。這裡要做的只剩下把 SPI6 的來源指過去 ——
+ * 而 HAL_RCCEx_PeriphCLKConfig 選到 PLL3Q 時會順手把 PLL3 的 Q 輸出打開
+ * （stm32h7rsxx_hal_rcc_ex.c 的 SPI6 分支），所以連輸出致能都不必自己做。
+ *
+ * **這個函式絕對不能去 HAL_RCC_OscConfig 任何一顆 PLL。** 上面那段註解
+ * 記著兩次的代價：動 PLL2 得到 -9，動 PLL3 直接掛死在 LTDC。
+ */
+HAL_StatusTypeDef MX_I2S6_ClockConfig(I2S_HandleTypeDef *hi2s, uint32_t SampleRate)
+{
+    RCC_PeriphCLKInitTypeDef pc = {0};
+    HAL_StatusTypeDef        status;
+
+    UNUSED(hi2s);
+    aud_step(AUD_STEP_CLK_CALL);
+
+    /* PLL3 的 Q 輸出固定是 49.152 MHz（見上面的頻率計畫），48kHz 這一族
+     * 都對得上。其他取樣率這一版不支援 —— 與其偷偷用錯的時脈播出音高不對
+     * 的聲音，不如當場回報失敗。 */
+    if (SampleRate != AUDIO_FREQUENCY_48K && SampleRate != AUDIO_FREQUENCY_96K &&
+        SampleRate != AUDIO_FREQUENCY_16K && SampleRate != AUDIO_FREQUENCY_8K &&
+        SampleRate != AUDIO_FREQUENCY_32K && SampleRate != AUDIO_FREQUENCY_192K) {
+        g_dbg_aud_pll = 0xBADFu;
+        AUD_BBOX[19]  = g_dbg_aud_pll;
+        return HAL_ERROR;
+    }
+
+    /* PLL3 必須已經在跑（LCD 初始化時設好的）。沒跑代表開機順序被改動過，
+     * 這裡直接失敗比默默用一個沒鎖定的時脈好。 */
+    if ((RCC->CR & RCC_CR_PLL3RDY) == 0u) {
+        g_dbg_aud_pll = 0xBAD3u;
+        AUD_BBOX[19]  = g_dbg_aud_pll;
+        return HAL_ERROR;
+    }
+    g_dbg_aud_pll = (uint32_t)HAL_OK;
+    AUD_BBOX[19]  = g_dbg_aud_pll;
+    aud_step(AUD_STEP_CLK_OSC);
+
+    pc.PeriphClockSelection = RCC_PERIPHCLK_SPI6;
+    pc.Spi6ClockSelection   = RCC_SPI6CLKSOURCE_PLL3Q;
+
+    status        = HAL_RCCEx_PeriphCLKConfig(&pc);
+    g_dbg_aud_sel = (uint32_t)status;
+    AUD_BBOX[20]  = g_dbg_aud_sel;
+    aud_step(AUD_STEP_CLK_SEL);
+    return status;
+}
 
 bool audio_init(uint32_t rate, uint32_t volume)
 {
     BSP_AUDIO_Init_t cfg;
     int32_t          r;
+
+    aud_step(AUD_STEP_INIT_CALL);
+
+    for (uint32_t i = 52u; i <= 59u; i++) { AUD_BBOX[i] = 0u; }
 
     if (g_ready) { return true; }
 
@@ -51,10 +201,25 @@ bool audio_init(uint32_t rate, uint32_t volume)
 
     r = BSP_AUDIO_OUT_Init(0, &cfg);
     g_dbg_aud_init = (uint32_t)r;
+    AUD_BBOX[18] = g_dbg_aud_init;
+    /* **Init 自己就會呼叫錯誤回呼，卻照樣回傳成功。** BSP 的 I2S_MspInit
+     * 在建 DMA 連結串列失敗時是呼叫 BSP_AUDIO_OUT_Error_CallBack(0) 然後
+     * 繼續往下走 —— Init 的回傳值完全看不出來。所以要在這裡先記一次，
+     * 才分得出「錯誤是初始化時就發生的」還是「播放之後 DMA 才出錯」。 */
+    AUD_BBOX[46] = g_dbg_aud_err;
+    aud_step(AUD_STEP_BSP_RET);   /* 它「有回來」本身就是一項資訊 */
     if (r != BSP_ERROR_NONE) { return false; }
+
+    /* **音量要自己再設一次。** BSP_AUDIO_OUT_Init 的 cfg.Volume 有沒有真的
+     * 傳到耳機放大器那一級，我沒有單獨驗過 —— 而第一次實測就是「DMA 在跑、
+     * 編解碼器也沒靜音，但聽不到」，把音量明確設上去才聽得到。
+     * 與其相信一個沒驗過的路徑，不如多打一次 I2C。 */
+    g_dbg_aud_vol = (uint32_t)BSP_AUDIO_OUT_SetVolume(0, (uint8_t)volume);
+    AUD_BBOX[104] = g_dbg_aud_vol;
 
     g_rate  = rate;
     g_ready = true;
+    aud_step(AUD_STEP_INIT_OK);
     return true;
 }
 
@@ -62,6 +227,9 @@ bool audio_tone(uint32_t hz)
 {
     uint32_t frames = AUDIO_BUF_BYTES / 4u;   /* 一個 frame = L+R = 4 bytes */
     int32_t  r;
+    uint32_t g_st = 0u;
+
+    aud_step(AUD_STEP_TONE_CALL);
 
     if (!g_ready) { return false; }
 
@@ -87,9 +255,63 @@ bool audio_tone(uint32_t hz)
     /* **DMA 從記憶體讀，資料還在 D-Cache 裡的話它讀到的是舊內容。**
      * 這一輪已經在 USB 那邊踩過同一類問題兩次（board-notes 22.3 / 22.5）。 */
     SCB_CleanDCache_by_Addr((uint32_t *)g_buf, (int32_t)(frames * 4u));
+    aud_step(AUD_STEP_TONE_FILL);
 
     r = BSP_AUDIO_OUT_Play(0, (uint8_t *)g_buf, frames * 4u);
     g_dbg_aud_play = (uint32_t)r;
+    AUD_BBOX[21] = g_dbg_aud_play;
+    aud_step(AUD_STEP_PLAY_RET);
+
+    /* 硬體自己的狀態，比任何推測都準（board-notes 16.4）。
+     * DMA 的 CSR 會直接寫著是哪一種錯：USEF=設定錯、DTEF=傳輸錯、
+     * ULEF=連結清單錯；SPI6 的 SR 則說 I2S 這邊有沒有 underrun。 */
+    AUD_BBOX[27] = GPDMA1_Channel2->CSR;
+    AUD_BBOX[28] = GPDMA1_Channel2->CCR;
+    AUD_BBOX[29] = SPI6->SR;
+    AUD_BBOX[45] = (uint32_t)BSP_AUDIO_OUT_GetState(0, &g_st) == 0u ? g_st : 0xFFFFFFFFu;
+
+    /* 再等一下下重看一次：Play 回來的那一瞬間 DMA 可能還沒被啟動，
+     * 只看那一刻會把「還沒開始」誤判成「起不來」。 */
+    HAL_Delay(50);
+    AUD_BBOX[43] = GPDMA1_Channel2->CSR;
+    AUD_BBOX[44] = GPDMA1_Channel2->CCR;
+    AUD_BBOX[47] = SPI6->CR1;
+    AUD_BBOX[48] = SPI6->CFG1;
+    /* **把編解碼器自己的狀態讀出來。**
+     * 到這裡為止證明的是「DMA 有在把資料餵給 I2S」，那是 I2S 之前的事。
+     * 沒有聲音的話問題在 I2S 之後 —— 而 WM8904 掛在 I2C1（跟觸控同一條），
+     * BSP 有現成的讀取函式，可以直接問它「你到底有沒有被設好」，
+     * 不必用推的（board-notes 16.4：靠硬體自己的狀態，不要猜）。 */
+    {
+        static const uint16_t regs[] = {
+            WM8904_SW_RESET,             /* 讀回來應該是 0x8904，證明 I2C 通 */
+            WM8904_BIAS_CONTROL0,
+            WM8904_PWR_MANAGEMENT0, WM8904_PWR_MANAGEMENT2,
+            WM8904_PWR_MANAGEMENT3, WM8904_PWR_MANAGEMENT6,
+            WM8904_CLOCK_RATES0, WM8904_CLOCK_RATES1, WM8904_CLOCK_RATES2,
+            WM8904_AUDIO_INTERFACE1, WM8904_AUDIO_INTERFACE2,
+            WM8904_AUDIO_INTERFACE3,
+            WM8904_DAC_DIGITAL_VOL_LEFT, WM8904_DAC_DIGITAL1,
+            WM8904_ANALOG_HP0, WM8904_CHARGE_PUMP0, WM8904_CLASS_W0,
+            /* 類比輸出那一級：DAC 沒靜音不代表耳機放大器沒靜音。
+             * HPOUT?_MUTE 是另一個位元，音量也是另一組暫存器。 */
+            WM8904_ANALOG_OUTPUT1_LEFT, WM8904_ANALOG_OUTPUT1_RIGHT,
+            WM8904_DC_SERVO0, WM8904_DC_SERVO_READBACK0,
+        };
+        AUD_BBOX[80] = SPI6->I2SCFGR;
+        AUD_BBOX[81] = SPI6->CR1;
+        AUD_BBOX[82] = SPI6->SR;
+        for (uint32_t i = 0; i < (sizeof(regs) / sizeof(regs[0])); i++) {
+            uint8_t  b[2] = {0, 0};
+            int32_t  rr   = BSP_I2C1_ReadReg(AUDIO_I2C_ADDRESS, regs[i], b, 2);
+            AUD_BBOX[83u + i] = (rr != 0) ? 0xE2C0000u
+                                          : (((uint32_t)b[0] << 8) | b[1]);
+        }
+    }
+
+    AUD_BBOX[49] = g_dbg_aud_half;
+    AUD_BBOX[50] = g_dbg_aud_full;
+    AUD_BBOX[51] = g_dbg_aud_err;
     return r == BSP_ERROR_NONE;
 }
 
@@ -98,6 +320,42 @@ void audio_stop(void)
     if (g_ready) {
         (void)BSP_AUDIO_OUT_Stop(0);
     }
+}
+
+/**
+ * 音訊輸出 DMA 的中斷處理常式（BSP 的表：I2S6 輸出 = GPDMA1 Channel 2）。
+ *
+ * **少了它就是無限迴圈。** 向量表裡沒有被定義的中斷會連到啟動碼的
+ * `Default_Handler`，而那個函式是 `b .` —— 中斷一進來，CPU 就永遠停在
+ * 那裡，不會有任何錯誤訊息。
+ *
+ * 實測症狀：`BSP_AUDIO_OUT_Play` 進去就沒再出來（腳印停在 0x3BE，
+ * PLAY_RET 這個位元不亮），而且相簿在啟動看門狗**之前**跑音訊測試，
+ * 所以沒有人來收拾，板子就一直掛著 —— 螢幕停在「音訊測試」那一頁。
+ * 從外面看跟「相簿當掉」一模一樣，完全不會聯想到是少了一個中斷向量。
+ *
+ * 定義在應用層而不是 cube 的 `stm32h7rsxx_it.c`：中斷處理常式本來就是
+ * 覆寫弱符號，放哪裡效果都一樣；而 cube/ 是 gitignore 的，寫在那裡
+ * 重跑 setup.sh 就會消失。
+ */
+void GPDMA1_Channel2_IRQHandler(void)
+{
+    /* **在進 HAL 之前先凍結第一次的現場。** HAL_DMA_IRQHandler 會先把狀態
+     * 旗標寫掉才呼叫錯誤回呼，所以事後再讀 CSR 永遠是乾淨的 —— 看起來
+     * 像「沒有錯誤」，而錯誤回呼卻真的進來過。
+     * 只留第一次：後面的會覆蓋掉，而第一次才是病因（board-notes 16.12/18.2）。 */
+    if (AUD_BBOX[53] == 0u) {
+        AUD_BBOX[52] = GPDMA1_Channel2->CSR;
+        AUD_BBOX[54] = GPDMA1_Channel2->CBR1;
+        AUD_BBOX[55] = GPDMA1_Channel2->CSAR;
+        AUD_BBOX[56] = GPDMA1_Channel2->CDAR;
+        AUD_BBOX[57] = GPDMA1_Channel2->CLLR;
+        AUD_BBOX[58] = GPDMA1_Channel2->CTR1;
+        AUD_BBOX[59] = GPDMA1_Channel2->CTR2;
+    }
+    AUD_BBOX[53]++;
+
+    BSP_AUDIO_OUT_IRQHandler(0, AUDIO_OUT_HEADPHONE);
 }
 
 /* BSP 的回呼。第一步只計次 —— 有沒有進來就知道 DMA 有沒有在跑，
@@ -118,4 +376,7 @@ void BSP_AUDIO_OUT_Error_CallBack(uint32_t Instance)
 {
     (void)Instance;
     g_dbg_aud_err++;
+    /* 直接寫 DTCM：要分辨「錯一次」與「錯誤中斷一直重進」（中斷風暴會讓
+     * 主程式永遠跑不下去，症狀就是整台掛住）。而這個數字必須活過重置。 */
+    AUD_BBOX[30] = g_dbg_aud_err;
 }
