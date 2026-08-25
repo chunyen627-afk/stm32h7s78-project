@@ -5,7 +5,21 @@
 wmv / flv / ts / gif，甚至一個裝滿 JPEG 的資料夾。這支程式本身不解析影片，
 只是把檔案交給 ffmpeg。
 
-輸出是單一 .bin，複製到 SD 卡根目錄，相簿選單的「影片」就會列出來。
+輸出是**兩個檔案**：
+
+    NAME.bin    影格包（畫面）
+    NAME.wav    音軌（48kHz / 16-bit / 立體聲）
+
+兩個都複製到 SD 卡根目錄。**檔名必須一樣** —— 韌體是靠同名去配對的
+（`MOVIE10.bin` 找 `MOVIE10.wav`），改名要兩個一起改。
+來源沒有音軌就只會有 .bin，影片照樣能播，只是沒聲音。
+
+音訊為什麼只能是 48kHz / 16-bit / 立體聲：板子的音訊時脈是 PLL3Q 分出來的
+49.152MHz，那是 48k 這一族專用的數字，44.1k 湊不出來（會音高不準而且
+對影片持續漂移）。所以這裡一律轉成 48k，不管來源是什麼。
+
+**音訊與影像的時間範圍一定要一致。** --start / --duration 會同時套用到
+兩邊 —— 只切其中一邊的話，同步從第一秒就錯了。
 
 方向
 ----
@@ -64,6 +78,11 @@ HDR = 24
 PANEL_W = 800
 PANEL_H = 480
 FLASH_LIMIT = 126 * 1024 * 1024
+
+# 韌體只吃這一組（見上面的說明）。每秒 192000 bytes，換算檔案大小用。
+WAV_RATE  = 48000
+WAV_CH    = 2
+WAV_BYTES_PER_SEC = WAV_RATE * WAV_CH * 2
 
 
 def need(tool):
@@ -177,6 +196,46 @@ def extract(src, outdir, args, vf):
         sys.exit("ffmpeg 切影格失敗")
 
 
+def has_audio(path):
+    """來源有沒有音軌。沒有就只出 .bin，不要產生一個空的 wav ——
+    韌體看到同名的 wav 就會去開它，空檔會變成「有音軌但沒聲音」。"""
+    out = subprocess.run(
+        ["ffprobe", "-v", "error", "-select_streams", "a:0",
+         "-show_entries", "stream=codec_type",
+         "-of", "default=noprint_wrappers=1:nokey=1", path],
+        capture_output=True, text=True)
+    return out.returncode == 0 and "audio" in out.stdout
+
+
+def extract_audio(src, dst, args):
+    """抽音軌成 48kHz / 16-bit / 立體聲的 WAV。
+
+    **-ss / -t 的位置與寫法要跟切影格那邊一模一樣**，否則兩邊會從不同的
+    時間點開始，同步從第一秒就錯 —— 而那個症狀看起來會像「韌體的同步
+    寫壞了」。
+    """
+    cmd = ["ffmpeg", "-v", "error", "-stats", "-y"]
+    if args.start:
+        cmd += ["-ss", str(args.start)]
+    cmd += ["-i", src]
+    if args.duration:
+        cmd += ["-t", str(args.duration)]
+    cmd += ["-vn",                      # 只要聲音
+            "-map", "a:0",              # 有多條音軌時取第一條
+            "-acodec", "pcm_s16le",
+            "-ar", str(WAV_RATE),
+            "-ac", str(WAV_CH),
+            dst]
+    if subprocess.run(cmd).returncode != 0:
+        sys.exit("ffmpeg 抽音軌失敗")
+
+    size = os.path.getsize(dst)
+    secs = (size - 44) / float(WAV_BYTES_PER_SEC)
+    print("  %s：%.1f MB，%d:%02d（48kHz 立體聲 16-bit）"
+          % (dst, size / 1048576.0, int(secs) // 60, int(secs) % 60))
+    return secs
+
+
 def sof_dims(path):
     """從 SOF 取寬高，順便確認這是解得開的 baseline JPEG。"""
     b = open(path, "rb").read(4096)
@@ -239,6 +298,7 @@ def pack(framedir, dst, fps):
         print("  注意：超過外部 Flash 的可用空間，只能放 SD 卡（複製到根目錄）")
     else:
         print("  可以放 SD 卡，也小到能燒進外部 Flash")
+    return len(paths)
 
 
 def pick_output(base, taken):
@@ -247,10 +307,15 @@ def pick_output(base, taken):
     編號從 02 開始而不是 01，因為第一個就叫 BASE.bin（使用者說的
     「先取第一個名稱，之後批量自己補編號」）。兩位數補零讓它在
     相簿的清單裡照字母排序也是對的。
+
+    **.wav 也要一起避開。** 韌體靠同名配對，所以這兩個檔案是一組的 ——
+    只檢查 .bin 的話，可能挑到一個 .bin 不存在、但 .wav 已經存在的編號，
+    結果新影片配到舊影片的聲音。那個症狀會像「同步整個壞掉」。
     """
     cand = base + ".bin"
     n = 1
-    while cand in taken or os.path.exists(cand):
+    while (cand in taken or os.path.exists(cand)
+           or os.path.exists(cand[:-4] + ".wav")):
         n += 1
         if n > 99:
             sys.exit("同名的檔案已經有 99 個了，換一個名字")
@@ -269,6 +334,8 @@ def main():
   video2bin.py video.mp4 --rotate none    不要轉，保持原本方向
   video2bin.py a.mkv out.bin --fps 30 --quality 4
   video2bin.py a.mov --start 60 --duration 30    只取第 60 秒起的 30 秒
+  video2bin.py *.mp4 --name MOVIE                 批量：MOVIE.bin/.wav、MOVIE02...
+  video2bin.py a.mp4 --audio-only --name MOVIE10  只補音軌（.bin 已經有了）
 """)
     ap.add_argument("src", nargs="*",
                     help="影片檔（ffmpeg 讀得懂的都行）或影格目錄，可以給多個")
@@ -291,6 +358,10 @@ def main():
     ap.add_argument("--preview", action="store_true",
                     help="只產生三張預覽 PNG 確認方向，不轉檔")
     ap.add_argument("--keep-frames", action="store_true", help="保留中間的 JPEG")
+    ap.add_argument("--no-audio", action="store_true",
+                    help="不要抽音軌（只出 .bin）")
+    ap.add_argument("--audio-only", action="store_true",
+                    help="只抽音軌（.bin 已經轉好、只想補聲音時用，快很多）")
     # 給拖放用的 .bat 在沒收到檔案時呼叫。訊息放這裡而不是 .bat 裡，
     # 是因為 cmd 用「解析當下」的字碼頁讀 .bat，中文會被切斷。
     ap.add_argument("--dropinfo", action="store_true", help=argparse.SUPPRESS)
@@ -299,7 +370,25 @@ def main():
 
     if args.dropinfo:
         print("")
-        print("  把影片檔拖到這個 .bat 上面就會轉成 .bin，一次可以拖多個。")
+        if args.audio_only:
+            print("  把影片檔拖到這個 .bat 上面**只會抽出聲音**，不重轉畫面（快很多）。")
+            print("  用在「.bin 已經在卡上、只是沒有聲音」的情況。")
+            print("")
+            print("  **檔名要跟卡上的 .bin 一樣** —— 韌體靠同名配對。")
+            print("  它會先問你名字：給「MOVIE10」就產生 MOVIE10.wav。")
+            print("  一次拖多個的話依序是 名稱.wav、名稱02.wav、名稱03.wav…")
+            print("")
+            print("  轉好的 .wav 複製到 SD 卡根目錄，跟 .bin 放一起。")
+            print("")
+            return
+        print("  把影片檔拖到這個 .bat 上面就會轉檔，一次可以拖多個。")
+        print("")
+        print("  每部影片會產生**兩個**檔案：")
+        print("    名稱.bin   畫面")
+        print("    名稱.wav   聲音（48kHz 立體聲）")
+        print("  **兩個都要複製到 SD 卡根目錄，而且檔名必須一樣** ——")
+        print("  韌體是靠同名配對的，改名要兩個一起改。")
+        print("  來源沒有聲音就只會有 .bin，影片照樣能播。")
         print("")
         if args.name_hint:
             print("  這一支會先問你要用什麼檔名：")
@@ -313,8 +402,8 @@ def main():
         print("  方向自動處理：直式來源轉 ccw、橫向不轉 —— 兩種都在板子上驗過，")
         print("  平常不用給任何參數。")
         print("")
-        print("  轉好的 .bin 複製到 SD 卡根目錄，相簿選單的「影片」就會列出來")
-        print("  （清單最多列 16 部）。")
+        print("  轉好的 .bin 與 .wav 複製到 SD 卡根目錄，相簿選單的「影片」")
+        print("  就會列出來（清單最多列 16 部）。播放時點畫面可以調音量。")
         print("")
         print("  要調參數就開命令列： python video2bin.py --help")
         return
@@ -357,6 +446,12 @@ def main():
                   % (i + 1, len(args.src), os.path.basename(one)))
         if args.out:
             dst = args.out
+        elif base and args.audio_only:
+            # **只補音軌時不能跳號。** 一般轉檔會避開已經存在的檔名，
+            # 但這裡的目的正好相反 —— 要對上那個已經存在的 .bin
+            # （韌體靠同名配對）。跳號的話新的 wav 會配到別部影片。
+            stem = os.path.join(os.path.dirname(one) or ".", base)
+            dst = ("%s.bin" % stem) if i == 0 else ("%s%02d.bin" % (stem, i + 1))
         elif base:
             dst = pick_output(os.path.join(os.path.dirname(one) or ".", base),
                               taken)
@@ -371,9 +466,20 @@ def main():
 
 
 def convert_one(src, dst, args):
+    wav = os.path.splitext(dst)[0] + ".wav"
+
     if os.path.isdir(src):
         print("==> 打包（來源是影格目錄，不做旋轉縮放）")
         pack(src, dst, args.fps)
+        return
+
+    if args.audio_only:
+        if args.no_audio:
+            sys.exit("--audio-only 跟 --no-audio 不能一起用")
+        if not has_audio(src):
+            sys.exit("這個來源沒有音軌：%s" % src)
+        print("==> 只抽音軌")
+        extract_audio(src, wav, args)
         return
 
     src_w, src_h, src_fps = probe(src)
@@ -396,16 +502,38 @@ def convert_one(src, dst, args):
         return
 
     tmp = tempfile.mkdtemp(prefix="video2bin_")
+    frames = 0
     try:
         print("==> 切影格")
         extract(src, tmp, args, vf)
         print("==> 打包")
-        pack(tmp, dst, args.fps)
+        frames = pack(tmp, dst, args.fps)
     finally:
         if args.keep_frames:
             print("  影格保留在 %s" % tmp)
         else:
             shutil.rmtree(tmp, ignore_errors=True)
+
+    if args.no_audio:
+        return
+    if not has_audio(src):
+        print("==> 音軌：來源沒有音軌，只出 .bin（影片照樣能播，只是沒聲音）")
+        return
+
+    print("==> 抽音軌")
+    asec = extract_audio(src, wav, args)
+
+    # **把兩邊的長度擺在一起。** 這是唯一能在轉檔當下看出「音畫會不會
+    # 對不上」的地方 —— 到了板子上才發現就得整包重轉。
+    vsec = frames / float(args.fps) if frames else 0.0
+    if vsec:
+        diff = asec - vsec
+        print("  影像 %d:%02d／音訊 %d:%02d，差 %+.2f 秒"
+              % (int(vsec) // 60, int(vsec) % 60,
+                 int(asec) // 60, int(asec) % 60, diff))
+        if abs(diff) > 1.0:
+            print("  ** 兩邊差超過一秒 —— 來源本身的音畫長度就不一致，")
+            print("     或 --start/--duration 只切到其中一邊。板子上會對不準。 **")
 
 
 if __name__ == "__main__":
