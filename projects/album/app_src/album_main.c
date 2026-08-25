@@ -1672,6 +1672,12 @@ static bool select_screen(void)
         }
         if (g_dbg_autovideo && g_vid_count > 0u) {
             BBOX[127] = autovideo_index();
+            /* **吃掉旗標**，跟其他除錯旗標一樣一次性。
+             * 不吃的話按「返回」離開播放之後，這裡立刻又把同一部從頭播 ——
+             * 使用者看到的是「返回鍵回不去選單，只會回到影片開頭」，
+             * 而返回鍵其實是好的。除錯用的觸發不該改變正式路徑的行為
+             * （board-notes 16.3）。 */
+            g_dbg_autovideo = 0u;
             play_video(&g_vids[BBOX[127]]);
             dirty = true;
             continue;
@@ -3372,6 +3378,7 @@ void album_run(void)
                  * 不寫就完全等於不存在（board-notes 16.3 的旗標觸發原則）。 */
                 if (g_dbg_autovideo && g_vid_count > 0u) {
                     BBOX[127] = autovideo_index();
+                    g_dbg_autovideo = 0u;       /* 一次性，見選單那一處的說明 */
                     play_video(&g_vids[BBOX[127]]);
                     continue;
                 }
