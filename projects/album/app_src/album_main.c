@@ -122,11 +122,17 @@ volatile uint32_t g_decode_fail;
  * 連續失敗超過門檻就判定卡片掛了，跳出去做一次完整的重新初始化。
  * 門檻要大於「偶爾一張壞檔」但遠小於整份清單。 */
 #define CARD_SICK_RUN   24u
-/* 連續幾張「解不開」就跳出來提示。設 8 是因為偶爾一兩張壞檔很正常，
- * 但連續八張就代表整個資料夾都不對，繼續試下去只是讓畫面看起來當機。 */
+/* 連續幾張「解不開」就跳出來提示。
+ *
+ * **門檻要跟清單大小取小的那個。** 寫死 8 的話，只有一兩張照片的資料夾
+ * 永遠湊不到，畫面還是什麼都不說 —— 使用者用「一張不支援的圖」測就踩到了。
+ * 一張圖的清單失敗一次，就已經是「全部都不行」了。
+ *
+ * 反過來，大清單裡偶爾一兩張壞檔很正常，不該打斷播放，所以上限留 8。 */
 #define BAD_PHOTO_RUN   8u
 
 static uint32_t g_bad_photo_run;   /* 連續解不開幾張（卡片是好的）*/
+static bool     g_bad_photo_told;  /* 這次播放已經提示過了 */
 static uint32_t g_read_fail_run;
 static bool     g_card_sick;
 
@@ -963,7 +969,9 @@ static void play_video(const video_info_t *v)
                 ov_until = HAL_GetTick() + OV_MS;
             } else if (x >= BACK_X && x < BACK_X + BACK_W &&
                        y >= BACK_Y && y < BACK_Y + BACK_H) {
-                wait_release();
+                g_bad_photo_run = 0;   /* 每次開始播放重新算 */
+    g_bad_photo_told = false;
+    wait_release();
                 break;
             } else if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
                 /* 拖曳 seek。位移表讓任何一格都能直接定址，成本跟播下一格
@@ -2421,12 +2429,26 @@ static void slideshow(void)
          * **一定要在螢幕上說話**：不講的話畫面就只是不動，看起來跟當機
          * 一模一樣（相簿在幾十毫秒內一張張失敗，沒有東西可換）。
          * 使用者實際踩過，而相框放在桌上時沒有人會接 SWD 去讀計數器。 */
-        if (g_bad_photo_run >= BAD_PHOTO_RUN) {
+        /* 連續全部失敗 -> 這個資料夾整個不能播，停下來回選單。
+         * 門檻取 min(清單大小, 8)：只有一兩張的資料夾失敗一次就等於全滅，
+         * 寫死 8 的話永遠湊不到（使用者用「一張不支援的圖」測就踩到了）。 */
+        if (g_bad_photo_run >= ((g_order_count < BAD_PHOTO_RUN)
+                                ? g_order_count : BAD_PHOTO_RUN)) {
             g_bad_photo_run = 0;
             show_message("這些照片解不開",
                          "需要 baseline JPEG、單張 2MB 以內");
             HAL_Delay(4000);
             return;              /* 回選單，不要繼續空轉 */
+        }
+
+        /* 只有一兩張壞掉：**提示但不打斷**，而且整次播放只講一次。
+         * 不講的話使用者永遠不知道有照片放不出來；每輪都講的話，
+         * 四千多張裡混進一張壞檔就會讓相框變成警報器。 */
+        if (g_bad_photo_run > 0u && !g_bad_photo_told) {
+            g_bad_photo_told = true;
+            show_message("有照片解不開，已跳過",
+                         "需要 baseline JPEG、單張 2MB 以內");
+            HAL_Delay(2000);
         }
 
         if (!sd_present() || g_card_sick || !wait_screen_on()) {

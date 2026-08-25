@@ -181,6 +181,7 @@ volatile uint32_t g_dbg_sum_scale, g_dbg_sum_out, g_dbg_sum_total;
 volatile uint32_t g_dbg_sum_kpx;
 volatile uint32_t g_dbg_need_rgb;   /* 這張照片解碼需要多少 RGB 空間 */
 volatile uint32_t g_dbg_toobig;     /* 因為太大被跳過的張數 */
+volatile uint32_t g_dbg_notbaseline; /* 不是 baseline 被擋下的張數 */
 
 /* 實際的讀寫範圍。與預期值一比就知道有沒有越界，不用再靠推理。 */
 volatile uint32_t g_dbg_dw, g_dbg_dh, g_dbg_ox, g_dbg_oy;
@@ -913,7 +914,20 @@ photo_result_t photo_show(const char *path)
     if (aborted()) {
         return PHOTO_ABORTED;
     }
+    /* **先看 SOF，不是 baseline 就直接退回，不要送進硬體解碼器。**
+     *
+     * 硬體 JPEG 只吃 baseline（SOF0）。餵 progressive（SOF2）給它的話它不會
+     * 立刻報錯，而是**卡十秒才放棄** —— 而上層還會重試一次，所以一張圖要
+     * 二十秒。實測 g_last_ms = 20016，但 g_dbg_us_read 只有 7ms、
+     * g_dbg_us_jpeg 只有 27ms，時間全花在等解碼器超時。
+     *
+     * 走一次標記鏈只要幾微秒，這一擋讓「不能解的圖」從二十秒變成瞬間。
+     * find_sof 本來就在（只是原本只寫進 g_dbg_sof 當除錯用），拿來擋剛好。 */
     find_sof(JPEG_FILE_BUF, size);
+    if (g_dbg_sof != 0xC0u) {
+        g_dbg_notbaseline++;
+        return PHOTO_ERR_DECODE;
+    }
 
     g_out_total = 0;
     g_in_ptr    = JPEG_FILE_BUF;
