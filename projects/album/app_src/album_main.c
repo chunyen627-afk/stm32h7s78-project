@@ -1126,6 +1126,7 @@ static void play_video(const video_info_t *v)
     uint32_t frame_us, frame_ms, frame_frac;
     uint32_t ov_until = 0;
     uint32_t vol_lock = 0u;   /* 按過音量之後要連續幾次讀不到觸控才解鎖 */
+    int32_t  dmax = -1000000, dmin = 1000000;   /* 音畫偏差的極值 */
     bool     paused = false;
 
     if (!video_open(v)) {
@@ -1176,6 +1177,33 @@ static void play_video(const video_info_t *v)
                     draw_overlay(v, idx, false);
                 }
                 present();
+            }
+
+            /* **逐格量音畫偏差，記極值。**
+             *
+             * 只在結束時取樣一次是不夠的 —— 那看不出它是「一直在那個值
+             * 附近」還是「一路往一個方向爬」，而這兩件事的意義完全不同：
+             * 前者是固定偏移（無害），後者才是漂移（會越來越糟）。
+             *
+             * 影格時間用 fps_x100 反算，跟播放節奏用的是同一個來源。 */
+            if (g_vid_has_audio) {
+                /* 用 frame_us 而不是重算一次 —— 這樣比對的正是播放節奏
+                 * 實際使用的那個數字（含它的整數截斷），量到的就是真正
+                 * 會發生在畫面上的偏差。 */
+                int32_t vms = (int32_t)((uint64_t)idx * frame_us / 1000u);
+                int32_t d   = (int32_t)audio_wav_pos_ms() - vms;
+
+                if (d > dmax) { dmax = d; }
+                if (d < dmin) { dmin = d; }
+                BBOX[142] = (uint32_t)dmax;
+                BBOX[143] = (uint32_t)dmin;
+                BBOX[144] = (uint32_t)d;
+
+                /* 開頭的基準值：跑到第 240 格（約十秒，啟動的暫態過去了）
+                 * 記一次。有了它就能直接算「後來 - 開頭」= 真正累積的漂移，
+                 * 不必從 max/min 的包絡去猜 —— 包絡裡混著影格量化的
+                 * 一個週期，那不是漂移。 */
+                if (idx == 240u) { BBOX[145] = (uint32_t)d; }
             }
             idx = (idx + 1u) % v->count;      /* 無限循環 */
         }

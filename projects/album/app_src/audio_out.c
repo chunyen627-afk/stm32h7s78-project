@@ -357,6 +357,13 @@ static volatile uint32_t g_tc_cnt;
 static uint32_t g_ht_done;         /* 主迴圈加的 */
 static uint32_t g_tc_done;
 
+/* 播放位置的原點與暫停補償，見 audio_wav_pos_ms()。 */
+static uint32_t g_pos_org;         /* 檔案位移的原點 */
+static uint32_t g_pos_org_play;    /* 對應那一刻已送出的位元組數 */
+static uint32_t g_pause_play;      /* 進入暫停時已送出的位元組數 */
+static uint32_t g_pause_total;     /* 暫停期間送出去的靜音總量 */
+static bool     g_playing;         /* DMA 真的在跑（CBR1 才有意義）*/
+
 volatile uint32_t g_dbg_wav_rate;
 volatile uint32_t g_dbg_wav_fmt;   /* (聲道 << 16) | 位元數 */
 volatile uint32_t g_dbg_wav_bytes; /* data 區塊總長 */
@@ -491,7 +498,13 @@ bool audio_wav_start(const char *path, uint32_t volume)
     wav_fill(1u);
 
     g_dbg_wav_step = 5u;
+    g_pos_org      = 0u;
+    g_pos_org_play = 0u;
+    g_pause_total  = 0u;
+    g_pause_play   = 0u;
+    g_playing      = true;
     if (BSP_AUDIO_OUT_Play(0, (uint8_t *)g_buf, AUDIO_BUF_BYTES) != BSP_ERROR_NONE) {
+        g_playing = false;
         audio_wav_stop();
         return false;
     }
@@ -513,17 +526,45 @@ void audio_wav_pump(void)
     while (g_tc_done != g_tc_cnt) { wav_fill(1u); g_tc_done++; }
 }
 
-/* 目前播到第幾毫秒。
+/* 已經送出去（＝已經播出去）的位元組數。
  *
- * 用「已經餵給 DMA 的量」減掉「還在緩衝裡沒播出去的量」——
- * 只算餵進去的會超前一整個緩衝（170ms），拿它來對時就會固定偏一格多。 */
+ * 之前是用「餵進緩衝的量」估的，而那個值以 16KB 為單位跳，解析度只有
+ * 85ms —— 拿來量漂移的話，尺比要量的東西還粗（實測九分鐘量到的差
+ * 58ms，比解析度還小，連正負號都定不下來）。
+ *
+ * 改成問 DMA 自己：`CBR1` 的 BNDT 是「這一塊還剩幾 bytes 沒搬」，
+ * 所以緩衝內的位置就是 `BUF - BNDT`，精度是位元組（0.005ms）。
+ *
+ * **要防繞圈的競爭。** 讀 BNDT 跟讀「已經跑完幾圈」不是原子的：如果剛好
+ * 在兩次讀取之間繞了一圈，算出來會整整多一個緩衝（170ms），而且是偶發的
+ * —— 那種偏差混在漂移數據裡會非常難查。做法是前後各讀一次圈數，
+ * 不一樣就重來。
+ */
+static uint32_t played_bytes(void)
+{
+    uint32_t c1, c2, bndt;
+
+    if (!g_playing) { return 0u; }
+    do {
+        c1   = g_tc_cnt;
+        bndt = GPDMA1_Channel2->CBR1 & DMA_CBR1_BNDT;
+        c2   = g_tc_cnt;
+    } while (c1 != c2);
+
+    return c1 * AUDIO_BUF_BYTES + (AUDIO_BUF_BYTES - bndt);
+}
+
+/* 目前播到第幾毫秒（扣掉暫停期間送出去的靜音）。 */
 uint32_t audio_wav_pos_ms(void)
 {
-    uint32_t fed = g_dbg_wav_fed;
+    uint32_t played = played_bytes();
+    uint32_t paused_now = g_wav_paused ? (played - g_pause_play) : 0u;
+    uint32_t off;
 
-    if (fed < AUDIO_BUF_BYTES) { return 0u; }
-    return (uint32_t)(((uint64_t)(fed - AUDIO_BUF_BYTES) * 1000u) /
-                      WAV_BYTES_PER_SEC);
+    if (!g_wav_open || played < g_pos_org_play) { return 0u; }
+
+    off = g_pos_org + (played - g_pos_org_play) - g_pause_total - paused_now;
+    return (uint32_t)(((uint64_t)off * 1000u) / WAV_BYTES_PER_SEC);
 }
 
 uint32_t audio_wav_len_ms(void)
@@ -544,7 +585,14 @@ bool audio_wav_seek_ms(uint32_t ms)
 
     if (f_lseek(&g_wav, g_wav_data0 + off) != FR_OK) { return false; }
     g_wav_left    = g_wav_total - off;
-    g_dbg_wav_fed = off + AUDIO_BUF_BYTES;       /* 讓 pos_ms 跟著跳 */
+    g_dbg_wav_fed = off + AUDIO_BUF_BYTES;
+
+    /* 位置的原點跟著搬。注意剛跳完的那一個緩衝（最多 170ms）裡還是舊資料，
+     * 所以位置會有一段短暫的誤差 —— 這是環形緩衝本來就有的，不是 bug。 */
+    g_pos_org      = off;
+    g_pos_org_play = played_bytes();
+    g_pause_total  = 0u;
+    g_pause_play   = g_pos_org_play;
 
     /* 兩半都重填，否則會先播出跳之前的殘留（聽起來像「跳完先閃一段舊的」）。*/
     wav_fill(0u);
@@ -569,7 +617,15 @@ bool audio_wav_seek_ms(uint32_t ms)
  */
 void audio_wav_pause(bool on)
 {
-    if (!g_wav_open) { return; }
+    if (!g_wav_open || on == g_wav_paused) { return; }
+
+    /* 暫停期間 DMA 照跑（送的是靜音），所以「已送出的位元組」會繼續增加。
+     * 不補償的話播放位置會在暫停時往前跑，恢復後就跟畫面差掉暫停的時間。 */
+    if (on) {
+        g_pause_play = played_bytes();
+    } else {
+        g_pause_total += played_bytes() - g_pause_play;
+    }
     g_wav_paused = on;
 }
 
@@ -590,6 +646,7 @@ void audio_wav_stop(void)
     }
     g_wav_left   = 0u;
     g_wav_paused = false;
+    g_playing    = false;
 }
 
 /* 設定音量（0~100）。**0 是真的靜音，不是最小聲。**
