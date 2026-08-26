@@ -983,6 +983,20 @@ static video_info_t g_vids[MAX_VIDEOS];
  * 掃卡會把它清掉，寧可從頭播也不要接到別部影片的位置。 */
 static uint32_t g_vid_resume[MAX_VIDEOS];
 static uint32_t     g_vid_count;
+/* --- 除錯建置：自動播影片 + 自動滑動 ----------------------------------
+ * 非 0 就進入全自動測試：開機直接播第一部有音軌的影片，然後每隔這麼多
+ * 毫秒自動滑動一次。**走的是跟觸控滑動完全一樣的路徑**，只是不用人在
+ * 旁邊點。查 USB 音訊那個「滑一兩下就當」用的 —— 一輪要燒錄、重現、
+ * 讀黑盒子，每一輪都要人配合就慢得離譜（board-notes 16.7 同一條教訓）。
+ *
+ * **正式建置一定要是 0。** */
+#define ALBUM_AUTOPLAY      0     /* 開機直接播第一部有音軌的影片 */
+#define ALBUM_AUTOSEEK_MS   0u     /* 非 0 就每隔這麼多毫秒自動滑動一次 */
+
+/* 二分法：0 = 完全不啟動 USB 主機（連 usbaudio_init 都不呼叫）。
+ * 用來判定「自動滑動會當」到底是不是 USB 帶進來的。 */
+#define ALBUM_USB_AUDIO     0
+
 volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
 volatile uint32_t   g_dbg_audiotest;   /* SWD 寫入頻率（Hz）就播測試音 */
 volatile uint32_t   g_dbg_autoplay;    /* SWD 可寫，直接開始放照片 */
@@ -1208,6 +1222,7 @@ static void play_video(const video_info_t *v)
             break;
         }
 
+        BBOX[149] = 1u;               /* 麵包屑：迴圈頂 */
         if (!paused) {
             uint8_t *back = (uint8_t *)(g_front ? FB0_ADDR : FB1_ADDR);
 
@@ -1244,9 +1259,37 @@ static void play_video(const video_info_t *v)
                  * 一個週期，那不是漂移。 */
                 if (idx == 240u) { BBOX[145] = (uint32_t)d; }
             }
+            BBOX[149] = 2u;           /* 解碼與 present 都做完了 */
             idx = (idx + 1u) % v->count;      /* 無限循環 */
         }
 
+#if ALBUM_AUTOSEEK_MS
+        /* 自動滑動：跟下面觸控那條路做一模一樣的事（改 idx、跳音訊、
+         * 重新對時），只是由時間觸發。位置用一個不會重複的序列走遍整條
+         * 進度條，免得每次都滑到同一個地方而漏掉某些情況。 */
+        {
+            static uint32_t as_next;
+            static uint32_t as_seq;
+
+            if ((int32_t)(HAL_GetTick() - as_next) >= 0) {
+                uint32_t px = (as_seq * 137u) % (uint32_t)PB_W;
+
+                as_seq++;
+                idx = (uint32_t)((uint64_t)px * v->count / PB_W);
+                if (idx >= v->count) { idx = v->count - 1u; }
+                BBOX[149] = 8u;           /* 自動滑動：seek 之前 */
+                (void)audio_wav_seek_ms((uint32_t)((uint64_t)idx * 100000u /
+                                        (v->fps_x100 ? v->fps_x100 : 2400u)));
+                BBOX[149] = 9u;           /* 自動滑動：seek 回來了 */
+                next_ms = HAL_GetTick();
+                acc     = 0;
+                as_next = HAL_GetTick() + ALBUM_AUTOSEEK_MS;
+                BBOX[146] = as_seq;          /* 自動滑了幾次 */
+            }
+        }
+#endif
+
+        BBOX[149] = 3u;               /* 自動滑動那一段過了 */
         touched = read_touch(&x, &y);
         if (!touched && vol_lock > 0u) { vol_lock--; }
         if (touched) {
@@ -1338,9 +1381,11 @@ static void play_video(const video_info_t *v)
         if ((int32_t)(next_ms - HAL_GetTick()) > 0) {
             /* **等待期間一定要繼續補音訊。** 這個忙等一等就是幾十毫秒，
              * 而緩衝只有 170ms —— 不補的話等個幾格就欠載了。 */
+            BBOX[149] = 4u;           /* 進入節奏忙等 */
             while ((int32_t)(next_ms - HAL_GetTick()) > 0) {
                 audio_wav_pump();
             }
+            BBOX[149] = 5u;           /* 離開節奏忙等 */
         } else {
             next_ms = HAL_GetTick();          /* 跟不上就重新對時 */
         }
@@ -3181,7 +3226,15 @@ void album_run(void)
     /* USB 無線耳機（CN17）。**失敗不影響相簿其他功能** —— 沒插 dongle
      * 是常態，這個呼叫只是把主機堆疊起起來等它出現。
      * 狀態看 DTCM 黑盒子 160 號之後（見 usbaudio.c）。 */
+#if ALBUM_USB_AUDIO
+    /* 麵包屑：釘死「usbaudio_init 到底有沒有回來」。
+     * USB 的黑盒子顯示 USBH_Start 沒回來（缺 0x20 那個位元），但相簿
+     * 明明跑到第 5 階段又滑了兩次 —— 兩者矛盾，代表我對其中一邊的
+     * 判讀是錯的。不要再推，讓它自己說。 */
+    BBOX[148] = 0xAA000001u;
     usbaudio_init();
+    BBOX[148] = 0xAA000002u;
+#endif
 
     /* 睡眠時保持除錯連線。
      *
@@ -3275,6 +3328,10 @@ void album_run(void)
     /* 0x5A5C = 測試音 + 自動播影片（量音訊 DMA 對輪詢解碼的干擾，A 組）
      * 0x5A5D = 只播影片（B 組對照）。**同一份韌體用旗標切換**，
      *          重編一版再比會混進別的差異。 */
+#if ALBUM_AUTOPLAY
+    g_dbg_autovideo = 2u;       /* 除錯建置：開機就播第一部有音軌的影片 */
+#endif
+
     if ((BBOX[16] >> 16) == 0x5A5Cu || (BBOX[16] >> 16) == 0x5A5Du) {
         g_dbg_autovideo = 2u;   /* 挑有音軌的那一部 */
         BBOX[16] = ((BBOX[16] >> 16) == 0x5A5Du)

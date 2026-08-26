@@ -140,9 +140,17 @@ void HAL_HCD_MspInit(HCD_HandleTypeDef* hcdHandle)
     __HAL_RCC_USB_OTG_FS_CLK_ENABLE();
     __HAL_RCC_USBPHYC_CLK_ENABLE();
 
-    /* Peripheral interrupt init */
-    HAL_NVIC_SetPriority(OTG_FS_IRQn, 6, 0);
-    HAL_NVIC_EnableIRQ(OTG_FS_IRQn);
+    /* --- **不要開 NVIC 的 OTG 中斷：改成純輪詢。** -----------------------
+     * 實測：只要開啟 OTG 全域中斷，相簿就會在影片滑動時整台停住 ——
+     * 主迴圈、TIM7、看門狗全部凍結，而且**沒有 CPU 故障**。
+     * 那是 HAL_HCD_IRQHandler 進去不出來（或不斷重入）的形狀。
+     * 二分法確認過：USBH_Init 不開中斷 -> 自動滑動 12 次跑滿 50 秒正常；
+     * 一開中斷 -> 滑一兩次就當。跟 VBUS 無關（只開中斷不供電也一樣當）。
+     *
+     * 改成輪詢之後這個風險從根本消失：USB 只在我們呼叫它的時候動，
+     * 而抽送頻率（8kHz）遠高於 USB 訊框的 1kHz，時序完全夠。
+     * 呼叫點見 usbaudio.c 的 usb_poll()。 */
+    HAL_NVIC_DisableIRQ(OTG_FS_IRQn);
   /* USER CODE BEGIN USB_OTG_FS_MspInit 1 */
 
   /* USER CODE END USB_OTG_FS_MspInit 1 */
@@ -620,5 +628,10 @@ USBH_StatusTypeDef USBH_Get_USB_Status(HAL_StatusTypeDef hal_status)
  * （board-notes 23.2 同一招）。 */
 void OTG_FS_IRQHandler(void)
 {
+  /* 數它進來幾次。**中斷風暴是目前唯一還沒排除的假設** ——
+   * USB 主機起動了、埠供電了、dongle 掛著，但沒有人呼叫 USBH_Process
+   * 去把狀態推進，中斷旗標就可能一直重新觸發，把主迴圈餓死。
+   * 幾秒內衝到百萬就是風暴；只有幾十次就不是。 */
+  ((volatile uint32_t *)0x20004020u)[185]++;
   HAL_HCD_IRQHandler(&hhcd_USB_OTG_FS);
 }

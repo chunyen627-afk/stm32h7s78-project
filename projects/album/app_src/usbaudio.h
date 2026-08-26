@@ -33,4 +33,20 @@ void usbaudio_process(void);
 /* dongle 在線而且 UAC1 類別已經掛好，可以開始送音訊。 */
 bool usbaudio_ready(void);
 
+/* --- 串流後端 ---------------------------------------------------------
+ * 形狀刻意跟 audio_out.h 的那 7 個一樣：audio_out.c 在輸出切到 USB 時
+ * 直接轉發過來，**I2S 那條路一個字都不用改**。
+ *
+ * usbaudio_wav_pump() 一樣要從主迴圈定期呼叫（開播序列與補資料在裡面）；
+ * 真正把封包送出去的是 TIM7 的 8kHz 中斷。 */
+bool     usbaudio_wav_start(const char *path, uint32_t volume);
+void     usbaudio_wav_pump(void);
+bool     usbaudio_wav_active(void);
+void     usbaudio_wav_stop(void);
+void     usbaudio_wav_pause(bool on);
+bool     usbaudio_wav_seek_ms(uint32_t ms);
+uint32_t usbaudio_wav_pos_ms(void);
+uint32_t usbaudio_wav_len_ms(void);
+void     usbaudio_set_volume(uint32_t pct);
+
 #endif /* USBAUDIO_H */

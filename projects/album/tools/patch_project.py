@@ -99,7 +99,7 @@ ALBUM_SOURCES = ["album_main.c", "photo.c", "video.c", "favorites.c",
                  "vbus.c",
                  "usbdrive.c",
                  "audio_out.c",
-                 "usbaudio.c", "usbh_glue.c",
+                 "usbaudio.c", "usbh_glue.c", "wav_hdr.c",
                  "sd_bsp_diskio.c", "xspi_psram.c",
                  "gfx.c", "font_zh.c"]   # gfx/xspi_psram 來自 repo 的 shared/
 
@@ -480,6 +480,58 @@ def patch_usbh_audio_alt():
     print("  usbh_audio.c 已套用（按格式挑 alt setting）")
 
 
+def patch_fault_bbox():
+    """把故障處理常式改成「先把現場寫進黑盒子，再等看門狗」。
+
+    ST 範本的 HardFault_Handler 是一個空的 `while (1)` —— **什麼都不留**。
+    這一輪查 USB 音訊的當機，症狀是「主迴圈與 TIM7 中斷在同一毫秒一起停」，
+    那就是故障或中斷不返回，但沒有任何現場可看，只能一輪一輪猜。
+
+    記三個暫存器就夠判讀大部分情況：
+      CFSR  哪一種故障（匯流排／記憶體管理／使用方式）
+      HFSR  是不是由上面那些升級上來的
+      BFAR  **出事的資料位址** —— 接近 0 就是對 NULL 解參照
+
+    位址跟 usbaudio.c 的黑盒子同一塊 DTCM，用 184 之後（那邊用到 181）。
+    """
+    path = os.path.join(PROJ, "Appli", "Src", "stm32h7rsxx_it.c")
+    if not os.path.isfile(path):
+        print("  !! 找不到 it.c，略過")
+        return
+
+    s = io.open(path, encoding="utf-8").read()
+    if "FBOX" in s:
+        print("  it.c 已改過")
+        return
+
+    helper = (
+        "/* 本專案加：故障現場的黑盒子。說明見 tools/patch_project.py。 */" + NL +
+        "#define FBOX ((volatile uint32_t *)0x20004020u)" + NL +
+        "static void fbox_record(uint32_t kind)" + NL +
+        "{" + NL +
+        "  FBOX[184] = kind;" + NL +
+        "  FBOX[185] = SCB->CFSR;" + NL +
+        "  FBOX[186] = SCB->HFSR;" + NL +
+        "  FBOX[187] = SCB->BFAR;" + NL +
+        "  FBOX[188]++;" + NL +
+        "}" + NL + NL)
+
+    anchor = "/**" + NL + "  * @brief This function handles Hard fault interrupt." + NL + "  */"
+    if anchor not in s:
+        print("  !! it.c 找不到錨點，略過")
+        return
+    s = s.replace(anchor, helper + anchor, 1)
+
+    for kind, name in ((1, "HardFault_Handler"), (2, "MemManage_Handler"),
+                       (3, "BusFault_Handler"), (4, "UsageFault_Handler")):
+        old = "void " + name + "(void)" + NL + "{"
+        if old in s:
+            s = s.replace(old, old + NL + "  fbox_record(" + str(kind) + "u);", 1)
+
+    io.open(path, "w", encoding="utf-8").write(s)
+    print("  it.c 已套用（故障現場寫進黑盒子）")
+
+
 def main():
     if not os.path.isdir(PROJ):
         print(f"找不到專案目錄: {PROJ}")
@@ -495,6 +547,7 @@ def main():
     patch_boot_hse()
     patch_i2s_dma_cache()
     patch_usbh_audio_alt()
+    patch_fault_bbox()
     return 0
 
 

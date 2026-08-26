@@ -15,6 +15,8 @@
  * 訊息就寫著「中斷干擾輪詢解碼」。所以第二步一定要量格率，不能只聽聲音。
  */
 #include "audio_out.h"
+#include "wav_hdr.h"
+#include "usbaudio.h"
 #include "main.h"
 #include "stm32h7s78_discovery_audio.h"
 #include "stm32h7s78_discovery_lcd.h"   /* MX_LTDC_ClockConfig 的原型 */
@@ -416,56 +418,41 @@ static void wav_fill(uint32_t half)
 
 /* WAV 檔頭：不要假設 data 一定在第 44 個位元組。
  * 很多轉檔工具會塞 LIST/INFO 之類的區塊進去，寫死 44 會直接把雜訊當成音訊播。 */
+/* 檔頭解析搬到 wav_hdr.c 跟 USB 那條路共用（行為刻意一模一樣）。
+ * 這裡只負責把結果填進本檔既有的全域，其餘完全沒動。 */
 static bool wav_parse(void)
 {
-    uint8_t  hdr[12];
-    UINT     got = 0;
-    uint32_t guard;
+    wav_hdr_t h;
 
-    if (f_read(&g_wav, hdr, 12u, &got) != FR_OK || got != 12u) { return false; }
-    if (memcmp(hdr, "RIFF", 4) != 0 || memcmp(hdr + 8, "WAVE", 4) != 0) {
-        return false;
-    }
+    if (!wav_hdr_parse(&g_wav, &h)) { return false; }
 
-    for (guard = 0; guard < 32u; guard++) {   /* 有上限，壞檔不會讓它繞不出來 */
-        uint8_t  ck[8];
-        uint32_t len;
-
-        if (f_read(&g_wav, ck, 8u, &got) != FR_OK || got != 8u) { return false; }
-        len = (uint32_t)ck[4] | ((uint32_t)ck[5] << 8) |
-              ((uint32_t)ck[6] << 16) | ((uint32_t)ck[7] << 24);
-
-        if (memcmp(ck, "fmt ", 4) == 0) {
-            uint8_t f[16];
-
-            if (len < 16u || f_read(&g_wav, f, 16u, &got) != FR_OK || got != 16u) {
-                return false;
-            }
-            g_dbg_wav_rate = (uint32_t)f[4] | ((uint32_t)f[5] << 8) |
-                             ((uint32_t)f[6] << 16) | ((uint32_t)f[7] << 24);
-            g_dbg_wav_fmt  = ((uint32_t)((uint32_t)f[2] | ((uint32_t)f[3] << 8)) << 16) |
-                             (uint32_t)((uint32_t)f[14] | ((uint32_t)f[15] << 8));
-            if (len > 16u && f_lseek(&g_wav, f_tell(&g_wav) + (len - 16u)) != FR_OK) {
-                return false;
-            }
-        } else if (memcmp(ck, "data", 4) == 0) {
-            g_wav_left      = len;
-            g_wav_total     = len;
-            g_wav_data0     = (uint32_t)f_tell(&g_wav);
-            g_dbg_wav_bytes = len;
-            return true;                      /* 檔案指標正好停在資料開頭 */
-        } else {
-            /* 區塊是偶數對齊的，奇數長度後面會補一個位元組。 */
-            if (f_lseek(&g_wav, f_tell(&g_wav) + len + (len & 1u)) != FR_OK) {
-                return false;
-            }
-        }
-    }
-    return false;
+    g_dbg_wav_rate  = h.rate;
+    g_dbg_wav_fmt   = ((uint32_t)h.channels << 16) | h.bits;
+    g_wav_left      = h.data_len;
+    g_wav_total     = h.data_len;
+    g_wav_data0     = h.data_off;
+    g_dbg_wav_bytes = h.data_len;
+    return true;
 }
+
+/* --- 輸出路徑：USB 無線耳機 vs 3.5mm 耳機孔 ---------------------------
+ * **兩條都保留。** 偵測到 dongle 就走 USB，沒有（或 USB 那邊開不起來）
+ * 就退回 I2S —— 使用者明確要求 3.5mm 要能繼續用。
+ *
+ * 選擇只在 audio_wav_start() 做一次，之後整段都用同一條路：
+ * 播到一半換路徑會在聲音上留下一個接縫，而且位置換算的原點也會跳掉。
+ *
+ * 這個旗標是**下面六個函式唯一的分歧點** —— I2S 的實作完全沒有動。 */
+static bool g_use_usb;
 
 bool audio_wav_start(const char *path, uint32_t volume)
 {
+    g_use_usb = false;
+    if (usbaudio_ready() && usbaudio_wav_start(path, volume)) {
+        g_use_usb = true;
+        return true;
+    }
+
     g_dbg_wav_step  = 1u;
     g_dbg_wav_fed   = 0u;
     g_dbg_wav_under = 0u;
@@ -514,6 +501,24 @@ bool audio_wav_start(const char *path, uint32_t volume)
 
 void audio_wav_pump(void)
 {
+    /* --- **USB 的狀態機一定要在這裡也被推進** --------------------------
+     * 不管這一段音訊走的是 I2S 還是 USB。
+     *
+     * 原因是實測出來的：相簿的影片節奏是
+     *     `while (next_ms > HAL_GetTick()) { audio_wav_pump(); }`
+     * 而**影片迴圈完全不經過 nap()** —— USB 原本只掛在 nap() 裡，
+     * 於是一進影片就沒有人服務 USB 了。後果不只是「音訊不會開播」：
+     * 主機起動了、埠供電了、dongle 掛在上面而沒有人去清它的中斷旗標，
+     * 那是中斷風暴，會把主迴圈餓死。
+     *
+     * 實測（自動滑動測試）：USB 開著滑兩次就當；把 USB 整個編掉，
+     * 滑 15 次、跑滿 60 秒完全正常。
+     *
+     * usbaudio_process() 在抽送已經交給中斷時會自己直接回來。 */
+    usbaudio_process();
+
+    if (g_use_usb) { usbaudio_wav_pump(); return; }
+
     if (!g_wav_open) { return; }
 
     /* 差距大於 1 代表上一次還沒補完就又被播過去了 —— 那一段是舊資料，
@@ -557,6 +562,8 @@ static uint32_t played_bytes(void)
 /* 目前播到第幾毫秒（扣掉暫停期間送出去的靜音）。 */
 uint32_t audio_wav_pos_ms(void)
 {
+    if (g_use_usb) { return usbaudio_wav_pos_ms(); }
+
     uint32_t played = played_bytes();
     uint32_t paused_now = g_wav_paused ? (played - g_pause_play) : 0u;
     uint32_t off;
@@ -569,12 +576,16 @@ uint32_t audio_wav_pos_ms(void)
 
 uint32_t audio_wav_len_ms(void)
 {
+    if (g_use_usb) { return usbaudio_wav_len_ms(); }
+
     return (uint32_t)(((uint64_t)g_wav_total * 1000u) / WAV_BYTES_PER_SEC);
 }
 
 /* 跳到指定的時間點。拖曳進度條之後聲音要跟著跳，否則畫面對了聲音沒對。 */
 bool audio_wav_seek_ms(uint32_t ms)
 {
+    if (g_use_usb) { return usbaudio_wav_seek_ms(ms); }
+
     uint32_t off;
 
     if (!g_wav_open) { return false; }
@@ -583,7 +594,11 @@ bool audio_wav_seek_ms(uint32_t ms)
     off &= ~3u;                                  /* 對齊到一個取樣框 */
     if (off > g_wav_total) { off = g_wav_total; }
 
+    /* 麵包屑（跟 album_main.c 的 BBOX[149] 同一格）：
+     * 10 進入 11 lseek 回來 12 第一半填完 13 第二半填完。 */
+    ((volatile uint32_t *)0x20004020u)[149] = 10u;
     if (f_lseek(&g_wav, g_wav_data0 + off) != FR_OK) { return false; }
+    ((volatile uint32_t *)0x20004020u)[149] = 11u;
     g_wav_left    = g_wav_total - off;
     g_dbg_wav_fed = off + AUDIO_BUF_BYTES;
 
@@ -596,7 +611,9 @@ bool audio_wav_seek_ms(uint32_t ms)
 
     /* 兩半都重填，否則會先播出跳之前的殘留（聽起來像「跳完先閃一段舊的」）。*/
     wav_fill(0u);
+    ((volatile uint32_t *)0x20004020u)[149] = 12u;
     wav_fill(1u);
+    ((volatile uint32_t *)0x20004020u)[149] = 13u;
     return true;
 }
 
@@ -617,6 +634,8 @@ bool audio_wav_seek_ms(uint32_t ms)
  */
 void audio_wav_pause(bool on)
 {
+    if (g_use_usb) { usbaudio_wav_pause(on); return; }
+
     if (!g_wav_open || on == g_wav_paused) { return; }
 
     /* 暫停期間 DMA 照跑（送的是靜音），所以「已送出的位元組」會繼續增加。
@@ -631,6 +650,8 @@ void audio_wav_pause(bool on)
 
 bool audio_wav_active(void)
 {
+    if (g_use_usb) { return usbaudio_wav_active(); }
+
     /* 資料讀完之後還要讓 DMA 把緩衝裡剩下的播完（最多兩個半區）。 */
     return g_wav_open && (g_wav_left != 0u ||
                           (uint32_t)(g_ht_cnt + g_tc_cnt) < 2u ||
@@ -639,6 +660,10 @@ bool audio_wav_active(void)
 
 void audio_wav_stop(void)
 {
+    /* **兩邊都收。** stop 可能發生在還沒選定路徑、或剛切換完的時候，
+     * 只收一邊會留下一條還在跑的串流。兩個都是冪等的。 */
+    if (g_use_usb) { usbaudio_wav_stop(); g_use_usb = false; return; }
+
     if (g_wav_open) {
         audio_stop();
         (void)f_close(&g_wav);
@@ -656,6 +681,8 @@ void audio_wav_stop(void)
  * 所以 0 走 BSP 的靜音（它會下 WM8904 的 DAC_MUTE），其餘才走音量。 */
 void audio_set_volume(uint32_t pct)
 {
+    if (g_use_usb) { usbaudio_set_volume(pct); return; }
+
     if (pct > 100u) { pct = 100u; }
 
     if (pct == 0u) {
