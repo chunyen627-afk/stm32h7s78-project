@@ -95,7 +95,16 @@ static WAV_InfoTypedef WavInfo;
 static FIL WavFile;
 static Audio_BufferTypeDef BufferCtl;
 int16_t FilePos = 0;
-static uint8_t freq_pending = 0U;   /* 取樣率還沒設定成功 */
+
+/* --- 開播的三個階段，每一個都有自己的旗標 -------------------------------
+ * 原本的程式**沒有這三個旗標**，全部擠在 USBH_AUDIO_GetOutOffset() 回的
+ * -1 裡面 —— 而那個 -1 同時代表「還沒開播」與「檔案播完了」。
+ * 分不開的後果見 README〈爆音的模型錯在哪〉。 */
+static uint8_t freq_pending = 0U;       /* 取樣率還沒設定成功 */
+static uint8_t play_pending = 0U;       /* 取樣率設好了，Play 還沒回 OK */
+static uint8_t play_started = 0U;       /* Play 回過 USBH_OK，資料真的在送 */
+static volatile uint8_t eof_seen = 0U;  /* 類別回報整段送完（唯一可信的「播完了」）*/
+static uint32_t dbg_unexpected = 0U;    /* 開播之後非預期停下來的次數 */
 uint8_t* oldfile;
 
 /* Exported variables ------------------------------------------------------- */
@@ -297,8 +306,15 @@ AUDIO_ErrorTypeDef AUDIO_Start(uint8_t idx)
      * 而且振幅越大越明顯（那是波形不連續，不是底噪）。
      *
      * 這裡只發起，實際的重試放在 PLAY 狀態 —— 不能在這裡卡迴圈等，
-     * 因為完成它需要主迴圈去跑 USBH_Process。 */
+     * 因為完成它需要主迴圈去跑 USBH_Process。
+     *
+     * 補一句上一輪沒查清楚的機制：SetFrequency 回 USBH_BUSY **不是**因為
+     * 控制傳輸還沒完成，而是因為它要求 play_state == AUDIO_PLAYBACK_IDLE，
+     * 而類別剛掛上時是 AUDIO_PLAYBACK_INIT。重試是對的，理由不一樣。 */
     freq_pending = 1U;
+    play_pending = 0U;
+    play_started = 0U;
+    eof_seen     = 0U;
 
     /* Fill whole buffer at first time */
     if (f_read(&WavFile,
@@ -417,13 +433,40 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
       if (st == USBH_OK)
       {
         freq_pending = 0U;
+        play_pending = 1U;
         USBH_UsrLog("SetFrequency OK: %luHz %uch %ubit",
                     (unsigned long)WavInfo.SampleRate,
                     (unsigned)WavInfo.NbrChannels,
                     (unsigned)WavInfo.BitPerSample);
       }
     }
+    else if (play_pending != 0U)
+    {
+      /* --- 開播：自己重試，不要等回呼 --------------------------------
+       * 唯一會讓類別開始送資料的是 USBH_AUDIO_Play()，而它要求
+       * play_state == AUDIO_PLAYBACK_IDLE。SetFrequency 回 OK 只是把類別
+       * 推進 AUDIO_PLAYBACK_SET_EP，那筆控制傳輸完成之後才回到 IDLE。
+       *
+       * **原本的程式不是這樣開播的**：它靠類別在 SET_EP 完成的那一刻
+       * 呼叫 USBH_AUDIO_FrequencySet() 回呼，而我們的回呼只在
+       * AUDIO_app_state == PLAYBACK_CONFIG 時才動作 —— 狀態機下一輪就
+       * 離開 CONFIG 了，所以那是一場競爭：撞不上就整輪白跑，
+       * GetOutOffset 回 -1 被當成檔案結束，繞 NEXT 的圈子重來。
+       *
+       * 這裡改成主動重試到 OK。play_state 回到 IDLE 之後就不會再變，
+       * 所以不必剛好在那一瞬間呼叫，也就沒有競爭可言。 */
+      if (USBH_AUDIO_Play(&hUsbHostFS, &BufferCtl.buff[0],
+                          WavInfo.FileSize) == USBH_OK)
+      {
+        play_pending = 0U;
+        play_started = 1U;
+        USBH_UsrLog("Play started");
+      }
+    }
 
+    /* 音量爬升等真的開播之後再開始 —— 它跟開播共用同一條控制傳輸的
+     * 狀態機，早插進去只是多一個東西在競爭。 */
+    if (play_started != 0U)
     {
       static uint32_t vol_tick = 0;
       static uint8_t  vol_steps = 0;
@@ -442,8 +485,24 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
       }
     }
 
-    if ((BufferCtl.out_ptr = USBH_AUDIO_GetOutOffset(&hUsbHostFS)) < 0) /* End of file */
+    /* --- 這裡原本是 `if (GetOutOffset() < 0) 就當成檔案結束` ------------
+     * 而 -1 有兩個意思：類別不在 PLAY 狀態就會回 -1，「還沒開播」與
+     * 「播完了」長得一模一樣。現在三種情況各走各的路。 */
+    if (play_started == 0U)
     {
+      /* 還沒開播。什麼都不要做，尤其不要當成檔案結束。 */
+    }
+    else if (eof_seen != 0U)                       /* 真的播完了 */
+    {
+      AUDIO_app_state = AUDIO_STATE_PLAYBACK_NEXT;
+    }
+    else if ((BufferCtl.out_ptr = USBH_AUDIO_GetOutOffset(&hUsbHostFS)) < 0)
+    {
+      /* 開播過、類別卻已經不在 PLAY，而且沒有回報送完 —— 非預期。
+       * 這一條以前是靜悄悄地被當成「檔案結束」吃掉的，現在讓它出聲。 */
+      dbg_unexpected++;
+      USBH_ErrLog("非預期停止 #%lu（開播過但類別離開 PLAY，且沒有 BufferEmpty）",
+                  (unsigned long)dbg_unexpected);
       AUDIO_app_state = AUDIO_STATE_PLAYBACK_NEXT;
     }
     else if (BufferCtl.out_ptr >= (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR)) /* End of buffer */
@@ -595,12 +654,31 @@ static AUDIO_ErrorTypeDef AUDIO_GetFileInfo(uint16_t file_idx,
   */
 void USBH_AUDIO_FrequencySet(USBH_HandleTypeDef * phost)
 {
-  if (AUDIO_app_state == AUDIO_STATE_PLAYBACK_CONFIG)
-  {
-    /* Start first read */
-    USBH_AUDIO_Play(&hUsbHostFS, &BufferCtl.buff[0], WavInfo.FileSize);
-    AUDIO_app_state = AUDIO_STATE_PLAYBACK_PLAY;
-  }
+  UNUSED(phost);
+
+  /* --- 這裡原本是整個範例唯一的開播點 -------------------------------
+   *     if (AUDIO_app_state == AUDIO_STATE_PLAYBACK_CONFIG) {
+   *       USBH_AUDIO_Play(...); AUDIO_app_state = ...PLAY;
+   *     }
+   * 類別在 SET_EP 完成的那一刻呼叫這個回呼，而應用層的狀態機下一輪就
+   * 離開 CONFIG —— 撞得上才開得成播。開播的責任已經移到 PLAY 狀態裡
+   * 主動重試，這裡只留下記錄，用來確認回呼確實有進來過。 */
+  USBH_UsrLog("FrequencySet callback (app_state=%d)", (int)AUDIO_app_state);
+}
+
+/**
+  * @brief  類別回報「這一段資料全部送完了」。
+  *
+  *         這是**唯一可信的「檔案播完了」**：USBH_AUDIO_OutputStream 在
+  *         global_ptr 超過 total_length 時才呼叫它。拿 GetOutOffset() 的
+  *         -1 當結束會把「還沒開播」一起吃進來。
+  * @param  phost: Host Handle
+  * @retval None
+  */
+void USBH_AUDIO_BufferEmptyCallback(USBH_HandleTypeDef * phost)
+{
+  UNUSED(phost);
+  eof_seen = 1U;
 }
 
 /**
