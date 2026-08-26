@@ -24,8 +24,22 @@
 #include "audio.h"
 #include <string.h>
 
-/* 開播後自動往上加幾格音量（每格約 400ms）。從小聲往上，不要嚇到耳朵。 */
-#define AUDIO_VOL_STEPS  8U
+/* 目標音量：裝置自己回報的 volumeMin..volumeMax 之間取百分之幾。
+ *
+ * **不是「按幾下 VOLUME_UP」**。ST 的類別只給相對的 UP/DOWN，按幾下的
+ * 結果完全取決於裝置的預設值與 resolution，換一支耳機就不一樣。
+ * 這裡改成算出絕對目標再自己走過去，並且把裝置回報的刻度印出來，
+ * 之後要調就是改這個數字。
+ *
+ * UAC1 的音量是有號 16 bit、單位 1/256 dB（0x8000 是靜音，不是最小聲）。
+ * ST 把它存進 uint32_t，所以要自己轉回 int16_t 才有意義。 */
+/* 57% -> -32dB。這是使用者實際戴著 JBL 聽過、說「音量還OK」的位置
+ * （2026-08-26）。**不是算出來的，是聽出來的** —— dB 是對數刻度，
+ * 百分比只是給人調的把手，不要用它去推「應該多大聲」。
+ *
+ * 接進相簿之後音量會是螢幕上的控制項，這個常數只管治具的起始值。 */
+#define AUDIO_VOL_PERCENT   57U
+#define AUDIO_VOL_MAX_STEPS 300U   /* 純粹的失控保險，正常收斂用不到 */
 #include "explorer.h"
 
 /* functions prototypes ---------------------------------------------*/
@@ -556,22 +570,87 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
       }
     }
 
-    /* 音量爬升等真的開播之後再開始 —— 它跟開播共用同一條控制傳輸的
-     * 狀態機，早插進去只是多一個東西在競爭。 */
+    /* 音量：走到絕對目標為止。等真的開播之後再開始 —— USBH_AUDIO_SetVolume
+     * 要求 play_state == AUDIO_PLAYBACK_PLAY，而且它跟開播共用同一條
+     * 控制傳輸的狀態機，早插進去只是多一個東西在競爭。 */
     if (play_started != 0U)
     {
-      static uint32_t vol_tick = 0;
+      static uint32_t vol_tick  = 0;
       static uint8_t  vol_steps = 0;
+      static uint8_t  vol_done  = 0;
+      static int32_t  vol_tgt   = 0;
+      static uint8_t  vol_announced = 0;
 
-      if (vol_steps < AUDIO_VOL_STEPS)
+      AUDIO_HandleTypeDef *vh =
+        (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+      if ((vol_done == 0U) && (vh != NULL))
       {
-        if ((HAL_GetTick() - vol_tick) > 400U)
+        int32_t lo  = (int16_t)vh->headphone.attribute.volumeMin;
+        int32_t hi  = (int16_t)vh->headphone.attribute.volumeMax;
+        int32_t cur = (int16_t)vh->headphone.attribute.volume;
+        int32_t res = (int32_t)(int16_t)vh->headphone.attribute.resolution;
+
+        if (res <= 0) { res = 1; }
+
+        if (vol_announced == 0U)
+        {
+          vol_announced = 1U;
+          vol_tgt  = lo + (((hi - lo) * (int32_t)AUDIO_VOL_PERCENT) / 100);
+          /* 一次把裝置的刻度攤開：raw 是 ST 存的原值，dB 是轉成有號之後
+           * 除以 256。兩個都印，因為 ST 的 uint32_t 存法本身就可疑。 */
+          USBH_UsrLog("VOL scale: min=%04lX(%ld.%02udB) max=%04lX(%ld.%02udB) "
+                      "cur=%04lX(%lddB) res=%ld -> target %d%% = %ld (%lddB)",
+                      (unsigned long)(vh->headphone.attribute.volumeMin & 0xFFFFU),
+                      (long)(lo / 256), (unsigned)(((lo % 256) < 0 ? -(lo % 256) : (lo % 256)) * 100 / 256),
+                      (unsigned long)(vh->headphone.attribute.volumeMax & 0xFFFFU),
+                      (long)(hi / 256), (unsigned)(((hi % 256) < 0 ? -(hi % 256) : (hi % 256)) * 100 / 256),
+                      (unsigned long)(vh->headphone.attribute.volume & 0xFFFFU),
+                      (long)(cur / 256),
+                      (long)res,
+                      (unsigned)AUDIO_VOL_PERCENT,
+                      (long)vol_tgt, (long)(vol_tgt / 256));
+        }
+
+        if ((HAL_GetTick() - vol_tick) > 120U)
         {
           vol_tick = HAL_GetTick();
-          if (USBH_AUDIO_SetVolume(&hUsbHostFS, VOLUME_UP) == USBH_OK)
+
+          /* **每 120ms 發一次就好，不要自作聰明配速。**
+           * 一次音量變更實測約 550ms 才落地（跟 HID 輪詢共用同一格
+           * control_state，互相排隊），所以四五次呼叫才生效一次 ——
+           * 那是浪費，但無害：迴圈每次都重讀 cur，到位就停。
+           *
+           * 我試過「只有上一步落地才發下一步」，結果衝過頭而且把診斷行
+           * 變成每 120ms 印一次，45 秒缺的訊框從 8 個變成 683 個。
+           * **會動的東西不要為了漂亮去改。** */
+          if (vol_steps >= AUDIO_VOL_MAX_STEPS)
           {
-            vol_steps++;
-            USBH_UsrLog("volume +1 (%d/%d)", vol_steps, AUDIO_VOL_STEPS);
+            vol_done = 1U;
+            USBH_UsrLog("VOL 失控保險跳了：%u 次還沒到（cur=%lddB tgt=%lddB）",
+                        (unsigned)vol_steps, (long)(cur / 256),
+                        (long)(vol_tgt / 256));
+          }
+          else if (cur < (vol_tgt - (res / 2)))
+          {
+            if (USBH_AUDIO_SetVolume(&hUsbHostFS, VOLUME_UP) == USBH_OK)
+            {
+              vol_steps++;
+            }
+          }
+          else if (cur > (vol_tgt + (res / 2)))
+          {
+            if (USBH_AUDIO_SetVolume(&hUsbHostFS, VOLUME_DOWN) == USBH_OK)
+            {
+              vol_steps++;
+            }
+          }
+          else
+          {
+            vol_done = 1U;
+            USBH_UsrLog("VOL 到位：%u%% = %lddB（發了 %u 次）",
+                        (unsigned)AUDIO_VOL_PERCENT, (long)(cur / 256),
+                        (unsigned)vol_steps);
           }
         }
       }
