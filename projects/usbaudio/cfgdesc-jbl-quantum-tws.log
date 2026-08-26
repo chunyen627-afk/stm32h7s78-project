@@ -1,0 +1,265 @@
+# JBL Quantum TWS dongle 的設定描述元原始記錄（COM4，2026-08-26）
+# 這是量測的原始輸出，判讀寫在 README.md。
+# 只留到音量爬完為止；後面是重複的 [mm:ss] 計時。
+
+**** USB OTG FS Host **** 
+USB Host library started.
+Starting AUDIO Application
+Connect your AUDIO Device
+USB Device Connected
+USB Device Reset Completed
+PID: 208ah
+VID: ecbh
+Address (#1) assigned.
+Manufacturer : Harman International Inc
+Product : JBL Quantum TWS
+Serial Number : 0000000000000000
+Enumeration done.
+This device has only 1 configuration.
+Default configuration set.
+AUDIO class started.
+=== CFGDESC BEGIN VID=0ECB PID=208A dev_total=228 stored=228 ===
+000: 09 02 E4 00 04 01 00 80 0A 09 04 00 00 00 01 01 
+010: 00 04 0A 24 01 00 01 47 00 02 01 02 0C 24 02 01 
+020: 01 01 00 02 03 00 00 00 0A 24 06 02 01 01 01 02 
+030: 02 00 09 24 03 03 01 03 00 02 00 0C 24 02 05 01 
+040: 02 0B 01 00 00 00 00 09 24 06 06 05 01 01 02 00 
+050: 07 24 05 04 01 06 00 09 24 03 07 01 01 00 04 00 
+060: 09 04 01 00 00 01 02 00 00 09 04 01 01 01 01 02 
+070: 00 00 07 24 01 01 01 01 00 0B 24 02 01 02 02 10 
+080: 01 80 BB 00 09 05 01 09 C0 00 01 00 00 07 25 01 
+090: 01 00 00 00 09 04 02 00 00 01 02 00 00 09 04 02 
+0A0: 01 01 01 02 00 00 07 24 01 07 01 01 00 0E 24 02 
+0B0: 01 01 02 10 02 80 3E 00 80 BB 00 09 05 81 09 C0 
+0C0: 00 01 00 00 07 25 01 01 00 00 00 09 04 03 00 01 
+0D0: 03 00 00 06 09 21 10 01 00 01 22 A4 02 07 05 83 
+0E0: 03 40 00 03 
+=== CFGDESC END ===
+ISO EP 01 OUT if=1 alt=1 attr=09 sync=ADAPTIVE usage=data mps=192 x1 bInterval=1 bLength=9 bSynchAddress=00
+ISO EP 81 IN  if=2 alt=1 attr=09 sync=ADAPTIVE usage=data mps=192 x1 bInterval=1 bLength=9 bSynchAddress=00
+CLASS PICK: headphone supported=1 if=1 alt=1 Ep=01 EpSize=192 Poll=1
+INFO : FatFs Initialized !
+SD Parsing .........
+
+Audio file(s) :
+video2.wav
+
+WBC211221.wav
+
+WBC211220.wav
+
+video3.wav
+
+new_face.wav
+
+End of files list.
+
+Auto-start playback (test build)
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+Playing file : 
+video3.wav
+Press the USER BUTTON to play the next wav file.
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[00:00]
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+SetFrequency OK: 48000Hz 2ch 16bit
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+*** Playing audio ***
+
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+[NEXT]
+WAV: data chunk found at 78 (not 44)
+WAV: 48000Hz 2ch 16bit, data=371580928 bytes
+volume +1 (1/8)
+volume +1 (2/8)
+volume +1 (3/8)
+[00:01]
+volume +1 (4/8)
+volume +1 (5/8)
+volume +1 (6/8)
+[00:02]
+volume +1 (7/8)
+volume +1 (8/8)

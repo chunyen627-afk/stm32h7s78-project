@@ -112,6 +112,143 @@ AUDIO_ErrorTypeDef AUDIO_Stop(void);
 /* Exported function prototypes ----------------------------------------------- */
 extern uint8_t Audio_ShowWavFiles(void);
 
+/* --- 量測：把設定描述元原封不動印出來 --------------------------------
+ * 要回答的問題只有一個：**等時 OUT 端點的同步型別**（端點描述元
+ * bmAttributes 的 bits[3:2]）。adaptive 的話裝置跟著我們的送出速度走，
+ * 剩下的只是緩衝設計；asynchronous 的話得自己實作 feedback 端點，
+ * 而 usbh_audio.c 整份沒有這個東西。
+ *
+ * 為什麼印「整份原始位元組」而不是只印那一個欄位：
+ * ST 的類別把描述元拆進 AUDIO_HandleTypeDef 時**沒有保留 bmAttributes**
+ * （stream_out[] 只有 Ep / EpSize / interface / AltSettings / Poll），
+ * 要看的欄位在解析之後就不見了。原始位元組是這裡最細的尺，而且同一次
+ * 量測順便看得到：有沒有伴隨的 feedback 端點（bSynchAddress）、每個
+ * alt setting 的封包大小與 bInterval、裝置支援哪些取樣率。
+ *
+ * 板子這邊多印一行解碼摘要只是交叉檢查；真正的判讀在電腦端對 hex 做。
+ */
+static void USB_DumpCfgDesc(void)
+{
+  const uint8_t *raw = hUsbHostFS.device.CfgDesc_Raw;
+  /* 裝置自己回報的長度（raw 的第 2、3 個位元組）。**不能用
+   * CfgDesc.wTotalLength 判斷有沒有被截斷** —— 那個值在解析時就已經被
+   * MIN() 夾到 USBH_MAX_SIZE_CONFIGURATION，看起來永遠剛剛好。 */
+  uint16_t dev_total = (uint16_t)raw[2] | ((uint16_t)raw[3] << 8);
+  uint16_t have      = hUsbHostFS.device.CfgDesc.wTotalLength;
+  uint16_t i;
+  uint8_t  iso_seen = 0U;
+  uint8_t  cur_if = 0xFFU, cur_alt = 0xFFU;
+
+  USBH_UsrLog("=== CFGDESC BEGIN VID=%04X PID=%04X dev_total=%u stored=%u ===",
+              (unsigned)hUsbHostFS.device.DevDesc.idVendor,
+              (unsigned)hUsbHostFS.device.DevDesc.idProduct,
+              (unsigned)dev_total, (unsigned)have);
+
+  if (dev_total > have)
+  {
+    USBH_UsrLog("!! TRUNCATED: 裝置有 %u bytes，緩衝只收得下 %u",
+                (unsigned)dev_total, (unsigned)have);
+  }
+
+  for (i = 0U; i < have; i += 16U)
+  {
+    char     line[16 * 3 + 1];
+    uint16_t j, n = 0U;
+
+    for (j = 0U; (j < 16U) && ((i + j) < have); j++)
+    {
+      n += (uint16_t)sprintf(&line[n], "%02X ", raw[i + j]);
+    }
+    line[n] = '\0';
+    USBH_UsrLog("%03X: %s", (unsigned)i, line);
+  }
+  USBH_UsrLog("=== CFGDESC END ===");
+
+  /* 走一遍描述元鏈，把每一個等時端點解碼出來 */
+  i = 0U;
+  while ((i + 2U) <= have)
+  {
+    uint8_t blen = raw[i];
+    uint8_t btyp = raw[i + 1U];
+
+    if (blen < 2U)
+    {
+      USBH_UsrLog("!! bLength=0 於位移 %u，鏈斷了，停止走訪", (unsigned)i);
+      break;
+    }
+    if ((uint16_t)(i + blen) > have)
+    {
+      USBH_UsrLog("!! 位移 %u 的描述元超出緩衝，停止走訪", (unsigned)i);
+      break;
+    }
+
+    if ((btyp == 0x04U) && (blen >= 9U))            /* INTERFACE */
+    {
+      cur_if  = raw[i + 2U];
+      cur_alt = raw[i + 3U];
+    }
+    else if ((btyp == 0x05U) && (blen >= 7U))       /* ENDPOINT */
+    {
+      uint8_t  addr  = raw[i + 2U];
+      uint8_t  attr  = raw[i + 3U];
+      uint16_t mps   = (uint16_t)raw[i + 4U] | ((uint16_t)raw[i + 5U] << 8);
+      uint8_t  intvl = raw[i + 6U];
+
+      if ((attr & 0x03U) == 0x01U)                  /* 等時 */
+      {
+        static const char * const sync_name[4] =
+          { "NONE", "ASYNCHRONOUS", "ADAPTIVE", "SYNCHRONOUS" };
+        static const char * const usage_name[4] =
+          { "data", "feedback", "implicit-fb", "reserved" };
+
+        iso_seen++;
+        /* UAC1 的端點描述元是 9 個位元組（多了 bRefresh、bSynchAddress）。
+         * 只有 7 個的話就沒有 bSynchAddress，印哨兵值 FF 而不是 0 ——
+         * 0 是「沒有伴隨端點」的合法值，跟「這個欄位不存在」不一樣。 */
+        USBH_UsrLog("ISO EP %02X %-3s if=%u alt=%u attr=%02X sync=%s usage=%s "
+                    "mps=%u x%u bInterval=%u bLength=%u bSynchAddress=%02X",
+                    (unsigned)addr, ((addr & 0x80U) != 0U) ? "IN" : "OUT",
+                    (unsigned)cur_if, (unsigned)cur_alt, (unsigned)attr,
+                    sync_name[(attr >> 2) & 0x03U],
+                    usage_name[(attr >> 4) & 0x03U],
+                    (unsigned)(mps & 0x07FFU),
+                    (unsigned)(((mps >> 11) & 0x03U) + 1U),
+                    (unsigned)intvl, (unsigned)blen,
+                    (blen >= 9U) ? (unsigned)raw[i + 8U] : 0xFFU);
+      }
+    }
+    i = (uint16_t)(i + blen);
+  }
+
+  if (iso_seen == 0U)
+  {
+    USBH_UsrLog("!! 走訪跑完了，但一個等時端點都沒有 —— "
+                "這是「真的沒有」，不是「沒跑到」");
+  }
+
+  /* 類別最後挑了哪一個 alt setting —— 拿來跟上面的清單對照，
+   * 才知道我們實際在用的是哪一個端點。 */
+  {
+    AUDIO_HandleTypeDef *h = (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+    if (h != NULL)
+    {
+      USBH_UsrLog("CLASS PICK: headphone supported=%u if=%u alt=%u Ep=%02X "
+                  "EpSize=%u Poll=%u",
+                  (unsigned)h->headphone.supported,
+                  (unsigned)h->headphone.interface,
+                  (unsigned)h->headphone.AltSettings,
+                  (unsigned)h->headphone.Ep,
+                  (unsigned)h->headphone.EpSize,
+                  (unsigned)h->headphone.Poll);
+    }
+    else
+    {
+      USBH_UsrLog("CLASS PICK: pData 是 NULL（類別還沒配置）");
+    }
+  }
+}
+
 /**
   * @brief  Starts Audio streaming.
   * @param  idx: File index
@@ -197,6 +334,17 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
   case AUDIO_STATE_PLAYBACK_IDLE:
     if (Appli_state == APPLICATION_READY)
     {
+      /* --- 量測：印在這裡是因為此時類別剛掛上、描述元已經在手上，
+       * 而且**還沒碰 SD 卡** —— 卡有問題也不會把這份量測一起帶走。 */
+      {
+        static uint8_t dumped = 0U;
+
+        if (dumped == 0U)
+        {
+          dumped = 1U;
+          USB_DumpCfgDesc();
+        }
+      }
       AUDIO_app_state = AUDIO_STATE_PLAYBACK_EXPLORE;
       AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_IDLE;
     }

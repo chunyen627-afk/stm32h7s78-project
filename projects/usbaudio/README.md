@@ -91,7 +91,8 @@ LIST 區塊** —— 實測我們卡上的檔案 data 在第 **78** 個位元組
 | 4096 x 16 = 65.5KB | 36 次 |
 
 非單調通常代表「我對它的模型是錯的」，該換方法而不是繼續試參數，
-所以停在這裡。
+所以停在這裡。**後來查出模型錯在哪了，見下面〈爆音的模型錯在哪〉——
+這張表量的不是緩衝掏空。**
 
 爬文的結論跟量到的一致：
 
@@ -101,17 +102,70 @@ LIST 區塊** —— 實測我們卡上的檔案 data 在第 **78** 個位元組
 - ST 社群 2026-02 有一篇〈Heavy Noise and Distorted Audio Output with
   USB Audio Class〉，症狀相符
 
-## 下一步（決定整件事的工作量）
+## 量到了：端點是 **ADAPTIVE**，不必實作 feedback 端點
 
-**把 dongle 的 OUT 端點描述元讀出來，看同步型別是 adaptive 還是
-asynchronous**（端點描述元 `bmAttributes` 的 bits[3:2]）。
+2026-08-26 實測。`audio.c` 的 `USB_DumpCfgDesc()` 在類別剛掛上、還沒碰 SD 卡
+的時候，把整份設定描述元原封不動印到 COM4：
 
-- **adaptive** → 裝置跟著主機的送出速度走，時基仍然是這塊板子的。
-  剩下的就是緩衝設計 —— 那是我們已經證明做得好的事
-  （I2S 那條路 9.5 分鐘零欠載）
-- **asynchronous** → 必須自己實作 feedback 端點（ST 沒有），工作量大很多
+```
+=== CFGDESC BEGIN VID=0ECB PID=208A dev_total=228 stored=228 ===
+...
+080: 01 80 BB 00 09 05 01 09 C0 00 01 00 00 07 25 01
+...
+ISO EP 01 OUT if=1 alt=1 attr=09 sync=ADAPTIVE usage=data mps=192 x1 bInterval=1 bLength=9 bSynchAddress=00
+CLASS PICK: headphone supported=1 if=1 alt=1 Ep=01 EpSize=192 Poll=1
+```
 
-這個量測用現在的治具就能做，不必再買任何東西。
+`09 05 01 09 C0 00 01 00 00` = 端點描述元：`bmAttributes = 0x09`
+= `0000 1001`，bits[1:0]=`01` 等時、**bits[3:2]=`10` = adaptive**、
+bits[5:4]=`00` 資料端點。而且 if=1 alt=1 的 `bNumEndpoints` 就是 1、
+`bSynchAddress = 0x00` —— **整個裝置沒有任何 feedback 端點**，兩邊互相佐證。
+
+**結論：時基是這塊板子的，dongle 跟著我們走。** 不必實作 ST 沒有的
+feedback 端點，剩下的是緩衝設計 —— 那正是這個專案已經證明做得好的事。
+
+順帶從同一份描述元讀到的（都是接下來用得到的硬條件）：
+
+| | |
+|---|---|
+| 喇叭串流支援的取樣率 | **只有 48000 Hz 一個**（`bSamFreqType=1`）。影片音軌本來就是 48k，剛好 |
+| 格式 | PCM、2 聲道、16 bit（`bSubframeSize=2` / `bBitResolution=16`）|
+| 封包 | 192 bytes、`bInterval=1` —— 每 1ms 剛好 48 個立體聲取樣框 |
+| 取樣率控制 | `07 25 01 01 00 00 00`，CS_ENDPOINT 的 `bmAttributes` bit0 = 1，所以 SET_CUR SAMPLING_FREQ 真的支援（跟 `SetFrequency OK` 對得起來）|
+| 麥克風 | if=2 alt=1，EP `0x81` 也是 adaptive，支援 16k / 48k |
+| `bMaxPower` | `0x0A` = 20mA |
+
+換一支耳機要重測時，這段程式碼留著，插上去讀 COM4 就有。
+
+## 爆音的模型錯在哪：那個計數量的不是緩衝掏空
+
+前面「調緩衝大小，重新開播次數 4 / 78 / 36 非單調」的量測，
+**量的根本不是緩衝掏空**。查證過的因果鏈：
+
+1. `USBH_AUDIO_GetOutOffset()` 在 `play_state != AUDIO_PLAYBACK_PLAY` 時
+   回 `-1` —— **「還沒開始播」跟「檔案播完了」回同一個值**。
+   `AUDIO_Process` 把 `-1` 一律當成檔案結束 → `[NEXT]`。
+2. 真正會讓 `play_state` 變成 PLAY 的只有 `USBH_AUDIO_Play()`，
+   而它唯一的呼叫點是 `USBH_AUDIO_FrequencySet()` 這個回呼
+   （`usbh_audio.c:1697`，SetEndpointControls 完成的那一刻）。
+3. 我們的 `USBH_AUDIO_FrequencySet()` 只在
+   `AUDIO_app_state == AUDIO_STATE_PLAYBACK_CONFIG` 時才呼叫 `Play` ——
+   但狀態機下一輪就離開 CONFIG 了。**回呼落在 CONFIG 之外就整輪白跑**，
+   於是 `[NEXT]` → CONFIG → START → PLAY → `-1` → `[NEXT]`，繞圈子，
+   直到某一輪剛好撞上為止。
+
+所以那三個數字是**這場競爭跑了幾圈**，不是緩衝掏空幾次。
+競爭的圈數當然跟緩衝大小沒有單調關係 —— 非單調不是雜訊，是在說
+「你量的東西跟你以為的不是同一件事」。
+
+本輪實測的開機記錄看得到這個形狀：先連續 20 幾組
+`[NEXT]` / `*** Playing audio ***` 快速刷過，之後才穩定播下去、
+24 秒內一次都沒再重開。
+
+**這是 ST 範例本來就有的競爭**（原版也只在 CONFIG 呼叫 `Play`），
+`patches/audio.c.patched` 那版沒有修掉它。修法是把「開播」從狀態的巧合
+改成明確的條件，並且**先把「還沒開播」跟「播完了」分開**
+—— 兩者現在共用 `-1`，不分開的話修完也看不出有沒有修好。
 
 ## 換一支耳機還能用嗎
 
