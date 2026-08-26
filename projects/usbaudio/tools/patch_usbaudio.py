@@ -141,6 +141,34 @@ def main():
              "  if (USBH_AUDIO_FindHIDControl(phost) == USBH_OK)"),
         ], "USBH_AUDIO_PickAltByFormat")
 
+    # --- 抽送權從主迴圈交給 TIM7 中斷所需要的兩個小改動 -----------------
+    #
+    # 為什麼要：USB 的等時端點要 1000 包/秒，而 USBH_Process 一次呼叫只送
+    # 一包。治具的主迴圈每毫秒 162 圈綽綽有餘，但**相簿每格影片要 17ms**
+    # （board-notes 23.7）—— 直接接上去每 17ms 才送一包。I2S 有 DMA 自己
+    # 搬所以不怕，USB 沒有這個好處。
+    #
+    # 實測：SOF（1kHz）驅動**只送得出 500 包/秒**（每個訊框進來時上一筆
+    # URB 還沒 DONE）。改用 TIM7 8kHz 抽送 -> **pk=1008、miss=0、over=0**，
+    # 而且主迴圈空轉 18ms 也不受影響。TIM7 的設定與中斷處理常式在 audio.c。
+    edit(os.path.join(APP, "Src", "usbh_conf.c"), [
+        ("void HAL_HCD_SOF_Callback(HCD_HandleTypeDef *hhcd)\n{",
+         "/* 抽送改由 TIM7 8kHz 做（見 audio.c）。SOF 1kHz 實測只有 500 包/秒：\n"
+         " * 每個訊框進來時上一筆 URB 還沒被標記成 URB_DONE。\n"
+         " * 這個旗標只當「主迴圈不要再驅動 USBH_Process」用。 */\n"
+         "volatile uint8_t g_usb_from_sof = 0U;\n"
+         "extern USBH_HandleTypeDef hUsbHostFS;\n\n"
+         "void HAL_HCD_SOF_Callback(HCD_HandleTypeDef *hhcd)\n{"),
+    ], "g_usb_from_sof")
+
+    edit(os.path.join(APP, "Src", "usb_host.c"), [
+        ("void MX_USB_HOST_Process(void)\n{",
+         "void MX_USB_HOST_Process(void)\n{\n"
+         "  /* 交給 TIM7 之後主迴圈不能再進來，不然同一個狀態機會被重入。 */\n"
+         "  extern volatile uint8_t g_usb_from_sof;\n\n"
+         "  if (g_usb_from_sof != 0U) { return; }\n"),
+    ], "g_usb_from_sof")
+
     edit(os.path.join(APP, "Inc", "ffconf.h"), [
         ("#define FF_USE_LFN		0", "#define FF_USE_LFN		1"),
         ("#define FF_FS_EXFAT		0", "#define FF_FS_EXFAT		1"),

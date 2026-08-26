@@ -173,6 +173,8 @@ static volatile uint8_t g_vol_dirty = 0U;   /* 目標變了，要重新走過去
  * HAL_GetTick 的解析度是 1ms，只夠抓「迴圈卡了好幾毫秒」這種量級；
  * 要是 gap_max 印出來都是 1，代表這把尺不夠細，得換 DWT。 */
 #define AUDIO_BUF_TOTAL   (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR)
+#define AUDIO_FAKE_WORK_MS  17U     /* 相簿每格影片的實測時間 */
+extern volatile uint8_t g_usb_from_sof;
 static uint32_t dbg_runway_min = 0xFFFFFFFFU;  /* (A) 最小可播存量，位元組 */
 static uint32_t dbg_over_cnt   = 0U;           /* (B) out_ptr 超出結尾的次數 */
 static uint32_t dbg_over_max   = 0U;           /* (B) 最多超出去幾個位元組 */
@@ -206,6 +208,8 @@ static uint32_t dbg_rw[DBG_SAMPLES];   /* 那一格的最小可播存量 */
  * 而它是從主迴圈跑的 —— 所以送出速率的上限就是這個數字。
  * 要是 it 也是 960 左右，「pk=960」就不必再找別的解釋了。 */
 static uint32_t dbg_it[DBG_SAMPLES];
+static uint32_t dbg_pm[DBG_SAMPLES];   /* 那一格 TIM7 中斷幾次 */
+static uint32_t dbg_pm0 = 0U;
 static uint32_t dbg_it_cnt = 0U;
 static uint32_t dbg_rd[DBG_SAMPLES];   /* 那一格 f_read 幾次 */
 /* 那一格數到幾個 SOF。hUsbHostFS.Timer 就是 SOF 計數（HAL_HCD_SOF_Callback
@@ -877,6 +881,61 @@ static void audio_trace_class_request(void)
   }
 }
 
+
+/* --- 用 TIM7 以 8kHz 抽送 USB -----------------------------------------
+ * SOF（1kHz）驅動**實測只送得出 500 包/秒**：每個訊框進來時上一筆 URB
+ * 還沒被標記成 URB_DONE（完成中斷跟 SOF 在同一顆 OTG 中斷裡），
+ * 於是每兩個訊框才成功一次。跑得比訊框快，一個訊框裡就有多次機會
+ * 撞到 DONE。
+ *
+ * HAL 的 TIM 模組在這個範例是關掉的（stm32h7rsxx_hal_conf.h:84），
+ * 所以直接寫暫存器。TIM7 是基本計時器，不佔腳位。
+ * 中斷處理常式定義在**應用層**覆寫啟動碼的弱符號 —— 跟 board-notes 23.2
+ * 同一招，而且 cube/ 是 gitignore 的。
+ *
+ * **優先權跟 OTG_FS 一樣（6）**：同優先權不會互相插隊，兩邊自然序列化。
+ * 設得比它高會讓 USBH_Process 插進 OTG 中斷處理到一半的現場。
+ *
+ * **緩衝繞回也搬進來。** 原本 ChangeOutBuffer 在主迴圈，17ms 一圈的
+ * 59Hz 追不上 11Hz 的繞回節奏，實測 over=225（送出緩衝後面的記憶體）。 */
+#define AUDIO_PUMP_HZ  8000U
+static volatile uint32_t g_pump_cnt = 0U;
+
+static void audio_pump_timer_start(void)
+{
+  /* APB1 分頻不是 1 的時候，計時器時脈是 PCLK1 的兩倍。
+   * 不過**不要相信這個推算** —— 下面會把實際的中斷次數印出來對。 */
+  uint32_t timclk = HAL_RCC_GetPCLK1Freq() * 2U;
+  uint32_t psc    = (timclk / 1000000U) - 1U;      /* 先分到 1MHz */
+
+  __HAL_RCC_TIM7_CLK_ENABLE();
+  TIM7->CR1  = 0U;
+  TIM7->PSC  = psc;
+  TIM7->ARR  = (1000000U / AUDIO_PUMP_HZ) - 1U;
+  TIM7->EGR  = TIM_EGR_UG;
+  TIM7->SR   = 0U;
+  TIM7->DIER = TIM_DIER_UIE;
+  HAL_NVIC_SetPriority(TIM7_IRQn, 6, 0);
+  HAL_NVIC_EnableIRQ(TIM7_IRQn);
+  TIM7->CR1  = TIM_CR1_CEN;
+}
+
+void TIM7_IRQHandler(void)
+{
+  if ((TIM7->SR & TIM_SR_UIF) != 0U)
+  {
+    TIM7->SR = ~TIM_SR_UIF;
+    g_pump_cnt++;
+
+    (void)USBH_Process(&hUsbHostFS);
+
+    if (USBH_AUDIO_GetOutOffset(&hUsbHostFS) >= (int32_t)AUDIO_BUF_TOTAL)
+    {
+      (void)USBH_AUDIO_ChangeOutBuffer(&hUsbHostFS, &BufferCtl.buff[0]);
+    }
+  }
+}
+
 /**
   * @brief  Manages Audio process.
   * @param  None
@@ -1354,7 +1413,12 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
         }
       }
 
-      if (BufferCtl.out_ptr >= AUDIO_BUF_TOTAL)          /* End of buffer */
+      /* --- 繞回的所有權要**無縫交接** --------------------------------
+       * TIM7 啟動之前由主迴圈管，啟動之後由中斷管，中間不能有空窗。
+       * 我第一版只交給中斷，結果「開播」到「計時器啟動」之間沒有人管，
+       * 實測那三秒 rw 變成負值（類別衝出緩衝結尾）、pk 掉到 64。
+       * 交接漏一格就是一段壞掉的聲音。 */
+      if ((g_usb_from_sof == 0U) && (BufferCtl.out_ptr >= AUDIO_BUF_TOTAL))
       {
         USBH_AUDIO_ChangeOutBuffer(&hUsbHostFS, &BufferCtl.buff[0]);
       }
@@ -1367,7 +1431,11 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
           diff = AUDIO_BUF_TOTAL + diff;
         }
 
-        if (diff >= (AUDIO_BUF_TOTAL / 2))
+        /* **while，不是 if。** 原本一次主迴圈只補 512 個位元組
+         * （2.7ms 的音訊），在治具那種每毫秒 162 圈的迴圈裡綽綽有餘，
+         * 但相簿每格影片要 17ms —— 那就變成每 17ms 只補 2.7ms，
+         * 一定掏空。改成補到追上為止（單次最多補半個緩衝 = 44ms）。 */
+        while (diff >= (AUDIO_BUF_TOTAL / 2))
         {
           uint32_t t0;
 
@@ -1385,12 +1453,15 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
           {
             f_close(&WavFile);
             error_state = AUDIO_ERROR_NONE;
+            break;
           }
           {
             uint32_t dt = HAL_GetTick() - t0;
             dbg_read_cnt++;
             if (dt > dbg_read_max) { dbg_read_max = dt; }
           }
+
+          diff -= AUDIO_BLOCK_SIZE;
         }
       }
     }
@@ -1442,6 +1513,35 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
       }
     }
 
+    /* --- 實驗：把驅動交給 SOF 中斷，並模擬相簿的 17ms 解碼負載 --------
+     * 相簿每格影片要 17ms（board-notes 23.7：讀檔 2.2 + 解碼 2.9 +
+     * 轉色 12.3），而 USB 的等時端點要 1000 包/秒、一次 USBH_Process
+     * 只送一包。I2S 有 DMA 自己搬所以不怕迴圈慢，**USB 沒有這個好處**。
+     *
+     * 這裡驗的就是「搬到 1kHz 中斷之後撐不撐得住」：
+     *   - g_usb_from_sof = 1 之後主迴圈不再跑 USBH_Process
+     *   - 主迴圈每輪空轉 17ms，模擬解碼
+     * 撐得住的話 pk 應該還是 1000/秒。 */
+    if ((play_started != 0U) && (rb_step >= 3U))
+    {
+      if (g_usb_from_sof == 0U)
+      {
+        audio_pump_timer_start();
+        g_usb_from_sof = 1U;          /* 主迴圈不要再驅動 USBH_Process */
+        USBH_UsrLog("TIM7 %uHz 抽送開啟；主迴圈開始模擬 %ums 的解碼負載",
+                    (unsigned)AUDIO_PUMP_HZ, (unsigned)AUDIO_FAKE_WORK_MS);
+      }
+      else
+      {
+        uint32_t t0 = HAL_GetTick();
+
+        while ((HAL_GetTick() - t0) < AUDIO_FAKE_WORK_MS)
+        {
+          /* 空轉。相簿在這段時間是在解 JPEG。 */
+        }
+      }
+    }
+
     /* --- 收集：一秒一格，收集期間一個字都不印 ------------------------ */
     if ((play_started != 0U) && (dbg_phase == 0U))
     {
@@ -1462,6 +1562,8 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
         dbg_gp[dbg_n] = dbg_gap_max;
         dbg_rw[dbg_n] = dbg_runway_min;
         dbg_it[dbg_n] = dbg_it_cnt;
+        dbg_pm[dbg_n] = g_pump_cnt - dbg_pm0;
+        dbg_pm0 = g_pump_cnt;
         dbg_sf[dbg_n] = hUsbHostFS.Timer - dbg_s0;
         dbg_s0 = hUsbHostFS.Timer;
         dbg_rd[dbg_n] = dbg_read_cnt;
@@ -1497,11 +1599,12 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
         if (miss > 0) { miss_total += (uint32_t)miss; }
         sof_total += dbg_sf[k];
         ms_total  += dbg_ms[k];
-        USBH_UsrLog("%02u pk=%lu sof=%lu ms=%lu miss=%ld it=%lu rd=%lu gap=%lu rw=%lu",
+        USBH_UsrLog("%02u pk=%lu sof=%lu ms=%lu miss=%ld pump=%lu it=%lu rd=%lu gap=%lu rw=%lu",
                     (unsigned)k,
                     (unsigned long)dbg_pk[k],
                     (unsigned long)dbg_sf[k], (unsigned long)dbg_ms[k],
                     (long)miss,
+                    (unsigned long)dbg_pm[k],
                     (unsigned long)dbg_it[k],
                     (unsigned long)dbg_rd[k],
                     (unsigned long)dbg_gp[k],

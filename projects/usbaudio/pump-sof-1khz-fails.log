@@ -1,0 +1,16 @@
+# SOF（1kHz）驅動：只送得出 500 包/秒 —— 這條路不通
+# 主迴圈空轉 17ms 模擬相簿的解碼負載。pk 掉到一半、45 秒缺 21063 個訊框。
+# 推測：每個 SOF 進來時上一筆 URB 還沒被標記成 URB_DONE。
+
+=== FRAMES BEGIN（一格一秒；pk=送出封包數 ms=實際毫秒 miss=pk-ms 的缺口）===
+00 pk=1001 sof=1000 ms=1000 miss=-1 it=105825 rd=359 gap=1 rw=8320
+01 pk=1000 sof=1000 ms=1000 miss=0 it=104925 rd=375 gap=1 rw=8320
+02 pk=1000 sof=1000 ms=1000 miss=0 it=105710 rd=375 gap=1 rw=8320
+03 pk=500 sof=1004 ms=1004 miss=504 it=181 rd=175 gap=17 rw=6464
+04 pk=501 sof=1003 ms=1003 miss=502 it=59 rd=178 gap=17 rw=6464
+05 pk=502 sof=1004 ms=1003 miss=501 it=59 rd=175 gap=17 rw=6464
+06 pk=502 sof=1003 ms=1003 miss=501 it=59 rd=178 gap=17 rw=6464
+07 pk=501 sof=1003 ms=1003 miss=502 it=59 rd=178 gap=17 rw=6464
+...（之後每一格都相同，略）
+44 pk=501 sof=1003 ms=1003 miss=502 it=59 rd=176 gap=17 rw=6464
+=== FRAMES END 缺 21063 訊框 / 45 秒，over=225；SOF 45135 / 45128 ms，誤差 155 ppm ===

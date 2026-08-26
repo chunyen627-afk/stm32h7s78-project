@@ -1,0 +1,17 @@
+# TIM7（8kHz）抽送：撐得住 —— 這條路可行
+# 同樣主迴圈空轉 17ms（實測 gap=18、it=56/秒，比相簿還嚴苛）。
+# pk=1008 miss=0 連續 41 秒、over=0、時脈 -44ppm。
+# pump 那一欄是實際量到的中斷次數，不是推算的。
+
+=== FRAMES BEGIN（一格一秒；pk=送出封包數 ms=實際毫秒 miss=pk-ms 的缺口）===
+00 pk=1001 sof=1000 ms=1000 miss=-1 pump=0 it=108316 rd=359 gap=1 rw=8320
+01 pk=1000 sof=1000 ms=1000 miss=0 pump=0 it=107346 rd=375 gap=1 rw=8320
+02 pk=1000 sof=1000 ms=1000 miss=0 pump=0 it=108211 rd=375 gap=1 rw=8320
+03 pk=1000 sof=1008 ms=1008 miss=8 pump=7963 it=172 rd=369 gap=18 rw=5056
+04 pk=1008 sof=1008 ms=1008 miss=0 pump=8064 it=56 rd=378 gap=18 rw=5056
+05 pk=1008 sof=1008 ms=1008 miss=0 pump=8064 it=56 rd=378 gap=18 rw=5056
+06 pk=1008 sof=1008 ms=1008 miss=0 pump=8064 it=56 rd=378 gap=18 rw=5056
+07 pk=1008 sof=1008 ms=1008 miss=0 pump=8064 it=56 rd=378 gap=18 rw=5056
+...（之後每一格都相同，略）
+44 pk=1008 sof=1008 ms=1008 miss=0 pump=8064 it=56 rd=378 gap=18 rw=5120
+=== FRAMES END 缺 11 訊框 / 45 秒，over=0；SOF 45334 / 45336 ms，誤差 -44 ppm ===
