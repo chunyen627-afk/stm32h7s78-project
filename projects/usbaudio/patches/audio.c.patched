@@ -1,0 +1,477 @@
+/**
+  ******************************************************************************
+  * @file    audio.c
+  * @author  MCD Application Team
+  * @brief   This file provides the Audio Out (playback) interface API
+  ******************************************************************************
+  * @attention
+  *
+  * Copyright (c) 2024 STMicroelectronics.
+  * All rights reserved.
+  *
+  * This software is licensed under terms that can be found in the LICENSE file
+  * in the root directory of this software component.
+  * If no LICENSE file comes with this software, it is provided AS-IS.
+  *
+  ******************************************************************************
+  */
+
+/* Includes ------------------------------------------------------------------ */
+#include "main.h"
+#include "usbh_audio.h"
+#include "ff.h"
+#include "ff_gen_drv.h"
+#include "audio.h"
+#include <string.h>
+
+/* 開播後自動往上加幾格音量（每格約 400ms）。從小聲往上，不要嚇到耳朵。 */
+#define AUDIO_VOL_STEPS  8U
+#include "explorer.h"
+
+/* functions prototypes ---------------------------------------------*/
+void Error_Handler(void);
+
+/* Private define ------------------------------------------------------------ */
+/* --- 暫時的測試修改：把緩衝放大、讀取變大塊 ---------------------
+ * 原本是 512 x 33 = 16,896 bytes = **88 毫秒**，而且每次只從卡上讀
+ * 512 個位元組（2.7ms 的音訊）。在 512GB 的 exFAT 卡上，每筆 512 bytes
+ * 都是一次完整的磁區存取 —— 要補滿半個緩衝要連續 16 次小讀取，
+ * 中間還夾著 USB 的處理，跟不上就是緩衝掏空、波形不連續。
+ *
+ * 對照我們自己的 I2S 路徑：緩衝 170ms、一次讀 16KB（實測 5.4ms），
+ * 9.5 分鐘零欠載。這裡照那個量級調。 */
+#define AUDIO_BLOCK_SIZE        512
+#define AUDIO_BLOCK_NBR         33
+#define FILEMGR_LIST_DEPDTH     24
+#define FILEMGR_FILE_NAME_SIZE  40
+#define FILEMGR_MAX_LEVEL       4
+#define FILETYPE_DIR            0
+#define FILETYPE_FILE           1
+/* Private typedef ----------------------------------------------------------- */
+typedef struct AUDIO_Info_t {
+  uint32_t ChunkID;       /* 0  */
+  uint32_t FileSize;      /* 4  */
+  uint32_t FileFormat;    /* 8  */
+  uint32_t SubChunk1ID;   /* 12 */
+  uint32_t SubChunk1Size; /* 16 */
+  uint16_t AudioFormat;   /* 20 */
+  uint16_t NbrChannels;   /* 22 */
+  uint32_t SampleRate;    /* 24 */
+  uint32_t ByteRate;      /* 28 */
+  uint16_t BlockAlign;    /* 32 */
+  uint16_t BitPerSample;  /* 34 */
+  uint32_t SubChunk2ID;   /* 36 */
+  uint32_t SubChunk2Size; /* 40 */
+}WAV_InfoTypedef;
+
+typedef struct _FILELIST_LineTypeDef {
+  uint8_t type;
+  uint8_t name[FILEMGR_FILE_NAME_SIZE];
+}FILELIST_LineTypeDef;
+
+typedef struct _FILELIST_FileTypeDef {
+  FILELIST_LineTypeDef  file[FILEMGR_LIST_DEPDTH] ;
+  uint16_t              ptr;
+} FILELIST_FileTypeDef;
+
+typedef enum {
+  APPLICATION_IDLE = 0,
+  APPLICATION_START,
+  APPLICATION_READY,
+  APPLICATION_DISCONNECT,
+} AUDIO_ApplicationTypeDef;
+
+typedef struct
+{
+  uint8_t buff[AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR];
+  int32_t out_ptr;
+  uint32_t in_ptr;
+} Audio_BufferTypeDef;
+
+/* Private variables --------------------------------------------------------- */
+AUDIO_PLAYBACK_StateTypeDef AUDIO_app_state;
+AUDIO_PLAYBACK_StateTypeDef AUDIO_app_prev_state;
+static WAV_InfoTypedef WavInfo;
+static FIL WavFile;
+static Audio_BufferTypeDef BufferCtl;
+int16_t FilePos = 0;
+static uint8_t freq_pending = 0U;   /* 取樣率還沒設定成功 */
+uint8_t* oldfile;
+
+/* Exported variables ------------------------------------------------------- */
+extern AUDIO_ApplicationTypeDef Appli_state;
+extern USBH_HandleTypeDef hUsbHostFS;
+extern FILELIST_FileTypeDef FileList;
+
+/* Private function prototypes ----------------------------------------------- */
+static AUDIO_ErrorTypeDef AUDIO_GetFileInfo(uint16_t file_idx, WAV_InfoTypedef * info);
+AUDIO_ErrorTypeDef AUDIO_Start(uint8_t idx);
+AUDIO_ErrorTypeDef AUDIO_Process(void);
+AUDIO_ErrorTypeDef AUDIO_Stop(void);
+
+/* Exported function prototypes ----------------------------------------------- */
+extern uint8_t Audio_ShowWavFiles(void);
+
+/**
+  * @brief  Starts Audio streaming.
+  * @param  idx: File index
+  * @retval Audio error
+  */
+AUDIO_ErrorTypeDef AUDIO_Start(uint8_t idx)
+{
+  uint32_t bytesread;
+
+  /* --- 暫時的測試修改（不是這個範例原本的行為）---------------------
+   * 直接從指定的檔名開始播，省得按好幾次 USER 鍵。 */
+  {
+    uint16_t k;
+
+    for (k = 0; k < FileList.ptr; k++)
+    {
+      if (strstr((char *)FileList.file[k].name, "video3") != NULL)
+      {
+        idx     = (uint8_t)k;
+        FilePos = (int16_t)k;
+        break;
+      }
+    }
+  }
+
+  if (FileList.ptr > idx)
+  {
+    f_close(&WavFile);
+
+    AUDIO_GetFileInfo(idx, &WavInfo);
+
+    /* --- 暫時的診斷輸出：把「檔案是什麼」跟「跟裝置談的結果」印出來 ---
+     * 雜音有兩種完全不同的來源（格式不符 vs 餵不上），這兩行就分得出來。 */
+    USBH_UsrLog("WAV: %luHz %uch %ubit, data=%lu bytes",
+                (unsigned long)WavInfo.SampleRate,
+                (unsigned)WavInfo.NbrChannels,
+                (unsigned)WavInfo.BitPerSample,
+                (unsigned long)WavInfo.SubChunk2Size);
+
+    /* Set Frequency
+     *
+     * **這個類別是非同步的**：SetFrequency 只是發起一筆控制傳輸，完成之前
+     * 一律回 USBH_BUSY。原本的範例呼叫一次就不管、連回傳值都沒看 ——
+     * 結果取樣率**從來沒有真的設定到裝置上**，dongle 用自己的預設速率播、
+     * 我們餵 48kHz，於是週期性補/丟樣本，聽起來就是「啵啵啵」，
+     * 而且振幅越大越明顯（那是波形不連續，不是底噪）。
+     *
+     * 這裡只發起，實際的重試放在 PLAY 狀態 —— 不能在這裡卡迴圈等，
+     * 因為完成它需要主迴圈去跑 USBH_Process。 */
+    freq_pending = 1U;
+
+    /* Fill whole buffer at first time */
+    if (f_read(&WavFile,
+               &BufferCtl.buff[0],
+               AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR, (void *)&bytesread) == FR_OK)
+    {
+      if (bytesread != 0)
+      {
+        return AUDIO_ERROR_NONE;
+      }
+    }
+
+    BufferCtl.in_ptr = 0;
+  }
+  return AUDIO_ERROR_IO;
+}
+
+/**
+  * @brief  Manages Audio process.
+  * @param  None
+  * @retval Audio error
+  */
+AUDIO_ErrorTypeDef AUDIO_Process(void)
+{
+  uint8_t str[16];
+  int32_t diff;
+  uint32_t bytesread, elapsed_time;
+  static uint32_t prev_elapsed_time = 0xFFFFFFFF;
+  AUDIO_ErrorTypeDef error_state = AUDIO_ERROR_NONE;
+
+  switch(AUDIO_app_state)
+  {
+  case AUDIO_STATE_PLAYBACK_IDLE:
+    if (Appli_state == APPLICATION_READY)
+    {
+      AUDIO_app_state = AUDIO_STATE_PLAYBACK_EXPLORE;
+      AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_IDLE;
+    }
+    break;
+
+  case AUDIO_STATE_PLAYBACK_EXPLORE:
+    if (Appli_state == APPLICATION_READY)
+    {
+      /* Init SD Storage */
+      if (SD_StorageInit() == 0)
+      {
+        USBH_UsrLog("SD Parsing .........");
+        SD_StorageParse();
+      }
+      /* Show Wav Files */
+      if (Audio_ShowWavFiles() == 0)
+      {
+        /* --- 暫時的測試修改：不等按鍵，自己開播 ---------------------
+         * 遠端除錯時「等使用者按鍵」會讓每一輪都要人在旁邊配合，
+         * 而且錄序列埠的時機很難抓（board-notes 16.7 記過同一件事：
+         * 手動步驟沒有除錯價值，只會讓循環變慢）。 */
+        AUDIO_app_state = AUDIO_STATE_PLAYBACK_CONFIG;
+        AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_EXPLORE;
+        USBH_UsrLog("Auto-start playback (test build)");
+      }
+      else
+      {
+        AUDIO_app_state = AUDIO_STATE_PLAYBACK_IDLE;
+        USBH_ErrLog("\nPlease check your SD card\n");
+      }
+    }
+    break;
+
+  case AUDIO_STATE_PLAYBACK_WAIT:
+    break;
+
+  case AUDIO_STATE_PLAYBACK_CONFIG:
+    if(Appli_state == APPLICATION_READY)
+    {
+      AUDIO_app_state = AUDIO_STATE_PLAYBACK_START;
+      AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_CONFIG;
+    }
+    break;
+
+  case AUDIO_STATE_PLAYBACK_START:
+    /* Read and Write File Here */
+    if(Appli_state == APPLICATION_READY)
+    {
+      USBH_UsrLog("*** Playing audio ***\n");
+      if (AUDIO_Start(0) == AUDIO_ERROR_IO)
+      {
+        USBH_UsrLog("*** AUDIO_ERROR_IO 1 ***");
+      }
+      AUDIO_app_state = AUDIO_STATE_PLAYBACK_PLAY;
+      AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_START;
+    }
+    break;
+
+  case AUDIO_STATE_PLAYBACK_PLAY:
+    /* --- 暫時的測試修改：開播之後自動把音量往上加 -------------------
+     * ST 的類別只提供一格一格的 VOLUME_UP（相對值，沒有絕對音量），
+     * 而且每次是一筆非同步的控制傳輸 —— 連續呼叫會互相蓋掉。
+     * 所以隔一段時間才加一格，加到設定的次數為止。
+     * **刻意從小聲慢慢往上**，使用者戴著耳機。 */
+    if (freq_pending != 0U)
+    {
+      USBH_StatusTypeDef st = USBH_AUDIO_SetFrequency(&hUsbHostFS,
+                                WavInfo.SampleRate,
+                                WavInfo.NbrChannels, WavInfo.BitPerSample);
+      if (st == USBH_OK)
+      {
+        freq_pending = 0U;
+        USBH_UsrLog("SetFrequency OK: %luHz %uch %ubit",
+                    (unsigned long)WavInfo.SampleRate,
+                    (unsigned)WavInfo.NbrChannels,
+                    (unsigned)WavInfo.BitPerSample);
+      }
+    }
+
+    {
+      static uint32_t vol_tick = 0;
+      static uint8_t  vol_steps = 0;
+
+      if (vol_steps < AUDIO_VOL_STEPS)
+      {
+        if ((HAL_GetTick() - vol_tick) > 400U)
+        {
+          vol_tick = HAL_GetTick();
+          if (USBH_AUDIO_SetVolume(&hUsbHostFS, VOLUME_UP) == USBH_OK)
+          {
+            vol_steps++;
+            USBH_UsrLog("volume +1 (%d/%d)", vol_steps, AUDIO_VOL_STEPS);
+          }
+        }
+      }
+    }
+
+    if ((BufferCtl.out_ptr = USBH_AUDIO_GetOutOffset(&hUsbHostFS)) < 0) /* End of file */
+    {
+      AUDIO_app_state = AUDIO_STATE_PLAYBACK_NEXT;
+    }
+    else if (BufferCtl.out_ptr >= (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR)) /* End of buffer */
+    {
+      USBH_AUDIO_ChangeOutBuffer(&hUsbHostFS, &BufferCtl.buff[0]);
+    }
+    else
+    {
+      diff = BufferCtl.out_ptr - BufferCtl.in_ptr;
+
+      if (diff < 0)
+      {
+        diff = AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR + diff;
+      }
+
+      if (diff >= (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR / 2))
+      {
+        BufferCtl.in_ptr += AUDIO_BLOCK_SIZE;
+
+        if (BufferCtl.in_ptr >= (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR))
+        {
+          BufferCtl.in_ptr = 0;
+        }
+
+        if (f_read(&WavFile,
+                   &BufferCtl.buff[BufferCtl.in_ptr],
+                   AUDIO_BLOCK_SIZE, (void *)&bytesread) != FR_OK)
+        {
+          f_close(&WavFile);
+          error_state = AUDIO_ERROR_NONE;
+        }
+      }
+    }
+    /* Display elapsed time */
+    elapsed_time = WavFile.fptr / WavInfo.ByteRate;
+    if(prev_elapsed_time != elapsed_time)
+    {
+      prev_elapsed_time = elapsed_time;
+      sprintf((char *)str, "[%02lu:%02lu]", (unsigned long)(elapsed_time /60), (unsigned long)(elapsed_time%60));
+      USBH_UsrLog("%s",str);
+    }
+    AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_PLAY;
+    break;
+
+  case AUDIO_STATE_PLAYBACK_NEXT:
+    USBH_UsrLog("[NEXT]");
+    if (++FilePos >= FileList.ptr)
+    {
+      FilePos = 0;
+    }
+    USBH_AUDIO_Stop(&hUsbHostFS);
+    AUDIO_Start(FilePos);
+    AUDIO_app_state = AUDIO_STATE_PLAYBACK_CONFIG;
+    break;
+
+  default:
+    break;
+  }
+  if(Appli_state == APPLICATION_DISCONNECT)
+  {
+    Appli_state = APPLICATION_IDLE;
+    USBH_ErrLog("USB device disconnected !!! \n");
+    AUDIO_Stop();
+    AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_IDLE;
+  }
+  return error_state;
+}
+
+/**
+  * @brief  Stops Audio streaming.
+  * @param  None
+  * @retval Audio error
+  */
+AUDIO_ErrorTypeDef AUDIO_Stop(void)
+{
+  AUDIO_app_state = AUDIO_STATE_PLAYBACK_IDLE;
+  USBH_AUDIO_Stop(&hUsbHostFS);
+  FilePos = 0;
+  f_close(&WavFile);
+  return AUDIO_ERROR_NONE;
+}
+
+/**
+  * @brief  Gets the file info.
+  * @param  file_idx: File index
+  * @param  info: Pointer to WAV file info
+  * @retval Audio error
+  */
+static AUDIO_ErrorTypeDef AUDIO_GetFileInfo(uint16_t file_idx,
+                                            WAV_InfoTypedef * info)
+{
+  uint32_t bytesread;
+
+  if (f_open
+      (&WavFile, (char *)FileList.file[file_idx].name,
+       FA_OPEN_EXISTING | FA_READ) == FR_OK)
+  {
+    /* Fill the buffer to Send */
+    if (f_read(&WavFile, info, sizeof(WAV_InfoTypedef), (void *)&bytesread) ==
+        FR_OK)
+    {
+      /* --- 暫時的診斷修正（不是這個範例原本的行為）---------------------
+       * 這個結構假設 data 區塊固定在第 44 個位元組，但 ffmpeg 產生的 wav
+       * 會在 fmt 與 data 之間插一個 LIST 區塊。照 44 去讀的話會把 LIST
+       * 當成音訊，而且整個檔案錯開 —— 偏移 34 不是 4 的倍數，16-bit 立體聲
+       * 的每個取樣都被切成兩半，症狀就是「聽得出原本的聲音但疊著雜訊」。
+       * 這裡改成走區塊鏈找到真正的 data，用來驗證雜訊就是這個原因。 */
+      if (info->SubChunk2ID != 0x61746164U)      /* 'data' */
+      {
+        uint8_t  ck[8];
+        uint32_t len, guard;
+
+        (void)f_lseek(&WavFile, 12U + 8U + info->SubChunk1Size);
+        for (guard = 0; guard < 16U; guard++)
+        {
+          if (f_read(&WavFile, ck, 8U, (void *)&bytesread) != FR_OK ||
+              bytesread != 8U) { break; }
+          len = (uint32_t)ck[4] | ((uint32_t)ck[5] << 8) |
+                ((uint32_t)ck[6] << 16) | ((uint32_t)ck[7] << 24);
+          if (ck[0] == 'd' && ck[1] == 'a' && ck[2] == 't' && ck[3] == 'a')
+          {
+            info->SubChunk2Size = len;           /* 檔案指標已經停在資料開頭 */
+            USBH_UsrLog("WAV: data chunk found at %lu (not 44)",
+                        (unsigned long)f_tell(&WavFile));
+            break;
+          }
+          (void)f_lseek(&WavFile, f_tell(&WavFile) + len + (len & 1U));
+        }
+      }
+
+      if( oldfile != FileList.file[file_idx].name)
+      {
+        USBH_UsrLog("Playing file : ");
+        USBH_UsrLog("%s",FileList.file[file_idx].name);
+        oldfile = FileList.file[file_idx].name;
+        USBH_UsrLog("Press the USER BUTTON to play the next wav file.");
+      }
+      return AUDIO_ERROR_NONE;
+    }
+    f_close(&WavFile);
+  }
+  return AUDIO_ERROR_IO;
+}
+
+/**
+  * @brief  Informs user that settings have been changed.
+  * @param  phost: Host Handle
+  * @retval None
+  */
+void USBH_AUDIO_FrequencySet(USBH_HandleTypeDef * phost)
+{
+  if (AUDIO_app_state == AUDIO_STATE_PLAYBACK_CONFIG)
+  {
+    /* Start first read */
+    USBH_AUDIO_Play(&hUsbHostFS, &BufferCtl.buff[0], WavInfo.FileSize);
+    AUDIO_app_state = AUDIO_STATE_PLAYBACK_PLAY;
+  }
+}
+
+/**
+  * @brief  GPIO EXTI Callback function
+  *         Handle remote-wakeup through key button
+  * @param  GPIO_Pin
+  * @retval None
+  */
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+  if (GPIO_Pin == USER_BUTTON_Pin)
+  {
+    if (AUDIO_app_prev_state == AUDIO_STATE_PLAYBACK_EXPLORE)
+    {
+      AUDIO_app_state = AUDIO_STATE_PLAYBACK_CONFIG;
+    }
+    else if (AUDIO_app_prev_state == AUDIO_STATE_PLAYBACK_PLAY)
+    {
+      AUDIO_app_state = AUDIO_STATE_PLAYBACK_NEXT;
+    }
+  }
+}
