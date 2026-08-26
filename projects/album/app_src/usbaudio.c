@@ -9,6 +9,7 @@
 #include "usbh_core.h"
 #include "usbh_audio.h"
 #include "stm32h7rsxx_hal_hcd.h"
+#include "stm32h7s78_discovery_sd.h"
 
 #include <string.h>
 
@@ -83,6 +84,11 @@ static volatile uint8_t s_state;   /* 初值 0 = US_IDLE */
 #define UB_PUMPCALLS 182
 #define UB_SEEKSTEP  183   /* 1 進入 2 已 Stop 3 已 lseek 4 已 prefill 5 完成 */
 #define UB_STARTRET  184   /* USBH_Start 的實際回傳值 */
+/* 186/187：把「有沒有被呼叫」跟「有沒有通過檢查」分開。
+ * PROC 讀到 0 但呼叫端明明在跑 —— 這種矛盾不能靠推理解決，
+ * 要把單一計數拆成兩個獨立的事實。 */
+#define UB_PROCENTRY 186   /* usbaudio_process 進入次數（任何檢查之前）*/
+#define UB_INITED    187   /* s_inited 的即時值 */
 /* 181/182 原本要記 HardFault，但 HardFault_Handler 在 cube 的 it.c 已經有
  * 非弱定義，應用層覆寫不了 —— 要記就得改 it.c（patch_project.py 的工作）。
  * 先不做：NULL 檢查本來就該加，加完再看還當不當。 */
@@ -213,6 +219,17 @@ void usbaudio_init(void)
         UBOX[UB_SEEKSTEP] = 0u;
     }
 
+    /* **每一輪開機都要把本輪會寫的欄位歸零。**
+     * 這是我這一輪踩到的第三個儀器缺陷：STARTRET / SEEKSTEP / STREAM
+     * 沒有歸零，於是上一次開機留下的值被我當成本輪的事實 ——
+     * 「USBH_Start 有回來」其實是上一輪的紀錄。
+     * 累計欄（TICK/STARTS/...）另外處理，只在斷電後第一次清。 */
+    UBOX[UB_STARTRET]  = 0xFFFFFFFFu;
+    UBOX[UB_SEEKSTEP]  = 0xFFFFFFFFu;
+    UBOX[UB_STREAM]    = 0xFFFFFFFFu;
+    UBOX[UB_PROCENTRY] = 0u;
+    UBOX[UB_INITED]    = 0xFFFFFFFFu;
+
     UBOX[UB_MAGIC]    = 0x55534231u;
     UBOX[UB_INIT]     = UB_INIT_ENTER;
     UBOX[UB_STATE]    = 0u;
@@ -279,15 +296,15 @@ void usbaudio_init(void)
     UBOX[UB_INIT] |= UB_INIT_STARTOK;
     return;
 #endif
-    {
-        USBH_StatusTypeDef st = USBH_Start(&hUsbHostFS);
+    /* 把 USBH_Start 拆開，讓黑盒子指出是哪一個呼叫不回來。
+     * USBH_Start 本身只有這兩行（usbh_core.c），而且都不該會等。 */
+    UBOX[UB_STARTRET] = 0xA0u;
+    (void)USBH_LL_Start(&hUsbHostFS);
+    UBOX[UB_STARTRET] = 0xA1u;
+    (void)USBH_LL_DriverVBUS(&hUsbHostFS, 1U);
+    UBOX[UB_STARTRET] = 0xA2u;
+    UBOX[UB_INIT] |= 0x20u;
 
-        UBOX[UB_INIT] |= 0x20u;
-        UBOX[UB_STARTRET] = (uint32_t)st;
-        if (st != USBH_OK) {
-            return;
-        }
-    }
     UBOX[UB_INIT] |= 0x40u;
 
 #if (USBAUDIO_INIT_LEVEL == 4)
@@ -307,6 +324,9 @@ void usbaudio_init(void)
 
 void usbaudio_process(void)
 {
+    UBOX[UB_PROCENTRY]++;          /* **任何檢查之前** */
+    UBOX[UB_INITED] = s_inited;
+
     if (s_inited == 0u) {
         return;
     }
@@ -845,3 +865,7 @@ void usbaudio_set_volume(uint32_t pct)
      * 包含再呼叫一次 USBH_AUDIO_Play —— 播放中改音量不該碰開播流程。
      * 由 US_PLAYING 裡的 s_vol_dirty 處理。 */
 }
+
+/* 註：這裡曾經覆寫 MX_SDMMC1_SD_Init 把 SDMMC 時脈降到 1/2 與 1/8
+ * （ST 社群對「USB 一開 SD 就卡住」的標準診斷）—— **兩個都沒有幫助**，
+ * 所以頻寬競爭不是原因，覆寫也就拿掉了（降速是有代價的）。 */

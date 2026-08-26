@@ -529,7 +529,21 @@ USBH_StatusTypeDef USBH_LL_DriverVBUS(USBH_HandleTypeDef *phost, uint8_t state)
       /* USER CODE END DRIVE_LOW_CHARGE_FOR_FS */
     }
   }
-  HAL_Delay(200);
+  /* --- **不要用 HAL_Delay。** ------------------------------------------
+   * 實測 usbaudio_init() 卡死在 USBH_Start 裡，而 USBH_Start 唯一會等的
+   * 就是這一行。HAL_Delay 忙等 uwTick，而 uwTick 靠 SysTick 中斷更新 ——
+   * 卡住只有一個意思：那一刻 SysTick 沒在跑。
+   *
+   * 這裡只是要等 VBUS 穩定，不需要精確的毫秒，改成不依賴中斷的空轉。
+   * 600MHz 下大約 200 毫秒。 */
+  {
+    volatile uint32_t spin;
+
+    for (spin = 0U; spin < 30000000U; spin++)
+    {
+      __NOP();
+    }
+  }
   return USBH_OK;
 }
 
