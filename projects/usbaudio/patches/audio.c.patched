@@ -105,6 +105,85 @@ static uint8_t play_pending = 0U;       /* 取樣率設好了，Play 還沒回 O
 static uint8_t play_started = 0U;       /* Play 回過 USBH_OK，資料真的在送 */
 static volatile uint8_t eof_seen = 0U;  /* 類別回報整段送完（唯一可信的「播完了」）*/
 static uint32_t dbg_unexpected = 0U;    /* 開播之後非預期停下來的次數 */
+
+/* --- 量測：爆音的兩個候選機制，分得開 -----------------------------------
+ * 波形不連續只有兩種來源，而它們要換的東西完全不同：
+ *
+ * (A) **掏空**：應用層來不及補，類別把還沒換掉的舊資料再送一次。
+ *     看得到的量：**可播存量（runway）**＝已經寫好、還沒被送出去的位元組。
+ *     逼近 0 就是掏空。
+ *
+ * (B) **衝出緩衝結尾**：usbh_audio.c 的 AUDIO_DATA_OUT **完全沒有對 cbuf
+ *     做邊界檢查** —— 送完整個緩衝之後 cbuf 繼續往前走，要靠應用層在主
+ *     迴圈裡看到 out_ptr 到底了才呼叫 ChangeOutBuffer 把它拉回來。
+ *     512x33 = 16896 剛好是 88 個封包，所以每 88ms 就有一次機會；
+ *     那一刻主迴圈要是慢了（f_read 正好卡住），送出去的就是緩衝後面的
+ *     記憶體。**「每 88ms 一次的機會」跟「週期性爆音」形狀吻合。**
+ *     看得到的量：out_ptr 有沒有大於緩衝總長。這是是非題，不必量時間。
+ *
+ * 兩個都不必動任何緩衝參數 —— 上一輪掃參數掃錯了東西，這次先把尺架好。
+ * 數字每秒印一次、印完歸零，所以每一行講的是那一秒發生的事，
+ * 可以跟耳朵聽到爆音的時間點對起來。
+ *
+ * 哨兵值 0xFFFFFFFF：分辨「這一秒沒跑到」與「跑了但結果是 0」。
+ * HAL_GetTick 的解析度是 1ms，只夠抓「迴圈卡了好幾毫秒」這種量級；
+ * 要是 gap_max 印出來都是 1，代表這把尺不夠細，得換 DWT。 */
+#define AUDIO_BUF_TOTAL   (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR)
+static uint32_t dbg_runway_min = 0xFFFFFFFFU;  /* (A) 最小可播存量，位元組 */
+static uint32_t dbg_over_cnt   = 0U;           /* (B) out_ptr 超出結尾的次數 */
+static uint32_t dbg_over_max   = 0U;           /* (B) 最多超出去幾個位元組 */
+static uint32_t dbg_gap_max    = 0U;           /* 兩次 PLAY 迴圈最大間隔 ms */
+static uint32_t dbg_gap_prev   = 0xFFFFFFFFU;
+static uint32_t dbg_read_cnt   = 0U;           /* f_read 次數 */
+static uint32_t dbg_read_max   = 0U;           /* 最慢一次 f_read 幾 ms */
+
+/* --- 第三個候選，也是前兩個量不到的那個 ---------------------------------
+ * (C) **訊框根本沒送出去。** usbh_audio.c 的 AUDIO_DATA_OUT 是從**主迴圈**
+ *     跑的（USBH_Process），不是從 SOF 中斷。它的條件是「上一筆 URB 完成
+ *     且距離上次送出 >= Poll(1ms)」—— 主迴圈卡住幾毫秒，那幾個 1ms 的訊框
+ *     就完全沒有封包送出去。裝置那端沒收到資料就是波形斷掉。
+ *
+ *     **這種斷法不會消耗緩衝**，所以 (A) 的 runway 永遠看起來健康 ——
+ *     前一把尺量不到它，不是因為沒發生，是因為量錯地方。
+ *
+ * 量法：等時端點是 1 封包 / 1 毫秒，所以「這一秒真的送出去幾個封包」
+ * 應該正好等於「這一秒經過幾毫秒」。少掉的就是斷掉的訊框數。
+ * 這是整數對整數，沒有解析度問題。
+ *
+ * **收集期間完全不印東西**，整張表最後一次倒出來 —— 上一版的診斷行
+ * 85 個字元 @115200 就要 7.4ms，量到的 gap_max=7ms 有一大半是尺自己
+ * 造成的。尺不能比受測物還粗，更不能自己就是干擾源。 */
+#define DBG_SAMPLES  45U
+static uint32_t dbg_pk[DBG_SAMPLES];   /* 那一格真的送出去幾個封包 */
+static uint32_t dbg_ms[DBG_SAMPLES];   /* 那一格實際經過幾毫秒 */
+static uint32_t dbg_gp[DBG_SAMPLES];   /* 那一格的迴圈最大間隔 */
+static uint32_t dbg_rw[DBG_SAMPLES];   /* 那一格的最小可播存量 */
+/* 主迴圈跑了幾圈。USBH_AUDIO_OutputStream 一次呼叫最多送一個封包，
+ * 而它是從主迴圈跑的 —— 所以送出速率的上限就是這個數字。
+ * 要是 it 也是 960 左右，「pk=960」就不必再找別的解釋了。 */
+static uint32_t dbg_it[DBG_SAMPLES];
+static uint32_t dbg_it_cnt = 0U;
+static uint32_t dbg_rd[DBG_SAMPLES];   /* 那一格 f_read 幾次 */
+/* 那一格數到幾個 SOF。hUsbHostFS.Timer 就是 SOF 計數（HAL_HCD_SOF_Callback
+ * -> USBH_LL_IncTimer）。全速匯流排的 SOF 應該是 1000/秒。
+ * **這個數字分掉兩種完全不同的病**：
+ *   sof≈960 -> USB 時脈本身慢 4%，整條鏈一起慢，波形其實是連續的
+ *   sof≈1000 而 pk=960 -> 真的每秒漏掉 40 個訊框 */
+static uint32_t dbg_sf[DBG_SAMPLES];
+static uint32_t dbg_s0 = 0U;
+static uint32_t dbg_t0 = 0xFFFFFFFFU;
+static uint32_t dbg_g0 = 0U;
+static uint16_t dbg_n  = 0U;
+static uint8_t  dbg_phase = 0U;        /* 0=收集中 1=收集完待印 2=印過了 */
+
+/* 類別送出去的總位元組數。單調遞增，不會繞回，取差值就是那一格的量。 */
+static uint32_t audio_global_ptr(void)
+{
+  AUDIO_HandleTypeDef *h = (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+  return (h != NULL) ? h->headphone.global_ptr : 0xFFFFFFFFU;
+}
+
 uint8_t* oldfile;
 
 /* Exported variables ------------------------------------------------------- */
@@ -316,6 +395,19 @@ AUDIO_ErrorTypeDef AUDIO_Start(uint8_t idx)
     play_started = 0U;
     eof_seen     = 0U;
 
+    dbg_runway_min = 0xFFFFFFFFU;
+    dbg_over_cnt   = 0U;
+    dbg_over_max   = 0U;
+    dbg_gap_max    = 0U;
+    dbg_gap_prev   = 0xFFFFFFFFU;
+    dbg_read_cnt   = 0U;
+    dbg_read_max   = 0U;
+    dbg_it_cnt     = 0U;
+    dbg_t0         = 0xFFFFFFFFU;
+    dbg_g0         = 0U;
+    dbg_n          = 0U;
+    dbg_phase      = 0U;
+
     /* Fill whole buffer at first time */
     if (f_read(&WavFile,
                &BufferCtl.buff[0],
@@ -505,44 +597,158 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
                   (unsigned long)dbg_unexpected);
       AUDIO_app_state = AUDIO_STATE_PLAYBACK_NEXT;
     }
-    else if (BufferCtl.out_ptr >= (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR)) /* End of buffer */
+    else
     {
-      USBH_AUDIO_ChangeOutBuffer(&hUsbHostFS, &BufferCtl.buff[0]);
+      /* --- 量測（不改任何行為，只是數） --------------------------- */
+      {
+        uint32_t now = HAL_GetTick();
+        uint32_t op  = (uint32_t)BufferCtl.out_ptr;
+        int32_t  d;
+
+        if (dbg_gap_prev != 0xFFFFFFFFU)
+        {
+          uint32_t gap = now - dbg_gap_prev;
+          if (gap > dbg_gap_max) { dbg_gap_max = gap; }
+        }
+        dbg_gap_prev = now;
+        dbg_it_cnt++;
+
+        /* (B) 類別已經走過緩衝結尾了嗎 —— 是非題，不必量時間 */
+        if (op > (uint32_t)AUDIO_BUF_TOTAL)
+        {
+          uint32_t over = op - (uint32_t)AUDIO_BUF_TOTAL;
+          dbg_over_cnt++;
+          if (over > dbg_over_max) { dbg_over_max = over; }
+        }
+
+        /* (A) 可播存量：已經寫好、還沒被送出去的位元組 */
+        d = BufferCtl.out_ptr - (int32_t)BufferCtl.in_ptr;
+        if (d < 0) { d += AUDIO_BUF_TOTAL; }
+        if ((uint32_t)(AUDIO_BUF_TOTAL - d) < dbg_runway_min)
+        {
+          dbg_runway_min = (uint32_t)(AUDIO_BUF_TOTAL - d);
+        }
+      }
+
+      if (BufferCtl.out_ptr >= AUDIO_BUF_TOTAL)          /* End of buffer */
+      {
+        USBH_AUDIO_ChangeOutBuffer(&hUsbHostFS, &BufferCtl.buff[0]);
+      }
+      else
+      {
+        diff = BufferCtl.out_ptr - BufferCtl.in_ptr;
+
+        if (diff < 0)
+        {
+          diff = AUDIO_BUF_TOTAL + diff;
+        }
+
+        if (diff >= (AUDIO_BUF_TOTAL / 2))
+        {
+          uint32_t t0;
+
+          BufferCtl.in_ptr += AUDIO_BLOCK_SIZE;
+
+          if (BufferCtl.in_ptr >= AUDIO_BUF_TOTAL)
+          {
+            BufferCtl.in_ptr = 0;
+          }
+
+          t0 = HAL_GetTick();
+          if (f_read(&WavFile,
+                     &BufferCtl.buff[BufferCtl.in_ptr],
+                     AUDIO_BLOCK_SIZE, (void *)&bytesread) != FR_OK)
+          {
+            f_close(&WavFile);
+            error_state = AUDIO_ERROR_NONE;
+          }
+          {
+            uint32_t dt = HAL_GetTick() - t0;
+            dbg_read_cnt++;
+            if (dt > dbg_read_max) { dbg_read_max = dt; }
+          }
+        }
+      }
+    }
+    /* --- 收集：一秒一格，收集期間一個字都不印 ------------------------ */
+    if ((play_started != 0U) && (dbg_phase == 0U))
+    {
+      uint32_t now = HAL_GetTick();
+
+      if (dbg_t0 == 0xFFFFFFFFU)
+      {
+        dbg_t0 = now;
+        dbg_g0 = audio_global_ptr();
+        dbg_s0 = hUsbHostFS.Timer;
+      }
+      else if ((now - dbg_t0) >= 1000U)
+      {
+        uint32_t g = audio_global_ptr();
+
+        dbg_pk[dbg_n] = (g - dbg_g0) / 192U;
+        dbg_ms[dbg_n] = now - dbg_t0;
+        dbg_gp[dbg_n] = dbg_gap_max;
+        dbg_rw[dbg_n] = dbg_runway_min;
+        dbg_it[dbg_n] = dbg_it_cnt;
+        dbg_sf[dbg_n] = hUsbHostFS.Timer - dbg_s0;
+        dbg_s0 = hUsbHostFS.Timer;
+        dbg_rd[dbg_n] = dbg_read_cnt;
+        dbg_n++;
+
+        dbg_t0 = now;
+        dbg_g0 = g;
+        dbg_gap_max    = 0U;
+        dbg_runway_min = 0xFFFFFFFFU;
+        dbg_it_cnt     = 0U;
+        dbg_read_cnt   = 0U;
+
+        if (dbg_n >= DBG_SAMPLES)
+        {
+          dbg_phase = 1U;
+        }
+      }
+    }
+    else if (dbg_phase == 1U)
+    {
+      uint16_t k;
+      uint32_t miss_total = 0U;
+
+      dbg_phase = 2U;
+      USBH_UsrLog("=== FRAMES BEGIN（一格一秒；pk=送出封包數 ms=實際毫秒 "
+                  "miss=pk-ms 的缺口）===");
+      for (k = 0U; k < dbg_n; k++)
+      {
+        int32_t miss = (int32_t)dbg_ms[k] - (int32_t)dbg_pk[k];
+
+        if (miss > 0) { miss_total += (uint32_t)miss; }
+        USBH_UsrLog("%02u pk=%lu sof=%lu ms=%lu miss=%ld it=%lu rd=%lu gap=%lu rw=%lu",
+                    (unsigned)k,
+                    (unsigned long)dbg_pk[k],
+                    (unsigned long)dbg_sf[k], (unsigned long)dbg_ms[k],
+                    (long)miss,
+                    (unsigned long)dbg_it[k],
+                    (unsigned long)dbg_rd[k],
+                    (unsigned long)dbg_gp[k],
+                    (unsigned long)dbg_rw[k]);
+      }
+      USBH_UsrLog("=== FRAMES END 共缺 %lu 個訊框 / %u 秒，over=%lu ===",
+                  (unsigned long)miss_total, (unsigned)dbg_n,
+                  (unsigned long)dbg_over_cnt);
+    }
+    else if (dbg_phase == 2U)
+    {
+      /* Display elapsed time */
+      elapsed_time = WavFile.fptr / WavInfo.ByteRate;
+      if(prev_elapsed_time != elapsed_time)
+      {
+        prev_elapsed_time = elapsed_time;
+        sprintf((char *)str, "[%02lu:%02lu]", (unsigned long)(elapsed_time /60), (unsigned long)(elapsed_time%60));
+        USBH_UsrLog("%s",str);
+      }
     }
     else
     {
-      diff = BufferCtl.out_ptr - BufferCtl.in_ptr;
-
-      if (diff < 0)
-      {
-        diff = AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR + diff;
-      }
-
-      if (diff >= (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR / 2))
-      {
-        BufferCtl.in_ptr += AUDIO_BLOCK_SIZE;
-
-        if (BufferCtl.in_ptr >= (AUDIO_BLOCK_SIZE * AUDIO_BLOCK_NBR))
-        {
-          BufferCtl.in_ptr = 0;
-        }
-
-        if (f_read(&WavFile,
-                   &BufferCtl.buff[BufferCtl.in_ptr],
-                   AUDIO_BLOCK_SIZE, (void *)&bytesread) != FR_OK)
-        {
-          f_close(&WavFile);
-          error_state = AUDIO_ERROR_NONE;
-        }
-      }
-    }
-    /* Display elapsed time */
-    elapsed_time = WavFile.fptr / WavInfo.ByteRate;
-    if(prev_elapsed_time != elapsed_time)
-    {
-      prev_elapsed_time = elapsed_time;
-      sprintf((char *)str, "[%02lu:%02lu]", (unsigned long)(elapsed_time /60), (unsigned long)(elapsed_time%60));
-      USBH_UsrLog("%s",str);
+      /* 收集中：不印。 */
     }
     AUDIO_app_prev_state = AUDIO_STATE_PLAYBACK_PLAY;
     break;

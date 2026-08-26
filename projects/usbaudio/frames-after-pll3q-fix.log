@@ -1,0 +1,16 @@
+# 修 PLL3Q 之後：SOF 每秒 1000 個（USB 時脈 48.000MHz）
+# 只改了 Boot 的 PLL3.PLLQ 25->24，Appli 一個字都沒動。
+# 剩下的 8 個缺口全部在開播頭 3 秒，那時音量爬升的控制傳輸還在跑。
+
+=== FRAMES BEGIN（一格一秒；pk=送出封包數 ms=實際毫秒 miss=pk-ms 的缺口）===
+00 pk=998 sof=999 ms=1000 miss=2 it=145478 rd=358 gap=2 rw=8320
+01 pk=998 sof=1000 ms=1000 miss=2 it=144157 rd=375 gap=2 rw=8320
+02 pk=997 sof=1000 ms=1000 miss=3 it=147900 rd=373 gap=2 rw=8320
+03 pk=1000 sof=1000 ms=1000 miss=0 it=156659 rd=375 gap=1 rw=8320
+04 pk=1000 sof=1000 ms=1000 miss=0 it=158010 rd=375 gap=1 rw=8320
+05 pk=1000 sof=1000 ms=1000 miss=0 it=156664 rd=375 gap=1 rw=8320
+06 pk=1000 sof=1000 ms=1000 miss=0 it=157996 rd=375 gap=1 rw=8320
+...（中間各格數字相同，略）
+43 pk=1000 sof=1000 ms=1000 miss=0 it=158143 rd=375 gap=1 rw=8320
+44 pk=1000 sof=1000 ms=1000 miss=0 it=156819 rd=375 gap=1 rw=8320
+=== FRAMES END 共缺 8 個訊框 / 45 秒，over=0 ===

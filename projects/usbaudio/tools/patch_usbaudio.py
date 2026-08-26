@@ -65,6 +65,26 @@ def main():
 
     print("套用 USB Host 音訊治具的修改：")
 
+    # --- ST 範例的第三個真 bug：USB 的 48MHz 其實是 46.08MHz -------------
+    #
+    # Boot 的 SystemClock_Config 把 PLL3 設成 HSE(24MHz) / M=5 = 4.8MHz、
+    # N=240 -> VCO 1152MHz、**Q=25 -> 46.08MHz**，而 usbh_conf.c 又指定
+    # RCC_USBOTGFSCLKSOURCE_PLL3Q 當 USB 全速的 48MHz。
+    #
+    # 46.08 / 48 = 0.96 —— 實測 SOF 每秒只有 **960** 個而不是 1000
+    # （hUsbHostFS.Timer 與硬體都同意）。等時端點是一個訊框一包，所以
+    # dongle 每秒只收到 46,080 個取樣，卻被 SetFrequency 告知要用 48000Hz
+    # 播 —— 它得週期性補洞，那就是「啵啵啵」，而且音量越大越明顯。
+    #
+    # 1152 / 24 = 48.000 剛好整除。PLL3Q 在這個範例裡只有 USB 一個使用者。
+    boot = os.path.join(CUBE, "Projects", "STM32H7S78-DK", "Applications",
+                        "USB_Host", "AUDIO_Standalone", "Boot")
+    edit(os.path.join(boot, "Src", "main.c"), [
+        ("  RCC_OscInitStruct.PLL3.PLLQ = 25;",
+         "  RCC_OscInitStruct.PLL3.PLLQ = 24;   /* 1152/24 = 48.000MHz；"
+         "原本的 25 是 46.08MHz，USB 慢 4% */"),
+    ], "PLL3.PLLQ = 24")
+
     edit(os.path.join(APP, "Inc", "ffconf.h"), [
         ("#define FF_USE_LFN		0", "#define FF_USE_LFN		1"),
         ("#define FF_FS_EXFAT		0", "#define FF_FS_EXFAT		1"),

@@ -1,0 +1,16 @@
+# 修 PLL3Q 之前：SOF 每秒 960 個（USB 時脈 46.08MHz）
+# pk=送出封包 sof=SOF 計數 ms=實際毫秒 it=主迴圈圈數 rd=f_read 次數
+# rw=最小可播存量(bytes)。收集期間不印任何東西，整表最後一次倒出。
+
+=== FRAMES BEGIN（一格一秒；pk=送出封包數 ms=實際毫秒 miss=pk-ms 的缺口）===
+00 pk=960 sof=960 ms=1000 miss=40 it=145949 rd=344 gap=2 rw=8320
+01 pk=958 sof=960 ms=1000 miss=42 it=144572 rd=359 gap=2 rw=8320
+02 pk=957 sof=960 ms=1000 miss=43 it=148308 rd=359 gap=2 rw=8320
+03 pk=959 sof=960 ms=1000 miss=41 it=157251 rd=360 gap=1 rw=8320
+04 pk=960 sof=960 ms=1000 miss=40 it=158598 rd=360 gap=1 rw=8320
+05 pk=960 sof=960 ms=1000 miss=40 it=157287 rd=360 gap=1 rw=8320
+06 pk=960 sof=960 ms=1000 miss=40 it=158358 rd=360 gap=1 rw=8320
+...（中間各格數字相同，略）
+43 pk=960 sof=960 ms=1000 miss=40 it=158144 rd=360 gap=1 rw=8320
+44 pk=960 sof=960 ms=1000 miss=40 it=157687 rd=360 gap=1 rw=8320
+=== FRAMES END 共缺 1806 個訊框 / 45 秒，over=0 ===
