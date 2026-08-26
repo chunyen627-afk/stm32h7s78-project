@@ -23,6 +23,7 @@
 #include "video.h"
 #include "favorites.h"
 #include "vbus.h"
+#include "usbaudio.h"
 #include "usbdrive.h"
 #include "audio_out.h"
 
@@ -325,6 +326,16 @@ static void nap(uint32_t ms)
     uint32_t t0 = HAL_GetTick();
 
     while ((HAL_GetTick() - t0) < ms) {
+        /* --- USB 無線耳機的列舉與類別請求就掛在這裡 ------------------
+         * **相簿所有的迴圈都經過 nap()**（選單、看照片、播影片），
+         * 所以這一個插入點就涵蓋全部，不必去改十幾個迴圈。
+         *
+         * 資料串流階段不靠這裡 —— 那時候相簿每格影片要 17ms，主迴圈
+         * 餵不動 USB 的 1000 包/秒，會交給 TIM7 的中斷
+         * （見 projects/usbaudio/README.md 的實測）。
+         *
+         * 這裡本來就是忙等（NAP_USE_WFI 是 0），順便做事不花額外時間。 */
+        usbaudio_process();
 #if NAP_USE_WFI
         __WFI();
 #endif
@@ -3166,6 +3177,11 @@ void album_run(void)
     bool wdt_reset;
 
     g_stage = 1;
+
+    /* USB 無線耳機（CN17）。**失敗不影響相簿其他功能** —— 沒插 dongle
+     * 是常態，這個呼叫只是把主機堆疊起起來等它出現。
+     * 狀態看 DTCM 黑盒子 160 號之後（見 usbaudio.c）。 */
+    usbaudio_init();
 
     /* 睡眠時保持除錯連線。
      *

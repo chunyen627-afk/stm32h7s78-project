@@ -33,7 +33,8 @@ SRC = "PARENT-2-PROJECT_LOC"
 HAL_MODULES = ["LTDC", "I2C", "DMA2D", "XSPI", "LPTIM", "SDRAM",
                "GFXTIM", "RAMCFG", "MDF", "CRC", "SD", "JPEG", "IWDG",
                "ADC",   # ADC 只為了量 VBUS（偵測 USB 線插上沒），見 vbus.c
-               "I2S"]   # I2S 給音訊（WM8904 走 I2S6）
+               "I2S",   # I2S 給音訊（WM8904 走 I2S6）
+               "HCD"]   # USB 主機控制器，給 CN17 的 USB 無線耳機
 
 HAL_SOURCES = [
     "stm32h7rsxx_hal_ltdc.c", "stm32h7rsxx_hal_ltdc_ex.c",
@@ -50,6 +51,20 @@ HAL_SOURCES = [
     "stm32h7rsxx_hal_adc.c", "stm32h7rsxx_hal_adc_ex.c",
     # 音訊：WM8904 掛在 I2S6（SPI6 的 I2S 模式）。
     "stm32h7rsxx_hal_i2s.c",
+    # USB 無線耳機：CN17（USB2 全速）當主機。跟隨身碟模式的 CN18（USB1 / HS）
+    # 是兩顆不同的控制器，不衝突。
+    "stm32h7rsxx_hal_hcd.c", "stm32h7rsxx_ll_usb.c",
+]
+
+# ST 的 USB Host 中介層。核心四個檔 + UAC1 類別。
+# **usbh_conf.h 與底層膠合（usbh_glue.c）在 app_src/**，不是從 cube 抄 ——
+# 那兩個檔有相簿專屬的修改（時脈走 HSI48+CRS、不用 malloc、log 關掉）。
+USBH_SOURCES = [
+    ("usbh_core.c",   "Core/Src/usbh_core.c"),
+    ("usbh_ctlreq.c", "Core/Src/usbh_ctlreq.c"),
+    ("usbh_ioreq.c",  "Core/Src/usbh_ioreq.c"),
+    ("usbh_pipes.c",  "Core/Src/usbh_pipes.c"),
+    ("usbh_audio.c",  "Class/AUDIO/Src/usbh_audio.c"),
 ]
 
 BSP_SOURCES = [
@@ -84,6 +99,7 @@ ALBUM_SOURCES = ["album_main.c", "photo.c", "video.c", "favorites.c",
                  "vbus.c",
                  "usbdrive.c",
                  "audio_out.c",
+                 "usbaudio.c", "usbh_glue.c",
                  "sd_bsp_diskio.c", "xspi_psram.c",
                  "gfx.c", "font_zh.c"]   # gfx/xspi_psram 來自 repo 的 shared/
 
@@ -100,6 +116,8 @@ INCLUDES = [
     f"{'../' * 7}Drivers/BSP/Components/wm8904",
     f"{'../' * 7}Middlewares/Third_Party/FatFs/source",
     f"{'../' * 7}Middlewares/Third_Party/FatFs/source/drivers/sd",
+    f"{'../' * 7}Middlewares/ST/STM32_USB_Host_Library/Core/Inc",
+    f"{'../' * 7}Middlewares/ST/STM32_USB_Host_Library/Class/AUDIO/Inc",
     f"{'../' * 7}Utilities/Fonts",
     f"{'../' * 7}Utilities/JPEG",
     "../../../Appli/Album",
@@ -204,6 +222,9 @@ def add_sources():
                       f"{PKG}/Middlewares/Third_Party/FatFs/{rel}"))
     for name, rel in UTIL_SOURCES:
         items.append((f"Utilities/{name}", f"{PKG}/Utilities/{rel}"))
+    for name, rel in USBH_SOURCES:
+        items.append((f"Middlewares/USBH/{name}",
+                      f"{PKG}/Middlewares/ST/STM32_USB_Host_Library/{rel}"))
 
     block = "".join(link(n, u) for n, u in items if n not in have)
     added = sum(1 for n, _ in items if n not in have)
@@ -411,6 +432,54 @@ def patch_i2s_dma_cache():
     print("  hal_i2s.c 已補上 DMA 節點的快取寫回")
 
 
+def patch_usbh_audio_alt():
+    """讓 UAC1 類別按格式挑 alt setting，而不是挑端點最大的。
+
+    ST 的 USBH_AUDIO_InterfaceInit 註解就寫著
+    "largest endpoint size : default behavior"。裝置只有一個 alt 時沒差
+    （JBL Quantum TWS 就是），但多 alt 的耳機會被挑到 24-bit 那個，
+    而我們送的是 16-bit —— 長度對不上，裝置整包丟掉，完全沒聲音。
+
+    **必須改在 InterfaceInit 裡**：它選完 alt 緊接著就用 headphone.EpSize
+    去開管線，改晚了主機通道的封包大小會跟裝置的端點對不上。
+
+    片段的正本在 projects/usbaudio/patches/ —— 那是這個發現的來源，
+    治具與相簿共用同一份，不要各留一份會走鐘。
+    """
+    frag = os.path.join(ROOT, "..", "usbaudio", "patches",
+                        "usbh_audio-pick-alt.c.frag")
+    frag = os.path.abspath(frag)
+    aud = os.path.join(CUBE, "Middlewares", "ST", "STM32_USB_Host_Library",
+                       "Class", "AUDIO", "Src", "usbh_audio.c")
+
+    if not os.path.isfile(frag) or not os.path.isfile(aud):
+        print("  !! 找不到 usbh_audio 的片段或目標，略過")
+        return
+
+    s = io.open(aud, encoding="utf-8").read()
+    if "USBH_AUDIO_PickAltByFormat" in s:
+        print("  usbh_audio.c 已改過")
+        return
+
+    body = io.open(frag, encoding="utf-8").read()
+    body = body[body.index("/* --- 本專案的修改"):]
+    sig = ("static USBH_StatusTypeDef USBH_AUDIO_InterfaceInit"
+           "(USBH_HandleTypeDef *phost)" + NL + "{")
+    hid = "  if (USBH_AUDIO_FindHIDControl(phost) == USBH_OK)"
+
+    if (sig not in s) or (hid not in s):
+        print("  !! usbh_audio.c 找不到錨點，略過")
+        return
+
+    s = s.replace(sig, body + sig, 1)
+    s = s.replace(hid,
+                  "  /* 本專案的修改：上面挑的是「端點最大的」，改成按格式挑。 */" + NL +
+                  "  USBH_AUDIO_PickAltByFormat(phost, 2U, 16U, 48000U);" + NL + NL +
+                  hid, 1)
+    io.open(aud, "w", encoding="utf-8").write(s)
+    print("  usbh_audio.c 已套用（按格式挑 alt setting）")
+
+
 def main():
     if not os.path.isdir(PROJ):
         print(f"找不到專案目錄: {PROJ}")
@@ -425,6 +494,7 @@ def main():
     patch_main()
     patch_boot_hse()
     patch_i2s_dma_cache()
+    patch_usbh_audio_alt()
     return 0
 
 
