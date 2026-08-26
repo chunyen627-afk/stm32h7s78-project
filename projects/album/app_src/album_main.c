@@ -1837,6 +1837,14 @@ static bool select_screen(void)
             g_dbg_audiotest || (BBOX[16] >> 16) == 0x5A5Bu) {
             return false;               /* 交回主迴圈去跑測試 */
         }
+#if ALBUM_AUTOPLAY && ALBUM_USB_AUDIO
+        /* 治具：等 USB 類別就緒才開播。搶在列舉前面的話音訊會退回
+         * I2S，USB 串流路徑根本沒被測到（上次驗證就是這樣漏掉的）。
+         * 15 秒沒等到（沒插 dongle）就照常播。 */
+        if (g_dbg_autovideo && !usbaudio_ready() && HAL_GetTick() < 15000u) {
+            /* 先不吃旗標，下一圈再看 */
+        } else
+#endif
         if (g_dbg_autovideo && g_vid_count > 0u) {
             BBOX[127] = autovideo_index();
             /* **吃掉旗標**，跟其他除錯旗標一樣一次性。
@@ -3566,6 +3574,11 @@ void album_run(void)
                 /* 除錯用：SWD 寫 g_dbg_autovideo 非 0 就直接播第一部影片。
                  * 影片問題只能靠點螢幕重現，這個旗標讓遠端也追得動。
                  * 不寫就完全等於不存在（board-notes 16.3 的旗標觸發原則）。 */
+#if ALBUM_AUTOPLAY && ALBUM_USB_AUDIO
+                if (g_dbg_autovideo && !usbaudio_ready() && HAL_GetTick() < 15000u) {
+                    /* 治具：等類別就緒，見選單那一處的說明 */
+                } else
+#endif
                 if (g_dbg_autovideo && g_vid_count > 0u) {
                     BBOX[127] = autovideo_index();
                     g_dbg_autovideo = 0u;       /* 一次性，見選單那一處的說明 */
