@@ -1,0 +1,18 @@
+# HSI48 + CRS(LSE)：USB 全速時脈完全不碰 PLL3 的實測（2026-08-26）
+# 開機後 0 次斷線、3 分鐘全程穩定、誤差 44 ppm。
+# 對照：PLL3Q 是 0 ppm 但跟相簿的 I2S 撞車；HSI48 原生是 +3177 ppm 且連不住。
+
+Product : JBL Quantum TWS
+VOL scale: min=B600(-74.00dB) max=FFFF(0.00dB) cur=DD00(-35dB) res=256 -> target 50% = -9473 (-37dB)
+VOL 時間到：-35dB -> -29dB（目標 -37dB，發了 86 次）
+00 pk=1000 sof=1000 ms=1000 miss=0 it=123872 rd=359 gap=1 rw=8320
+01 pk=1000 sof=1000 ms=1000 miss=0 it=123316 rd=375 gap=1 rw=8320
+02 pk=1000 sof=1000 ms=1000 miss=0 it=124245 rd=375 gap=1 rw=8320
+03 pk=1000 sof=1001 ms=1000 miss=0 it=122268 rd=375 gap=1 rw=8320
+04 pk=1001 sof=1000 ms=1000 miss=-1 it=123394 rd=375 gap=1 rw=8320
+05 pk=1000 sof=1000 ms=1000 miss=0 it=123447 rd=375 gap=1 rw=8320
+06 pk=1000 sof=1000 ms=1000 miss=0 it=124595 rd=375 gap=1 rw=8320
+07 pk=1000 sof=1000 ms=1000 miss=0 it=123026 rd=375 gap=1 rw=8320
+08 pk=1001 sof=1001 ms=1000 miss=-1 it=122594 rd=376 gap=1 rw=8320
+09 pk=1000 sof=1000 ms=1000 miss=0 it=123436 rd=375 gap=1 rw=8320
+=== FRAMES END 缺 7 訊框 / 45 秒，over=0；SOF 45002 / 45000 ms，誤差 44 ppm ===

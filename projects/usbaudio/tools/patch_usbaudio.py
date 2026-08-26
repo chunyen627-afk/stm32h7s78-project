@@ -85,6 +85,32 @@ def main():
          "原本的 25 是 46.08MHz，USB 慢 4% */"),
     ], "PLL3.PLLQ = 24")
 
+    # --- USB 全速的 48MHz 改用 HSI48 + CRS(LSE)，完全繞開 PLL3 -----------
+    #
+    # 為什麼非改不可：相簿的 PLL3 三個輸出都名花有主（board-notes 23.1 ——
+    # PLL3R 給 LTDC、PLL3Q 給 I2S 的 49.1521MHz），而 **LTDC 只有 PLL3R
+    # 一個來源**，PLL3 放不掉。相簿的 VCO 是 393.2168MHz，393.2168/48 =
+    # 8.192，沒有任何整數分頻能生出 48MHz —— 改分頻救不了。
+    #
+    # 試過而不通的：
+    #   CLK48（USBPHYC）-> 沒有時脈，韌體卡在 HAL_HCD_Init 之前。
+    #   HSI48 原生       -> 實測 +3177ppm，超出 USB 全速訊框時序規格
+    #                       （±0.05%）六倍，dongle 一直斷線重連。
+    # 可行的：HSI48 + CRS，用 LSE 當基準持續校準。SYNCDIV=32 時
+    #   48e6 x 32 / 32768 = 46875 剛好整除，量化誤差 0。
+    #   **實測 -44 ppm、開機後 0 次斷線、45 秒缺 0~7 個訊框。**
+    #
+    # 前提是板子有 32.768kHz 晶振 —— 實測 STM32H7S78-DK 有（LSE ready）。
+    frag = os.path.join(ROOT, "patches", "usbh_conf-clock.c.frag")
+    if os.path.isfile(frag):
+        body = io.open(frag, encoding="utf-8").read()
+        body = body[body.index("    /* --- USB"):]
+        edit(os.path.join(APP, "Src", "usbh_conf.c"), [
+            ("""    PeriphClkInit.PeriphClockSelection = RCC_PERIPHCLK_USBOTGFS;
+    PeriphClkInit.UsbOtgFsClockSelection = RCC_USBOTGFSCLKSOURCE_PLL3Q;
+""", body),
+        ], "RCC_USBOTGFSCLKSOURCE_HSI48")
+
     edit(os.path.join(APP, "Inc", "ffconf.h"), [
         ("#define FF_USE_LFN		0", "#define FF_USE_LFN		1"),
         ("#define FF_FS_EXFAT		0", "#define FF_FS_EXFAT		1"),

@@ -38,8 +38,17 @@
  * 百分比只是給人調的把手，不要用它去推「應該多大聲」。
  *
  * 接進相簿之後音量會是螢幕上的控制項，這個常數只管治具的起始值。 */
-#define AUDIO_VOL_PERCENT   57U
-#define AUDIO_VOL_MAX_STEPS 300U   /* 純粹的失控保險，正常收斂用不到 */
+/* 起始音量。按 USER 鍵可以往下調，調到滿意的 dB 之後把百分比寫回這裡。 */
+#define AUDIO_VOL_PERCENT   50U
+#define AUDIO_VOL_STEP_PCT  8U     /* 按一下降幾個百分點（8% x 74dB = 約 6dB）*/
+#define AUDIO_VOL_FLOOR_PCT 13U    /* 降到這裡以下就繞回 AUDIO_VOL_PERCENT */
+/* **時限，不是步數上限。** 原本用步數，結果迴圈根本不收斂：類別每設一次
+ * 音量就回頭去讀裝置回報的值（cs_req_state = AUDIO_REQ_GET_VOLUME），
+ * 那個值不會停在我算的目標上，所以「到位」永遠不成立 ——
+ * 於是每 120ms 發一筆控制傳輸，**整場不停**。
+ * 一步音量是分兩筆設左右聲道的，持續不斷地發就會聽到左右切換。
+ * 給它 12 秒把音量帶到大概的位置，時間到就閉嘴。 */
+#define AUDIO_VOL_BUDGET_MS 12000U
 #include "explorer.h"
 
 /* functions prototypes ---------------------------------------------*/
@@ -119,6 +128,10 @@ static uint8_t play_pending = 0U;       /* 取樣率設好了，Play 還沒回 O
 static uint8_t play_started = 0U;       /* Play 回過 USBH_OK，資料真的在送 */
 static volatile uint8_t eof_seen = 0U;  /* 類別回報整段送完（唯一可信的「播完了」）*/
 static uint32_t dbg_unexpected = 0U;    /* 開播之後非預期停下來的次數 */
+
+/* 目前的目標音量百分比。USER 鍵會改它，所以是 volatile。 */
+static volatile uint8_t g_vol_pct   = AUDIO_VOL_PERCENT;
+static volatile uint8_t g_vol_dirty = 0U;   /* 目標變了，要重新走過去 */
 
 /* --- 量測：爆音的兩個候選機制，分得開 -----------------------------------
  * 波形不連續只有兩種來源，而它們要換的東西完全不同：
@@ -580,9 +593,19 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
       static uint8_t  vol_done  = 0;
       static int32_t  vol_tgt   = 0;
       static uint8_t  vol_announced = 0;
+      static uint32_t vol_t0    = 0;    /* 這一輪爬升的起點時刻 */
+      static int32_t  vol_from  = 0;    /* 起點音量，用來看它到底有沒有動 */
 
       AUDIO_HandleTypeDef *vh =
         (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+      if (g_vol_dirty != 0U)
+      {
+        g_vol_dirty   = 0U;
+        vol_done      = 0U;
+        vol_steps     = 0U;
+        vol_announced = 0U;
+      }
 
       if ((vol_done == 0U) && (vh != NULL))
       {
@@ -596,7 +619,9 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
         if (vol_announced == 0U)
         {
           vol_announced = 1U;
-          vol_tgt  = lo + (((hi - lo) * (int32_t)AUDIO_VOL_PERCENT) / 100);
+          vol_tgt  = lo + (((hi - lo) * (int32_t)g_vol_pct) / 100);
+          vol_t0   = HAL_GetTick();
+          vol_from = cur;
           /* 一次把裝置的刻度攤開：raw 是 ST 存的原值，dB 是轉成有號之後
            * 除以 256。兩個都印，因為 ST 的 uint32_t 存法本身就可疑。 */
           USBH_UsrLog("VOL scale: min=%04lX(%ld.%02udB) max=%04lX(%ld.%02udB) "
@@ -608,49 +633,56 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
                       (unsigned long)(vh->headphone.attribute.volume & 0xFFFFU),
                       (long)(cur / 256),
                       (long)res,
-                      (unsigned)AUDIO_VOL_PERCENT,
+                      (unsigned)g_vol_pct,
                       (long)vol_tgt, (long)(vol_tgt / 256));
         }
 
+        /* 120ms 一步。縮到 20ms 試過：加上 control_state 守門之後等於用
+         * 控制傳輸猛敲 dongle，實測開機後斷線 4 次、音量走不完。
+         * **一次只改一件事** —— 那一輪同時改了守門和節奏，分不出是誰的錯，
+         * 退回已知可用的 120ms 之後才確定守門本身是對的。 */
         if ((HAL_GetTick() - vol_tick) > 120U)
         {
           vol_tick = HAL_GetTick();
 
-          /* **每 120ms 發一次就好，不要自作聰明配速。**
-           * 一次音量變更實測約 550ms 才落地（跟 HID 輪詢共用同一格
-           * control_state，互相排隊），所以四五次呼叫才生效一次 ——
-           * 那是浪費，但無害：迴圈每次都重讀 cur，到位就停。
+          /* --- 配速：等上一步整個做完再發下一步 ---------------------
+           * **一步音量不是一筆傳輸，是兩筆**：USBH_AUDIO_SetControlAttribute
+           * 先設 channel 2，下一輪才設 channel 1（temp_channels 遞減）。
+           * 中途再發一次 SetVolume 會把 control_state 蓋掉，
+           * **兩個聲道就走散了** —— 聽起來就是左右換來換去、忽大忽小，
+           * 而且只在音量移動的時候出現。
            *
-           * 我試過「只有上一步落地才發下一步」，結果衝過頭而且把診斷行
-           * 變成每 120ms 印一次，45 秒缺的訊框從 8 個變成 683 個。
-           * **會動的東西不要為了漂亮去改。** */
-          if (vol_steps >= AUDIO_VOL_MAX_STEPS)
+           * 所以只在 control_state 回到 INIT/CHANGE（＝不在做音量）時才發。
+           * 之前試過盯 attribute.volume 有沒有變，那是錯的尺：
+           * 值變了不代表「兩個聲道都設完了」。 */
+          if ((HAL_GetTick() - vol_t0) > AUDIO_VOL_BUDGET_MS)
           {
             vol_done = 1U;
-            USBH_UsrLog("VOL 失控保險跳了：%u 次還沒到（cur=%lddB tgt=%lddB）",
-                        (unsigned)vol_steps, (long)(cur / 256),
-                        (long)(vol_tgt / 256));
+            USBH_UsrLog("VOL 時間到：%lddB -> %lddB（目標 %lddB，發了 %u 次）",
+                        (long)(vol_from / 256), (long)(cur / 256),
+                        (long)(vol_tgt / 256), (unsigned)vol_steps);
           }
-          else if (cur < (vol_tgt - (res / 2)))
+          else if ((cur >= (vol_tgt - (res / 2))) && (cur <= (vol_tgt + (res / 2))))
           {
-            if (USBH_AUDIO_SetVolume(&hUsbHostFS, VOLUME_UP) == USBH_OK)
-            {
-              vol_steps++;
-            }
+            vol_done = 1U;
+            USBH_UsrLog("VOL 到位：%u%% = %lddB（發了 %u 次）"
+                        "；按 USER 鍵再降 %u%%",
+                        (unsigned)g_vol_pct, (long)(cur / 256),
+                        (unsigned)vol_steps, (unsigned)AUDIO_VOL_STEP_PCT);
           }
-          else if (cur > (vol_tgt + (res / 2)))
+          else if ((vh->control_state == AUDIO_CONTROL_INIT) ||
+                   (vh->control_state == AUDIO_CONTROL_CHANGE))
           {
-            if (USBH_AUDIO_SetVolume(&hUsbHostFS, VOLUME_DOWN) == USBH_OK)
+            if (USBH_AUDIO_SetVolume(&hUsbHostFS,
+                                     (cur < vol_tgt) ? VOLUME_UP : VOLUME_DOWN)
+                == USBH_OK)
             {
               vol_steps++;
             }
           }
           else
           {
-            vol_done = 1U;
-            USBH_UsrLog("VOL 到位：%u%% = %lddB（發了 %u 次）",
-                        (unsigned)AUDIO_VOL_PERCENT, (long)(cur / 256),
-                        (unsigned)vol_steps);
+            /* 上一步還在做，等它。 */
           }
         }
       }
@@ -791,6 +823,8 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
     {
       uint16_t k;
       uint32_t miss_total = 0U;
+      uint32_t sof_total  = 0U;
+      uint32_t ms_total   = 0U;
 
       dbg_phase = 2U;
       USBH_UsrLog("=== FRAMES BEGIN（一格一秒；pk=送出封包數 ms=實際毫秒 "
@@ -800,6 +834,8 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
         int32_t miss = (int32_t)dbg_ms[k] - (int32_t)dbg_pk[k];
 
         if (miss > 0) { miss_total += (uint32_t)miss; }
+        sof_total += dbg_sf[k];
+        ms_total  += dbg_ms[k];
         USBH_UsrLog("%02u pk=%lu sof=%lu ms=%lu miss=%ld it=%lu rd=%lu gap=%lu rw=%lu",
                     (unsigned)k,
                     (unsigned long)dbg_pk[k],
@@ -810,9 +846,18 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
                     (unsigned long)dbg_gp[k],
                     (unsigned long)dbg_rw[k]);
       }
-      USBH_UsrLog("=== FRAMES END 共缺 %lu 個訊框 / %u 秒，over=%lu ===",
+      /* SOF 總數 vs 毫秒總數 = 時脈誤差。45000 個計數，1 個計數 = 0.002%，
+       * 這把尺比要量的東西細三個數量級。ppm = (sof-ms)/ms * 1e6，
+       * 用整數算避免浮點。 */
+      USBH_UsrLog("=== FRAMES END 缺 %lu 訊框 / %u 秒，over=%lu；"
+                  "SOF %lu / %lu ms，誤差 %ld ppm ===",
                   (unsigned long)miss_total, (unsigned)dbg_n,
-                  (unsigned long)dbg_over_cnt);
+                  (unsigned long)dbg_over_cnt,
+                  (unsigned long)sof_total, (unsigned long)ms_total,
+                  (ms_total != 0U)
+                    ? (long)((((int32_t)sof_total - (int32_t)ms_total) * 1000000LL)
+                             / (int32_t)ms_total)
+                    : 0L);
     }
     else if (dbg_phase == 2U)
     {
@@ -976,13 +1021,20 @@ void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
 {
   if (GPIO_Pin == USER_BUTTON_Pin)
   {
-    if (AUDIO_app_prev_state == AUDIO_STATE_PLAYBACK_EXPLORE)
+    /* --- 這顆鍵原本是「跳下一首」，改成音量 -------------------------
+     * 治具只播一個檔案（AUDIO_Start 用檔名挑 video3），跳下一首沒有用處；
+     * 而音量只能靠耳朵找，改一個數字重燒一次太慢。
+     * 按一下降 AUDIO_VOL_STEP_PCT 個百分點，降到底繞回起始值。
+     * 到位的 dB 會印到 COM4，找到滿意的位置就把百分比寫回
+     * AUDIO_VOL_PERCENT。 */
+    if (g_vol_pct > (AUDIO_VOL_FLOOR_PCT + AUDIO_VOL_STEP_PCT))
     {
-      AUDIO_app_state = AUDIO_STATE_PLAYBACK_CONFIG;
+      g_vol_pct = (uint8_t)(g_vol_pct - AUDIO_VOL_STEP_PCT);
     }
-    else if (AUDIO_app_prev_state == AUDIO_STATE_PLAYBACK_PLAY)
+    else
     {
-      AUDIO_app_state = AUDIO_STATE_PLAYBACK_NEXT;
+      g_vol_pct = AUDIO_VOL_PERCENT;
     }
+    g_vol_dirty = 1U;
   }
 }
