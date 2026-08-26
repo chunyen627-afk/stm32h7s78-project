@@ -995,7 +995,12 @@ static uint32_t     g_vid_count;
 
 /* 二分法：0 = 完全不啟動 USB 主機（連 usbaudio_init 都不呼叫）。
  * 用來判定「自動滑動會當」到底是不是 USB 帶進來的。 */
-#define ALBUM_USB_AUDIO     0
+#define ALBUM_USB_AUDIO     1
+
+/* 快取二分：1 = 進相簿就關掉 D-Cache。判定「USB 一開就卡死 SD 讀取」
+ * 是不是快取／推測式存取這一類（usbaudio README「新方向」的第 3 步）。
+ * 只關資料快取，I-Cache 照開。**正式建置一定要是 0。** */
+#define ALBUM_DCACHE_OFF    0
 
 volatile uint32_t   g_dbg_autovideo;   /* SWD 可寫，見主迴圈 */
 volatile uint32_t   g_dbg_audiotest;   /* SWD 寫入頻率（Hz）就播測試音 */
@@ -1163,6 +1168,7 @@ static void play_video(const video_info_t *v)
     uint32_t vol_lock = 0u;   /* 按過音量之後要連續幾次讀不到觸控才解鎖 */
     int32_t  dmax = -1000000, dmin = 1000000;   /* 音畫偏差的極值 */
     bool     paused = false;
+    bool     dcache_off = false;   /* 本次播放有沒有把 D-Cache 關掉 */
 
     if (!video_open(v)) {
         show_message("影片開啟失敗", v->name);
@@ -1182,6 +1188,13 @@ static void play_video(const video_info_t *v)
             idx = g_vid_resume[vi];
         }
         BBOX[146] = idx;            /* 這次從第幾格開始 */
+    }
+
+    /* 開播前的音訊預填就會讀 SD，所以危險組態的判斷要在這之前做一次；
+     * 迴圈頂那個檢查負責接住「播到一半才插 dongle」（說明見迴圈頂）。 */
+    if (usbaudio_session_active()) {
+        SCB_DisableDCache();
+        dcache_off = true;
     }
 
     /* 有同名的 .wav 就一起播。沒有就照舊只放畫面 —— 卡上八部影片只有一部
@@ -1217,6 +1230,34 @@ static void play_video(const video_info_t *v)
         bool touched;
 
         watchdog_feed();
+
+        /* --- USB 會話活躍時，影片播放全程關 D-Cache -------------------
+         *
+         * 2026-08-27 A/B/A 實測收斂出來的結論：USB 主機會話一活躍
+         * （dongle 連上、埠有電），加上 D-Cache 的匯流排交易，再加上
+         * 影片這種 SD 持續串流＋滑動，幾秒內就會把匯流排互連整個鎖死
+         * —— 主迴圈與所有中斷同瞬間停、沒有任何 CPU 故障、連 SWD 的
+         * AHB-AP 都進不去，只剩看門狗能救。卡死的位置用 DTCM 探針
+         * （UBOX 188/189）抓過三次：OTG 暫存器讀取一次、SDMMC 的
+         * f_read 兩次 —— CPU 死在「當下剛好碰到的從屬」上，代表死的
+         * 是互連，不是某個週邊。
+         *
+         * 排除掉的（都實測過，不要重試）：GAHBCFG.GINT（設了清、
+         * 從頭不設都一樣死）、NVIC 的 OTG 中斷（本來就關）、CRS 修整
+         * （收斂後凍結 TRIM 照樣死）、SDMMC 降頻（1/2 與 1/8 都沒用）。
+         * 唯一實證有效的是關 D-Cache：同一份自動滑動治具從「7~12 秒
+         * 必死」變成「209 秒、51 次滑動零異常」，而且影片照樣跑滿
+         * 23.6fps（解碼在硬體 JPEG＋DMA2D 上，CPU 快取影響小）。
+         *
+         * 所以把代價限縮到最小：只在「USB 會話活躍」時、只在影片播放
+         * 期間關。照片瀏覽（快取效益最大的路徑）不受影響；沒插 dongle
+         * 時影片也維持原本的組態。放在迴圈頂而不是進場，是為了接住
+         * 「播到一半才插 dongle」。 */
+        if (!dcache_off && usbaudio_session_active()) {
+            SCB_DisableDCache();
+            dcache_off = true;
+        }
+
         audio_wav_pump();
         if (!sd_present()) {
             break;
@@ -1406,6 +1447,12 @@ static void play_video(const video_info_t *v)
     /* **一定要走這裡。** DMA 解碼整合進相簿正式路徑曾經把週邊弄壞
      * （board-notes 16.6），video_close() 會做完整拆除並把解碼器還給照片。 */
     video_close();
+
+    /* 播放期間關掉的 D-Cache 在這裡還回來（所有出口都經過這裡）。
+     * EnableDCache 會先整體失效再開啟，不會撿到停用期間的舊快取行。 */
+    if (dcache_off) {
+        SCB_EnableDCache();
+    }
 }
 
 /* g_dbg_autovideo 要播哪一部：1 = 第一部；2 = **第一部有音軌的**。
@@ -3222,6 +3269,10 @@ void album_run(void)
     bool wdt_reset;
 
     g_stage = 1;
+
+#if ALBUM_DCACHE_OFF
+    SCB_DisableDCache();
+#endif
 
     /* USB 無線耳機（CN17）。**失敗不影響相簿其他功能** —— 沒插 dongle
      * 是常態，這個呼叫只是把主機堆疊起起來等它出現。

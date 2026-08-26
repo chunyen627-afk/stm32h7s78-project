@@ -30,6 +30,10 @@ void usbaudio_init(void);
  * 見 projects/usbaudio/README.md 的實測）。 */
 void usbaudio_process(void);
 
+/* 主機起來了而且 dongle 在線（不要求類別就緒）。play_video() 用它決定
+ * 要不要在播放期間關 D-Cache（USB 會話 + D-Cache + SD 串流會鎖死匯流排）。 */
+bool usbaudio_session_active(void);
+
 /* dongle 在線而且 UAC1 類別已經掛好，可以開始送音訊。 */
 bool usbaudio_ready(void);
 

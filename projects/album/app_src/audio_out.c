@@ -399,10 +399,15 @@ static void wav_fill(uint32_t half)
     if (want != 0u) {
         uint32_t c0 = DWT->CYCCNT;
 
+        /* 卡死探針（189 號，DTCM）：1 = 卡在這個 f_read（SDMMC）裡。
+         * 跟 usbaudio.c 的 188 號一組，凍結後讀回來就知道 CPU 死在哪個
+         * 從屬上 —— 凍住時 SWD 進不去，只能靠腳印回推。 */
+        ((volatile uint32_t *)0x20004020u)[189] = 1u;
         if (f_read(&g_wav, dst, want, &got) != FR_OK) {
             got = 0;
             g_dbg_wav_rderr++;
         }
+        ((volatile uint32_t *)0x20004020u)[189] = 0u;
         g_wav_left      -= got;
         g_dbg_wav_fed   += got;
         g_dbg_wav_us    += (DWT->CYCCNT - c0) / (SystemCoreClock / 1000000u);

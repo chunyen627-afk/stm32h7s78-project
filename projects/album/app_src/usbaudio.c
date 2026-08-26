@@ -135,8 +135,15 @@ extern HCD_HandleTypeDef hhcd_USB_OTG_FS;
  * 這一個函式就是「服務一次 USB」：先處理硬體事件，再推狀態機。 */
 static void usb_poll(void)
 {
+    /* 卡死探針（188 號）：凍結時匯流排整個鎖死、連 SWD 都進不去，
+     * 所以「凍住那一刻 CPU 在讀哪個從屬」只能靠前後腳印回推。
+     * 1 = 卡在 HAL_HCD_IRQHandler（OTG 暫存器）、2 = 卡在 USBH_Process、
+     * 0 = 不在 usb_poll 裡。 */
+    UBOX[188] = 1u;
     HAL_HCD_IRQHandler(&hhcd_USB_OTG_FS);
+    UBOX[188] = 2u;
     (void)USBH_Process(&hUsbHostFS);
+    UBOX[188] = 0u;
 }
 
 /* 應用層看到的狀態。**volatile**：TIM7 的中斷之後也會改到相關狀態。 */
@@ -229,6 +236,8 @@ void usbaudio_init(void)
     UBOX[UB_STREAM]    = 0xFFFFFFFFu;
     UBOX[UB_PROCENTRY] = 0u;
     UBOX[UB_INITED]    = 0xFFFFFFFFu;
+    UBOX[188]          = 0xFFFFFFFFu;   /* 卡死探針：0xFFFFFFFF = 還沒跑到 */
+    UBOX[189]          = 0xFFFFFFFFu;
 
     UBOX[UB_MAGIC]    = 0x55534231u;
     UBOX[UB_INIT]     = UB_INIT_ENTER;
@@ -347,6 +356,15 @@ void usbaudio_process(void)
 bool usbaudio_ready(void)
 {
     return (s_appli == 2u);
+}
+
+/* 「會話活躍」= 主機起來了而且 dongle 在線（已連接或類別就緒）。
+ * 給 play_video() 判斷要不要關 D-Cache 用（見 album_main.c 的說明）——
+ * 判斷條件刻意比 usbaudio_ready() 寬：凍死不需要類別就緒，
+ * dongle 一連上、會話一跑起來就有毒。 */
+bool usbaudio_session_active(void)
+{
+    return (s_inited != 0u) && (s_appli == 1u || s_appli == 2u);
 }
 
 /* ======================================================================
