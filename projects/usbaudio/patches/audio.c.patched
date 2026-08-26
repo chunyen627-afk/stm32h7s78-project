@@ -123,6 +123,23 @@ int16_t FilePos = 0;
  * 原本的程式**沒有這三個旗標**，全部擠在 USBH_AUDIO_GetOutOffset() 回的
  * -1 裡面 —— 而那個 -1 同時代表「還沒開播」與「檔案播完了」。
  * 分不開的後果見 README〈爆音的模型錯在哪〉。 */
+static uint8_t mic_off      = 1U;       /* 0=還沒把麥克風放回 alt 0 */
+static uint8_t force_alt    = 1U;       /* 0=還沒送那筆強制 SET_INTERFACE */
+static uint8_t pre_alt      = 1U;       /* 0=還沒讀開播前的 alt */
+static uint8_t mute_step    = 3U;       /* 0=讀 1=寫 2=再讀 3=做完了 */
+static uint8_t rb_step      = 3U;       /* 對帳：0=alt 1=取樣率 2=音量 3=做完 */
+static uint8_t dvol_step    = 2U;       /* 直接設音量：0=ch1 1=ch2 2=做完 */
+/* 先開到最大來回答「音量寫得進去嗎」。ROG 的 Feature Unit 是
+ * bmaControls[0]=0x01（主聲道只有靜音）、[1]=[2]=0x02（音量在聲道 1、2），
+ * 所以寫要寫聲道 1 和 2，**讀也要讀聲道 1** —— 我前一輪讀聲道 0，
+ * 那是一個不存在的控制，讀回 -74dB 根本不能當證據。 */
+#define AUDIO_VOL_DB   (-32)   /* 使用者實聽認可的位置 */
+
+/* 把 ST 類別的相對音量爬升整個關掉。
+ * 它是開播之後唯一大量的主機->裝置流量（12 秒、72 筆控制傳輸），
+ * 而對帳量到裝置在那之後從 alt=1 掉回 alt=2。先拿掉這個變因。
+ * 音量改用我們自己那一次絕對值 SET_CUR（AUDIO_VOL_DB）。 */
+#define AUDIO_USE_CLASS_VOL  0
 static uint8_t freq_pending = 0U;       /* 取樣率還沒設定成功 */
 static uint8_t play_pending = 0U;       /* 取樣率設好了，Play 還沒回 OK */
 static uint8_t play_started = 0U;       /* Play 回過 USBH_OK，資料真的在送 */
@@ -364,6 +381,290 @@ static void USB_DumpCfgDesc(void)
   }
 }
 
+
+/* --- 挑「格式相符」的 alt setting ------------------------------------
+ * ST 的 USBH_AUDIO_InterfaceInit 是**挑端點最大的**（原始碼註解就寫著
+ * "largest endpoint size : default behavior"）。裝置只有一個 alt 時沒差
+ * —— JBL Quantum TWS 就是 —— 但 ROG Delta II (2.4GHz) 有兩個：
+ *
+ *     if=1 alt=1   16-bit   mps 384
+ *     if=1 alt=2   24-bit   mps 576   <- ST 挑這個
+ *
+ * 而我們的 wav 是 16-bit。裝置被切到 24-bit 之後每個訊框期待 288 bytes，
+ * 我們送 192，長度不對就整包丟掉 —— **實測完全沒聲音**。
+ *
+ * 這裡走一遍原始描述元找相符的 alt。**不靠 class_desc.as_desc[] 的索引
+ * 去對 stream_out[]** —— 那兩個陣列的順序對不對得上是沒有保證的假設，
+ * 原始位元組才是唯一不會騙人的來源（跟量端點同步型別同一個理由）。
+ *
+ * 哨兵 0xFF = 沒找到，跟「找到 interface 0」分得開。 */
+static uint8_t  g_alt_if  = 0xFFU;
+static uint8_t  g_alt_num = 0xFFU;
+static uint16_t g_alt_mps = 0U;
+
+static void usb_pick_matching_alt(uint32_t rate, uint8_t ch, uint8_t bits)
+{
+  const uint8_t *raw = hUsbHostFS.device.CfgDesc_Raw;
+  uint16_t have = hUsbHostFS.device.CfgDesc.wTotalLength;
+  uint16_t i = 0U;
+  uint8_t  cur_if = 0xFFU, cur_alt = 0xFFU;
+  uint8_t  fmt_ok = 0U;
+
+  g_alt_if  = 0xFFU;
+  g_alt_num = 0xFFU;
+  g_alt_mps = 0U;
+
+  while ((uint16_t)(i + 2U) <= have)
+  {
+    uint8_t blen = raw[i];
+    uint8_t btyp = raw[i + 1U];
+
+    if ((blen < 2U) || ((uint16_t)(i + blen) > have)) { break; }
+
+    if ((btyp == 0x04U) && (blen >= 9U))            /* INTERFACE */
+    {
+      cur_if  = raw[i + 2U];
+      cur_alt = raw[i + 3U];
+      fmt_ok  = 0U;                                 /* 換 alt 就重算 */
+    }
+    else if ((btyp == 0x24U) && (blen >= 8U) && (raw[i + 2U] == 0x02U))
+    {
+      /* CS_INTERFACE / FORMAT_TYPE：
+       * [3]bFormatType [4]bNrChannels [5]bSubframeSize [6]bBitResolution
+       * [7]bSamFreqType [8..]tSamFreq（每個 3 bytes，0 代表 [min,max] 範圍）*/
+      if ((raw[i + 3U] == 0x01U) && (raw[i + 4U] == ch) && (raw[i + 6U] == bits))
+      {
+        uint8_t nfreq = raw[i + 7U];
+
+        if (nfreq == 0U)
+        {
+          if (blen >= 14U)
+          {
+            uint32_t lo = (uint32_t)raw[i + 8U] | ((uint32_t)raw[i + 9U] << 8) |
+                          ((uint32_t)raw[i + 10U] << 16);
+            uint32_t hi = (uint32_t)raw[i + 11U] | ((uint32_t)raw[i + 12U] << 8) |
+                          ((uint32_t)raw[i + 13U] << 16);
+            if ((rate >= lo) && (rate <= hi)) { fmt_ok = 1U; }
+          }
+        }
+        else
+        {
+          uint8_t k;
+
+          for (k = 0U; k < nfreq; k++)
+          {
+            uint16_t o = (uint16_t)(i + 8U + ((uint16_t)k * 3U));
+
+            if ((uint16_t)(o + 3U) > (uint16_t)(i + blen)) { break; }
+            if ((((uint32_t)raw[o]) | ((uint32_t)raw[o + 1U] << 8) |
+                 ((uint32_t)raw[o + 2U] << 16)) == rate)
+            {
+              fmt_ok = 1U;
+              break;
+            }
+          }
+        }
+      }
+    }
+    else if ((btyp == 0x05U) && (blen >= 7U) && (fmt_ok != 0U))
+    {
+      uint8_t addr = raw[i + 2U];
+
+      if (((addr & 0x80U) == 0U) && ((raw[i + 3U] & 0x03U) == 0x01U))
+      {
+        g_alt_if  = cur_if;                          /* OUT 等時，就是它 */
+        g_alt_num = cur_alt;
+        g_alt_mps = (uint16_t)(((uint16_t)raw[i + 4U] |
+                                ((uint16_t)raw[i + 5U] << 8)) & 0x07FFU);
+        break;
+      }
+    }
+    else
+    {
+      /* 其他描述元，略過。 */
+    }
+
+    i = (uint16_t)(i + blen);
+  }
+}
+
+
+/* --- 靜音：ST 的類別定義了 MUTE_CONTROL 卻從來沒用過 -------------------
+ * `grep -n "MUTE\|mute" usbh_audio.c` 的結果是**空的** —— 整個類別不曾
+ * 讀寫靜音位元。裝置要是處於靜音狀態，主機端會看到一個完美的串流
+ * （0 斷線、0 缺口、時脈精準）而使用者什麼都聽不到。
+ *
+ * 組法照抄 USBH_AC_SetCur：
+ *   wIndex = (UnitID << 8) | AC 介面號（類別寫死 0）
+ *   wValue = (控制選擇碼 << 8) | 聲道號（0 = 主聲道）
+ * 用 phost->Control 直接送，跟 USBH_SetInterface 同一個機制，
+ * 回 USBH_BUSY 就重試。
+ *
+ * **先讀、再寫、再讀。** 不然「本來就沒靜音」跟「寫進去沒生效」分不開，
+ * 而那兩件事接下來要查的方向完全不同。 */
+static uint8_t g_mute_val = 0xFFU;      /* 哨兵：還沒讀過 */
+
+static USBH_StatusTypeDef audio_mute_req(uint8_t is_set, uint8_t value)
+{
+  AUDIO_HandleTypeDef *h = (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+  AUDIO_FeatureDescTypeDef *fu;
+
+  if (h == NULL) { return USBH_FAIL; }
+
+  fu = h->class_desc.cs_desc.FeatureUnitDesc[h->headphone.asociated_feature];
+  if (fu == NULL) { return USBH_FAIL; }
+
+  if (hUsbHostFS.RequestState == CMD_SEND)
+  {
+    if (is_set != 0U) { g_mute_val = value; }
+
+    hUsbHostFS.Control.setup.b.bmRequestType =
+      (uint8_t)(((is_set != 0U) ? USB_H2D : USB_D2H) |
+                USB_REQ_RECIPIENT_INTERFACE | USB_REQ_TYPE_CLASS);
+    hUsbHostFS.Control.setup.b.bRequest  =
+      (uint8_t)((is_set != 0U) ? UAC_SET_CUR : UAC_GET_CUR);
+    hUsbHostFS.Control.setup.b.wValue.w  = (uint16_t)((uint16_t)MUTE_CONTROL << 8);
+    hUsbHostFS.Control.setup.b.wIndex.w  = (uint16_t)((uint16_t)fu->bUnitID << 8);
+    hUsbHostFS.Control.setup.b.wLength.w = 1U;
+  }
+
+  return USBH_CtlReq(&hUsbHostFS, &g_mute_val, 1U);
+}
+
+
+/* --- 把「裝置自己的認知」讀回來 ---------------------------------------
+ * ROG Delta II 的狀況是：alt 切對了、沒靜音、串流完美（0 斷線、
+ * pk=1000/秒 代表每個 URB 都完成）、音量滾輪轉到底 —— 就是沒聲音。
+ * 到這裡所有「我們以為設好了」的東西都該去跟裝置本人對一次帳。
+ *
+ * 三個問題，一次問完：
+ *   GET_INTERFACE      -> 它**實際**在哪個 alt（不是我們以為的）
+ *   GET_CUR 取樣率     -> 它以為現在是幾 Hz（端點控制，wIndex = 端點位址）
+ *   GET_CUR 音量       -> 跟類別維護的 attribute.volume 對不對得上
+ *
+ * 組法照抄 USBH_AUDIO_SetEndpointControls 與 USBH_AC_SetCur，
+ * 只是方向反過來（USB_D2H / UAC_GET_CUR）。 */
+static uint8_t g_rb[4];
+
+static USBH_StatusTypeDef audio_readback(uint8_t step)
+{
+  AUDIO_HandleTypeDef *h = (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+  if (h == NULL) { return USBH_FAIL; }
+
+  if (hUsbHostFS.RequestState == CMD_SEND)
+  {
+    /* **哨兵 0xAA，不是 0。** alt 0 是合法答案（零頻寬設定），
+     * 用 0 當初值就分不出「讀到 alt 0」與「這筆傳輸沒發生」——
+     * 我先前就靠這個誤判過一輪，而 MUTE 那次讀回 255 才露了餡。 */
+    g_rb[0] = 0xAAU; g_rb[1] = 0xAAU; g_rb[2] = 0xAAU; g_rb[3] = 0xAAU;
+
+    if (step == 0U)                       /* 標準請求：GET_INTERFACE */
+    {
+      hUsbHostFS.Control.setup.b.bmRequestType =
+        (uint8_t)(USB_D2H | USB_REQ_RECIPIENT_INTERFACE | USB_REQ_TYPE_STANDARD);
+      hUsbHostFS.Control.setup.b.bRequest  = USB_REQ_GET_INTERFACE;
+      hUsbHostFS.Control.setup.b.wValue.w  = 0U;
+      hUsbHostFS.Control.setup.b.wIndex.w  = h->headphone.interface;
+      hUsbHostFS.Control.setup.b.wLength.w = 1U;
+    }
+    else if (step == 1U)                  /* 端點的取樣率 */
+    {
+      hUsbHostFS.Control.setup.b.bmRequestType =
+        (uint8_t)(USB_D2H | USB_REQ_RECIPIENT_ENDPOINT | USB_REQ_TYPE_CLASS);
+      hUsbHostFS.Control.setup.b.bRequest  = UAC_GET_CUR;
+      hUsbHostFS.Control.setup.b.wValue.w  = (uint16_t)(SAMPLING_FREQ_CONTROL << 8);
+      hUsbHostFS.Control.setup.b.wIndex.w  = h->headphone.Ep;
+      hUsbHostFS.Control.setup.b.wLength.w = 3U;
+    }
+    else                                  /* Feature Unit 的音量 */
+    {
+      AUDIO_FeatureDescTypeDef *fu =
+        h->class_desc.cs_desc.FeatureUnitDesc[h->headphone.asociated_feature];
+
+      if (fu == NULL) { return USBH_FAIL; }
+      hUsbHostFS.Control.setup.b.bmRequestType =
+        (uint8_t)(USB_D2H | USB_REQ_RECIPIENT_INTERFACE | USB_REQ_TYPE_CLASS);
+      hUsbHostFS.Control.setup.b.bRequest  = UAC_GET_CUR;
+      /* **聲道 1**，不是聲道 0。主聲道沒有音量控制。 */
+      hUsbHostFS.Control.setup.b.wValue.w  =
+        (uint16_t)(((uint16_t)VOLUME_CONTROL << 8) | 1U);
+      hUsbHostFS.Control.setup.b.wIndex.w  = (uint16_t)((uint16_t)fu->bUnitID << 8);
+      hUsbHostFS.Control.setup.b.wLength.w = 2U;
+    }
+  }
+
+  return USBH_CtlReq(&hUsbHostFS, g_rb,
+                     (step == 0U) ? 1U : ((step == 1U) ? 3U : 2U));
+}
+
+
+/* --- 從原始描述元推導「耳機那條路的 Feature Unit」---------------------
+ * ST 的類別用 headphone.asociated_feature 這個**索引**去查
+ * class_desc.cs_desc.FeatureUnitDesc[]，而那個索引是它自己配的。
+ * ROG Delta II 有兩個 Feature Unit（耳機 ID 2、麥克風 ID 6），
+ * 對帳量到的結果是：**裝置的音量卡在 -74dB（= volumeMin，全靜音），
+ * 而類別以為是 -32dB** —— 72 次寫入全部落空。
+ *
+ * 這裡改成走原始描述元：找 wTerminalType 是喇叭/耳機那一族的
+ * OUTPUT_TERMINAL，它的 bSourceID 就是要控制的單元。
+ * 跟挑 alt setting 同一個原則 —— **不要相信中介層的索引記帳，
+ * 原始位元組才是唯一的事實來源。**
+ *
+ * 0x0301 喇叭 / 0x0302 耳機 / 0x0303 頭戴式 / 0x0304 桌上型喇叭 ...
+ * 統一看高位元組是不是 0x03。 */
+static uint8_t g_fu_id = 0xFFU;         /* 哨兵：沒找到 */
+
+static void usb_find_headphone_feature(void)
+{
+  const uint8_t *raw = hUsbHostFS.device.CfgDesc_Raw;
+  uint16_t have = hUsbHostFS.device.CfgDesc.wTotalLength;
+  uint16_t i = 0U;
+
+  g_fu_id = 0xFFU;
+
+  while ((uint16_t)(i + 2U) <= have)
+  {
+    uint8_t blen = raw[i];
+
+    if ((blen < 2U) || ((uint16_t)(i + blen) > have)) { break; }
+
+    /* CS_INTERFACE(0x24) / OUTPUT_TERMINAL(0x03)：
+     * [3]bTerminalID [4:5]wTerminalType [6]bAssocTerminal [7]bSourceID */
+    if ((raw[i + 1U] == 0x24U) && (blen >= 9U) && (raw[i + 2U] == 0x03U) &&
+        (raw[i + 5U] == 0x03U))
+    {
+      g_fu_id = raw[i + 7U];
+      break;
+    }
+
+    i = (uint16_t)(i + blen);
+  }
+}
+
+/* SET_CUR 音量到指定的 Feature Unit / 聲道。dB 值 x 256（UAC1 的單位）。 */
+static uint8_t g_vbuf[2];
+
+static USBH_StatusTypeDef audio_set_vol_direct(uint8_t unit, uint8_t chan,
+                                               int16_t val)
+{
+  if (hUsbHostFS.RequestState == CMD_SEND)
+  {
+    g_vbuf[0] = (uint8_t)((uint16_t)val & 0xFFU);
+    g_vbuf[1] = (uint8_t)(((uint16_t)val >> 8) & 0xFFU);
+
+    hUsbHostFS.Control.setup.b.bmRequestType =
+      (uint8_t)(USB_H2D | USB_REQ_RECIPIENT_INTERFACE | USB_REQ_TYPE_CLASS);
+    hUsbHostFS.Control.setup.b.bRequest  = UAC_SET_CUR;
+    hUsbHostFS.Control.setup.b.wValue.w  =
+      (uint16_t)(((uint16_t)VOLUME_CONTROL << 8) | chan);
+    hUsbHostFS.Control.setup.b.wIndex.w  = (uint16_t)((uint16_t)unit << 8);
+    hUsbHostFS.Control.setup.b.wLength.w = 2U;
+  }
+
+  return USBH_CtlReq(&hUsbHostFS, g_vbuf, 2U);
+}
+
 /**
   * @brief  Starts Audio streaming.
   * @param  idx: File index
@@ -417,6 +718,12 @@ AUDIO_ErrorTypeDef AUDIO_Start(uint8_t idx)
      * 補一句上一輪沒查清楚的機制：SetFrequency 回 USBH_BUSY **不是**因為
      * 控制傳輸還沒完成，而是因為它要求 play_state == AUDIO_PLAYBACK_IDLE，
      * 而類別剛掛上時是 AUDIO_PLAYBACK_INIT。重試是對的，理由不一樣。 */
+    force_alt    = 0U;
+    mic_off      = 0U;
+    pre_alt      = 0U;
+    mute_step    = 0U;
+    rb_step      = 0U;
+    dvol_step    = 0U;
     freq_pending = 1U;
     play_pending = 0U;
     play_started = 0U;
@@ -451,6 +758,125 @@ AUDIO_ErrorTypeDef AUDIO_Start(uint8_t idx)
   return AUDIO_ERROR_IO;
 }
 
+
+/* --- 在類別送出 SET_INTERFACE 之前把 alt setting 換掉 ------------------
+ * **時機就是全部。** usbh_core.c 在 pActiveClass->Init() 成功之後把
+ * gState 設成 HOST_CLASS_REQUEST 然後 break（usbh_core.c:685-690），
+ * 所以主迴圈這一輪還會再呼叫我們一次 —— 那是 InterfaceInit 已經填好
+ * headphone.*、而 ClassRequest 的 AUDIO_REQ_SET_OUT_INTERFACE 還沒發出
+ * 之前的唯一視窗。在這裡改，類別自己就會去設對的 alt。
+ *
+ * **不要等類別跑起來才從外面改。** 那是跟類別搶 alt setting 與
+ * phost->Control 的所有權：實測連續三輪對帳量到三個不同的 alt
+ * （1、2、0 —— 而 0 是零頻寬，等於沒有端點），GET_CUR 甚至讀不到東西
+ * （緩衝裡留著哨兵 255）。三個不同的答案就是在說「這個東西不歸你管」。 */
+static void audio_fixup_alt_once(void)
+{
+  static uint8_t done = 0U;
+  AUDIO_HandleTypeDef *h;
+
+  if (hUsbHostFS.gState == HOST_IDLE) { done = 0U; }   /* 拔掉重插要重來 */
+  if (done != 0U) { return; }
+  if (hUsbHostFS.gState != HOST_CLASS_REQUEST) { return; }
+  if (hUsbHostFS.pActiveClass == NULL) { return; }
+
+  h = (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+  if (h == NULL) { return; }
+
+  done = 1U;
+  usb_pick_matching_alt(48000U, 2U, 16U);
+
+  if (g_alt_if == 0xFFU)
+  {
+    USBH_UsrLog("ALT: 找不到 2ch/16bit/48000 的 OUT 串流，沿用類別挑的 alt=%u",
+                (unsigned)h->headphone.AltSettings);
+  }
+  else if (g_alt_num != h->headphone.AltSettings)
+  {
+    USBH_UsrLog("ALT: 趁 SET_INTERFACE 之前改掉 alt %u -> %u（mps %u -> %u）",
+                (unsigned)h->headphone.AltSettings, (unsigned)g_alt_num,
+                (unsigned)h->headphone.EpSize, (unsigned)g_alt_mps);
+    h->headphone.AltSettings = g_alt_num;
+    h->headphone.EpSize      = g_alt_mps;
+  }
+  else
+  {
+    USBH_UsrLog("ALT: 類別挑的 alt=%u 本來就相符", (unsigned)g_alt_num);
+  }
+}
+
+
+/* --- 唯讀追蹤 ST 的類別請求狀態機 -------------------------------------
+ * 症狀：ROG Delta II 最後停在 alt 0（零頻寬，等於沒有端點）。
+ * ST 的 ClassRequest 順序是
+ *   SET_DEFAULT_OUT_INTERFACE(alt 0) -> CS_REQUESTS(一串音量查詢)
+ *   -> SET_OUT_INTERFACE(alt N)
+ * 懷疑中間那串查詢被 STALL，導致最後一步沒走到。
+ *
+ * **不改中介層，只讀。** 主迴圈每毫秒跑 160 圈，狀態轉換一個都不會漏。
+ * 記進陣列、結束後一次倒出來 —— 收集期間不印，免得自己變成干擾源
+ * （board-notes 8.8 那個 7.4ms 的教訓）。
+ *
+ * req_state:  1=INIT 2=IDLE 3=SET_DEF_IN 4=SET_DEF_OUT 5=SET_IN
+ *             6=SET_OUT 7=CS_REQUESTS
+ * cs_req_state: 1=SET_VOL 2=SET_MUTE 3=GET_CURR_VOL 4=GET_MIN 5=GET_MAX
+ *               6=GET_VOL 7=GET_RES 8=CS_IDLE
+ */
+#define AUDIO_TRACE_N  48U
+static uint8_t  g_tr[AUDIO_TRACE_N][2];
+static uint8_t  g_tr_n = 0U;
+static uint8_t  g_tr_dumped = 0U;
+
+static void audio_trace_class_request(void)
+{
+  AUDIO_HandleTypeDef *h;
+
+  if (hUsbHostFS.gState == HOST_IDLE) { g_tr_n = 0U; g_tr_dumped = 0U; }
+
+  if (hUsbHostFS.pActiveClass == NULL) { return; }
+  h = (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+  if (h == NULL) { return; }
+
+  if (hUsbHostFS.gState == HOST_CLASS_REQUEST)
+  {
+    uint8_t r = (uint8_t)h->req_state;
+    uint8_t c = (uint8_t)h->cs_req_state;
+
+    if ((g_tr_n == 0U) ||
+        (g_tr[g_tr_n - 1U][0] != r) || (g_tr[g_tr_n - 1U][1] != c))
+    {
+      if (g_tr_n < AUDIO_TRACE_N)
+      {
+        g_tr[g_tr_n][0] = r;
+        g_tr[g_tr_n][1] = c;
+        g_tr_n++;
+      }
+    }
+  }
+  else if ((g_tr_dumped == 0U) && (g_tr_n > 0U))
+  {
+    uint8_t k;
+    char line[AUDIO_TRACE_N * 6 + 1];
+    uint16_t n = 0U;
+
+    g_tr_dumped = 1U;
+    for (k = 0U; k < g_tr_n; k++)
+    {
+      n += (uint16_t)sprintf(&line[n], "%u.%u ", (unsigned)g_tr[k][0],
+                             (unsigned)g_tr[k][1]);
+    }
+    line[n] = '\0';
+    USBH_UsrLog("REQTRACE(%u): %s", (unsigned)g_tr_n, line);
+    USBH_UsrLog("REQTRACE 對照 req:1INIT 2IDLE 3SETDEFIN 4SETDEFOUT "
+                "5SETIN 6SETOUT 7CSREQ / cs:1SETVOL 2SETMUTE 3GETCUR "
+                "4GETMIN 5GETMAX 6GETVOL 7GETRES 8IDLE");
+  }
+  else
+  {
+    /* 已經倒過了。 */
+  }
+}
+
 /**
   * @brief  Manages Audio process.
   * @param  None
@@ -464,6 +890,9 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
   static uint32_t prev_elapsed_time = 0xFFFFFFFF;
   AUDIO_ErrorTypeDef error_state = AUDIO_ERROR_NONE;
 
+  audio_fixup_alt_once();
+  audio_trace_class_request();
+
   switch(AUDIO_app_state)
   {
   case AUDIO_STATE_PLAYBACK_IDLE:
@@ -476,8 +905,34 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
 
         if (dumped == 0U)
         {
+          AUDIO_HandleTypeDef *ah =
+            (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
           dumped = 1U;
           USB_DumpCfgDesc();
+
+          /* 我們永遠送 48000Hz / 2 聲道 / 16 bit（video2bin 就是這樣輸出的）*/
+          usb_find_headphone_feature();
+          USBH_UsrLog("FU: 描述元推導出耳機的 Feature Unit = %u；"
+                      "類別用的索引是 %u",
+                      (unsigned)g_fu_id,
+                      (ah != NULL) ? (unsigned)ah->headphone.asociated_feature
+                                   : 0xFFU);
+
+          usb_pick_matching_alt(48000U, 2U, 16U);
+          if (g_alt_if == 0xFFU)
+          {
+            USBH_UsrLog("ALT: 找不到 2ch/16bit/48000 的 OUT 串流 —— "
+                        "沿用類別挑的 alt=%u",
+                        (ah != NULL) ? (unsigned)ah->headphone.AltSettings : 0xFFU);
+          }
+          else
+          {
+            USBH_UsrLog("ALT: 相符的是 if=%u alt=%u mps=%u；類別挑的是 alt=%u",
+                        (unsigned)g_alt_if, (unsigned)g_alt_num,
+                        (unsigned)g_alt_mps,
+                        (ah != NULL) ? (unsigned)ah->headphone.AltSettings : 0xFFU);
+          }
         }
       }
       AUDIO_app_state = AUDIO_STATE_PLAYBACK_EXPLORE;
@@ -544,7 +999,126 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
      * 而且每次是一筆非同步的控制傳輸 —— 連續呼叫會互相蓋掉。
      * 所以隔一段時間才加一格，加到設定的次數為止。
      * **刻意從小聲慢慢往上**，使用者戴著耳機。 */
-    if (freq_pending != 0U)
+    if (force_alt == 0U)
+    {
+      /* --- 即使類別已經挑對了，還是再送一筆 SET_INTERFACE ---------------
+       * 實測：類別在 ClassRequest 裡的那筆（AUDIO_REQ_SET_OUT_INTERFACE）
+       * 狀態機顯示回報 OK，**但裝置事後回報自己在 alt 0**（零頻寬）。
+       * 而應用層自己補送一筆，裝置就確實在 alt 1。
+       * 為什麼類別那筆沒生效還沒查出來 —— 但這兩件事是獨立的，
+       * 管線要用中介層挑對（不然 mps 是 576 而端點是 384），
+       * alt 要靠這一筆確實推過去。 */
+      if ((g_alt_if == 0xFFU) ||
+          (USBH_SetInterface(&hUsbHostFS, g_alt_if, g_alt_num) == USBH_OK))
+      {
+        force_alt = 1U;
+        USBH_UsrLog("ALT 補送 SET_INTERFACE(if=%u, alt=%u)",
+                    (unsigned)g_alt_if, (unsigned)g_alt_num);
+      }
+    }
+    else if (mic_off == 0U)
+    {
+      /* --- 把麥克風介面放回 alt 0 -------------------------------------
+       * 類別的 AUDIO_REQ_SET_IN_INTERFACE 會把麥克風設到它的 alt N，
+       * 宣告一條等時 IN 頻寬 —— 然後從來不去讀它。只想播放的主機
+       * （例如電腦只開喇叭時）不會這樣做，它會把麥克風留在零頻寬。
+       * 這是「電腦會做而我們沒做」的差異裡最便宜的一個。 */
+      AUDIO_HandleTypeDef *mh =
+        (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+      if ((mh == NULL) || (mh->microphone.supported != 1U) ||
+          (USBH_SetInterface(&hUsbHostFS, mh->microphone.interface, 0U)
+           == USBH_OK))
+      {
+        mic_off = 1U;
+        USBH_UsrLog("MIC 介面放回 alt 0");
+      }
+    }
+    else if (pre_alt == 0U)
+    {
+      USBH_StatusTypeDef pst = audio_readback(0U);
+
+      if (pst == USBH_OK)
+      {
+        pre_alt = 1U;
+        USBH_UsrLog("對帳(開播前) 裝置在 alt=%u%s", (unsigned)g_rb[0],
+                    (g_rb[0] == 0xAAU) ? "  <- 哨兵！這筆傳輸沒發生" : "");
+      }
+      else if (pst != USBH_BUSY)
+      {
+        pre_alt = 1U;
+        USBH_UsrLog("對帳(開播前) 回 %d", (int)pst);
+      }
+      else
+      {
+        /* 還在傳。 */
+      }
+    }
+    else if (mute_step < 3U)
+    {
+      /* 讀 -> 寫 0 -> 再讀。在 SetFrequency 之前做完，之後就不再碰它。 */
+      USBH_StatusTypeDef mst = audio_mute_req((mute_step == 1U) ? 1U : 0U, 0U);
+
+      if (mst == USBH_OK)
+      {
+        if (mute_step == 0U)
+        {
+          USBH_UsrLog("MUTE 原本是 %u（1=靜音）", (unsigned)g_mute_val);
+        }
+        else if (mute_step == 2U)
+        {
+          USBH_UsrLog("MUTE 解除後讀回 %u", (unsigned)g_mute_val);
+        }
+        else
+        {
+          /* 寫入那一步不印，下一步會讀回來對。 */
+        }
+        mute_step++;
+      }
+      else if (mst != USBH_BUSY)
+      {
+        USBH_UsrLog("MUTE 第 %u 步回 %d —— 裝置不支援主聲道靜音控制，跳過",
+                    (unsigned)mute_step, (int)mst);
+        mute_step = 3U;
+      }
+      else
+      {
+        /* 還在傳，下一輪再來。 */
+      }
+    }
+    else if (dvol_step < 2U)
+    {
+      USBH_StatusTypeDef dst;
+
+      if (g_fu_id == 0xFFU)
+      {
+        USBH_UsrLog("VOLd 找不到耳機那條路的 Feature Unit，跳過");
+        dvol_step = 2U;
+      }
+      else
+      {
+        dst = audio_set_vol_direct(g_fu_id, (uint8_t)(dvol_step + 1U),
+                                   (int16_t)(AUDIO_VOL_DB * 256));
+        if (dst == USBH_OK)
+        {
+          USBH_UsrLog("VOLd 單元 %u 聲道 %u <- %ddB",
+                      (unsigned)g_fu_id, (unsigned)(dvol_step + 1U),
+                      (int)AUDIO_VOL_DB);
+          dvol_step++;
+        }
+        else if (dst != USBH_BUSY)
+        {
+          USBH_UsrLog("VOLd 單元 %u 聲道 %u 回 %d，跳過",
+                      (unsigned)g_fu_id, (unsigned)(dvol_step + 1U), (int)dst);
+          dvol_step = 2U;
+        }
+        else
+        {
+          /* 還在傳。 */
+        }
+      }
+    }
+    else if (freq_pending != 0U)
     {
       USBH_StatusTypeDef st = USBH_AUDIO_SetFrequency(&hUsbHostFS,
                                 WavInfo.SampleRate,
@@ -586,7 +1160,7 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
     /* 音量：走到絕對目標為止。等真的開播之後再開始 —— USBH_AUDIO_SetVolume
      * 要求 play_state == AUDIO_PLAYBACK_PLAY，而且它跟開播共用同一條
      * 控制傳輸的狀態機，早插進去只是多一個東西在競爭。 */
-    if (play_started != 0U)
+    if ((play_started != 0U) && (AUDIO_USE_CLASS_VOL != 0))
     {
       static uint32_t vol_tick  = 0;
       static uint8_t  vol_steps = 0;
@@ -598,6 +1172,45 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
 
       AUDIO_HandleTypeDef *vh =
         (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+      if (rb_step < 3U)
+      {
+        USBH_StatusTypeDef rst = audio_readback(rb_step);
+
+        if (rst == USBH_OK)
+        {
+          if (rb_step == 0U)
+          {
+            USBH_UsrLog("對帳 裝置實際在 alt=%u（我們以為 %u）",
+                        (unsigned)g_rb[0], (unsigned)vh->headphone.AltSettings);
+          }
+          else if (rb_step == 1U)
+          {
+            USBH_UsrLog("對帳 端點取樣率 = %lu Hz",
+                        (unsigned long)((uint32_t)g_rb[0] |
+                                        ((uint32_t)g_rb[1] << 8) |
+                                        ((uint32_t)g_rb[2] << 16)));
+          }
+          else
+          {
+            USBH_UsrLog("對帳 聲道1 音量 = %lddB（類別以為 %lddB）",
+                        (long)(((int16_t)((uint16_t)g_rb[0] |
+                                          ((uint16_t)g_rb[1] << 8))) / 256),
+                        (long)(((int16_t)vh->headphone.attribute.volume) / 256));
+          }
+          rb_step++;
+        }
+        else if (rst != USBH_BUSY)
+        {
+          USBH_UsrLog("對帳 第 %u 步回 %d（裝置不支援這個查詢）",
+                      (unsigned)rb_step, (int)rst);
+          rb_step++;
+        }
+        else
+        {
+          /* 還在傳。 */
+        }
+      }
 
       if (g_vol_dirty != 0U)
       {
@@ -781,6 +1394,54 @@ AUDIO_ErrorTypeDef AUDIO_Process(void)
         }
       }
     }
+    /* 爬升關掉時上面那個區塊整個不跑，對帳改在這裡做（開播後就開始）。 */
+    if ((play_started != 0U) && (AUDIO_USE_CLASS_VOL == 0) && (rb_step < 3U))
+    {
+      static uint32_t rb_tick = 0;
+      AUDIO_HandleTypeDef *vh2 =
+        (AUDIO_HandleTypeDef *)hUsbHostFS.pActiveClass->pData;
+
+      if (rb_tick == 0U) { rb_tick = HAL_GetTick(); }
+
+      if (((HAL_GetTick() - rb_tick) > 3000U) && (vh2 != NULL))
+      {
+        USBH_StatusTypeDef rst = audio_readback(rb_step);
+
+        if (rst == USBH_OK)
+        {
+          if (rb_step == 0U)
+          {
+            USBH_UsrLog("對帳(開播後) 裝置在 alt=%u（我們以為 %u）%s",
+                        (unsigned)g_rb[0], (unsigned)vh2->headphone.AltSettings,
+                        (g_rb[0] == 0xAAU) ? "  <- 哨兵！沒發生" : "");
+          }
+          else if (rb_step == 1U)
+          {
+            USBH_UsrLog("對帳 端點取樣率 = %lu Hz",
+                        (unsigned long)((uint32_t)g_rb[0] |
+                                        ((uint32_t)g_rb[1] << 8) |
+                                        ((uint32_t)g_rb[2] << 16)));
+          }
+          else
+          {
+            USBH_UsrLog("對帳 聲道1 音量 = %lddB",
+                        (long)(((int16_t)((uint16_t)g_rb[0] |
+                                          ((uint16_t)g_rb[1] << 8))) / 256));
+          }
+          rb_step++;
+        }
+        else if (rst != USBH_BUSY)
+        {
+          USBH_UsrLog("對帳 第 %u 步回 %d", (unsigned)rb_step, (int)rst);
+          rb_step++;
+        }
+        else
+        {
+          /* 還在傳。 */
+        }
+      }
+    }
+
     /* --- 收集：一秒一格，收集期間一個字都不印 ------------------------ */
     if ((play_started != 0U) && (dbg_phase == 0U))
     {

@@ -111,6 +111,36 @@ def main():
 """, body),
         ], "RCC_USBOTGFSCLKSOURCE_HSI48")
 
+    # --- 按格式挑 alt setting，而不是挑端點最大的 ------------------------
+    #
+    # ST 的 USBH_AUDIO_InterfaceInit 註解就寫著
+    # "largest endpoint size : default behavior"。裝置只有一個 alt 時沒差
+    # （JBL Quantum TWS 就是），但 ROG Delta II (2.4GHz) 有兩個：
+    #     if=1 alt=1  16-bit  mps 384
+    #     if=1 alt=2  24-bit  mps 576   <- 原本會挑這個
+    # 而我們送的是 16-bit。
+    #
+    # **必須改在 InterfaceInit 裡**，不能等它跑完再從應用層改：
+    # 那個函式選完 alt 之後緊接著就用 headphone.EpSize 去開管線，
+    # 改晚了主機通道會照 576 排程，而裝置的端點是 384。
+    #
+    # 這是「外面的主機」（PS5／Windows／ALSA）都在做的按格式協商 ——
+    # 通用機制，不是哪一支耳機的專用補丁。
+    afrag = os.path.join(ROOT, "patches", "usbh_audio-pick-alt.c.frag")
+    aud = os.path.join(CUBE, "Middlewares", "ST", "STM32_USB_Host_Library",
+                       "Class", "AUDIO", "Src", "usbh_audio.c")
+    if os.path.isfile(afrag):
+        body = io.open(afrag, encoding="utf-8").read()
+        body = body[body.index("/* --- 本專案的修改"):]
+        edit(aud, [
+            ("static USBH_StatusTypeDef USBH_AUDIO_InterfaceInit(USBH_HandleTypeDef *phost)\n{",
+             body + "static USBH_StatusTypeDef USBH_AUDIO_InterfaceInit(USBH_HandleTypeDef *phost)\n{"),
+            ("  if (USBH_AUDIO_FindHIDControl(phost) == USBH_OK)",
+             "  /* 本專案的修改：上面挑的是「端點最大的」，改成按格式挑。 */\n"
+             "  USBH_AUDIO_PickAltByFormat(phost, 2U, 16U, 48000U);\n\n"
+             "  if (USBH_AUDIO_FindHIDControl(phost) == USBH_OK)"),
+        ], "USBH_AUDIO_PickAltByFormat")
+
     edit(os.path.join(APP, "Inc", "ffconf.h"), [
         ("#define FF_USE_LFN		0", "#define FF_USE_LFN		1"),
         ("#define FF_FS_EXFAT		0", "#define FF_FS_EXFAT		1"),
