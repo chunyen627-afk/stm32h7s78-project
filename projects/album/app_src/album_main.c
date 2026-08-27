@@ -1070,6 +1070,210 @@ static void scan_videos(void)
 
 /* ---- 播放中的疊加層 ---------------------------------------------- */
 
+/* ------------------------------------------------------------------ */
+/* 播放位置的斷電記憶（0:/播放位置.txt）                                  */
+/* ------------------------------------------------------------------ */
+/* g_vid_resume 只活在記憶體，斷電就沒了 —— 使用者要的是拔電再上電還能
+ * 接著看。照「我的最愛」那一套安全設計（favorites.c，那邊的說明更完整）：
+ *   - 固定大小（16 格 x 128B = 2KB），存檔只覆寫一格 = 一個磁區的
+ *     read-modify-write，檔案大小從頭到尾不變 —— 不配置新簇、不動 FAT
+ *   - 磁碟層預設唯讀，只在寫的瞬間解鎖
+ *   - FA_CREATE_NEW 只在「真的沒有這個檔」（FR_NO_FILE）時建立 ——
+ *     卡片一瞬間讀不到就重建會毀掉既有資料，favorites 踩過
+ *   - 寫完讀回比對
+ * 記錄以**檔名**為鍵（不能用索引 —— 掃卡順序會變），格式是文字：
+ * 名稱補空白到 110 欄 + 影格數 16 欄 + CRLF，在電腦上打開直接看得懂。
+ * 128 整除 512，一筆記錄永遠不會跨磁區。 */
+#define RS_FILE_NAME  "播放位置.txt"
+#define RS_MAX        16u
+#define RS_REC_BYTES  128u
+#define RS_NAME_W     110u
+
+static char g_rs_tab[RS_MAX * RS_REC_BYTES];
+static bool g_rs_have;          /* 表讀進記憶體了，之後才做得了比對與省寫 */
+
+void sd_bsp_unlock_write(void);  /* favorites.c 用的同一組寫入閘門 */
+void sd_bsp_lock_write(void);
+
+volatile uint32_t g_dbg_rs_saveok;    /* SWD 觀察用 */
+volatile uint32_t g_dbg_rs_savefail;
+
+static char *rs_rec(uint32_t i)
+{
+    return &g_rs_tab[i * RS_REC_BYTES];
+}
+
+/* 名稱補空白到固定寬度。**不能拿空白當結束符**（名稱裡本來就可能有
+ * 空白，favorites.c 為此翻過車），所以比對一律整欄 memcmp。 */
+static void rs_name_pad(const char *name, char *out)
+{
+    size_t n = strlen(name);
+
+    if (n > RS_NAME_W) { n = RS_NAME_W; }
+    memset(out, ' ', RS_NAME_W);
+    memcpy(out, name, n);
+}
+
+static void rs_rec_set(uint32_t i, const char *padded, uint32_t frame)
+{
+    char *r = rs_rec(i);
+    char  num[RS_REC_BYTES - RS_NAME_W + 1u];
+
+    memcpy(r, padded, RS_NAME_W);
+    /* snprintf 進暫存再搬：直接印進表會把結尾的 NUL 多寫進下一格。 */
+    (void)snprintf(num, sizeof(num), "%16u\r\n", (unsigned)frame);
+    memcpy(r + RS_NAME_W, num, RS_REC_BYTES - RS_NAME_W);
+}
+
+static uint32_t rs_frame(uint32_t i)
+{
+    const char *s = rs_rec(i) + RS_NAME_W;
+    uint32_t    v = 0;
+
+    for (uint32_t k = 0; k < 16u; k++) {
+        if (s[k] >= '0' && s[k] <= '9') { v = v * 10u + (uint32_t)(s[k] - '0'); }
+    }
+    return v;
+}
+
+static bool rs_empty(uint32_t i)
+{
+    return rs_rec(i)[0] == ' ';     /* 檔名不會以空白開頭 */
+}
+
+static void rs_path(char *out, size_t cap)
+{
+    (void)snprintf(out, cap, "%s%s", g_drive, RS_FILE_NAME);
+}
+
+/* 掃完卡之後呼叫：把檔案讀進來，按名字回填 g_vid_resume。
+ * 沒有檔／讀不到／長度不對都安靜跳過 —— 這個功能失效的代價只是從頭播。 */
+static void resume_table_load(void)
+{
+    FIL     f;
+    FRESULT r;
+    UINT    got = 0;
+    char    path[64];
+
+    g_rs_have = false;
+    rs_path(path, sizeof(path));
+    if (f_open(&f, path, FA_READ) != FR_OK) {
+        return;                      /* 第一次存檔才建，開機不寫卡 */
+    }
+    r = f_read(&f, g_rs_tab, sizeof(g_rs_tab), &got);
+    (void)f_close(&f);
+    if (r != FR_OK || got != sizeof(g_rs_tab)) {
+        return;                      /* 長度不對不亂猜也不重建（favorites 的教訓）*/
+    }
+    g_rs_have = true;
+
+    for (uint32_t k = 0; k < g_vid_count; k++) {
+        char padded[RS_NAME_W];
+
+        rs_name_pad(g_vids[k].name, padded);
+        for (uint32_t i = 0; i < RS_MAX; i++) {
+            if (memcmp(rs_rec(i), padded, RS_NAME_W) == 0) {
+                uint32_t fr = rs_frame(i);
+
+                if (fr < g_vids[k].count) { g_vid_resume[k] = fr; }
+                break;
+            }
+        }
+    }
+}
+
+/* 把一部影片的位置寫進卡裡。找同名格；沒有就用空格；再沒有就挑一個
+ * 不在目前清單上的（換過卡留下的舊名字）；真的全滿就覆寫第 0 格。 */
+static void resume_save(const char *name, uint32_t frame)
+{
+    char     padded[RS_NAME_W];
+    char     path[64];
+    char     back[RS_REC_BYTES];
+    uint32_t slot = RS_MAX;
+    FIL      f;
+    FRESULT  r;
+    UINT     put = 0, got = 0;
+
+    rs_name_pad(name, padded);
+    rs_path(path, sizeof(path));
+
+    if (!g_rs_have) {
+        /* 表不在記憶體 = 開機時沒讀到。只有「真的沒有這個檔」才建；
+         * 有檔但剛才讀失敗的話這一輪就不要動它。 */
+        r = f_open(&f, path, FA_READ);
+        if (r == FR_OK) { (void)f_close(&f); return; }
+        if (r != FR_NO_FILE && r != FR_NO_PATH) { return; }
+
+        memset(g_rs_tab, ' ', sizeof(g_rs_tab));
+        for (uint32_t i = 0; i < RS_MAX; i++) {
+            rs_rec(i)[RS_REC_BYTES - 2u] = '\r';
+            rs_rec(i)[RS_REC_BYTES - 1u] = '\n';
+        }
+        sd_bsp_unlock_write();
+        r = f_open(&f, path, FA_WRITE | FA_CREATE_NEW);
+        if (r == FR_OK) {
+            r = f_write(&f, g_rs_tab, sizeof(g_rs_tab), &put);
+            (void)f_close(&f);
+        }
+        sd_bsp_lock_write();
+        if (r != FR_OK || put != sizeof(g_rs_tab)) {
+            g_dbg_rs_savefail++;
+            return;
+        }
+        g_rs_have = true;
+    }
+
+    for (uint32_t i = 0; i < RS_MAX; i++) {
+        if (memcmp(rs_rec(i), padded, RS_NAME_W) == 0) { slot = i; break; }
+    }
+    if (slot < RS_MAX && rs_frame(slot) == frame) {
+        return;                      /* 位置沒變就不磨卡 */
+    }
+    if (slot == RS_MAX) {
+        for (uint32_t i = 0; i < RS_MAX; i++) {
+            if (rs_empty(i)) { slot = i; break; }
+        }
+    }
+    if (slot == RS_MAX) {
+        /* 沒空格：挑一個不屬於目前卡上任何影片的舊名字。 */
+        for (uint32_t i = 0; i < RS_MAX && slot == RS_MAX; i++) {
+            bool current = false;
+
+            for (uint32_t k = 0; k < g_vid_count; k++) {
+                char pk[RS_NAME_W];
+
+                rs_name_pad(g_vids[k].name, pk);
+                if (memcmp(rs_rec(i), pk, RS_NAME_W) == 0) { current = true; break; }
+            }
+            if (!current) { slot = i; }
+        }
+        if (slot == RS_MAX) { slot = 0; }
+    }
+
+    rs_rec_set(slot, padded, frame);
+
+    /* 單格覆寫 + 讀回比對（favorites.c 的 write_slot 同一套）。 */
+    sd_bsp_unlock_write();
+    r = f_open(&f, path, FA_WRITE | FA_READ | FA_OPEN_EXISTING);
+    if (r == FR_OK) {
+        r = f_lseek(&f, (FSIZE_t)slot * RS_REC_BYTES);
+        if (r == FR_OK) { r = f_write(&f, rs_rec(slot), RS_REC_BYTES, &put); }
+        if (r == FR_OK && put == RS_REC_BYTES &&
+            f_lseek(&f, (FSIZE_t)slot * RS_REC_BYTES) == FR_OK &&
+            f_read(&f, back, RS_REC_BYTES, &got) == FR_OK &&
+            got == RS_REC_BYTES &&
+            memcmp(back, rs_rec(slot), RS_REC_BYTES) == 0) {
+            (void)f_close(&f);
+            sd_bsp_lock_write();
+            g_dbg_rs_saveok++;
+            return;
+        }
+        (void)f_close(&f);
+    }
+    sd_bsp_lock_write();
+    g_dbg_rs_savefail++;
+}
+
 #define OV_MS        3000U     /* 觸碰後疊加層顯示多久 */
 #define PB_X         40
 #define PB_W         400
@@ -1088,6 +1292,14 @@ static void scan_videos(void)
 #define VOL_BTN_W    90
 #define VOL_MINUS_X  PB_X
 #define VOL_PLUS_X   (PB_X + PB_W - VOL_BTN_W)
+
+/* ±10 秒微調鍵：音量列再上面一排。左右各一顆，中間留空
+ *（點到中間跟點畫面其他地方一樣是暫停，跟音量列同一種性質）。 */
+#define SEEK_Y       520
+#define SEEK_H       64
+#define SEEK_BTN_W   140
+#define SEEK_BWD_X   PB_X
+#define SEEK_FWD_X   (PB_X + PB_W - SEEK_BTN_W)
 #define VOL_STEP     10u
 
 static bool g_vid_has_audio;   /* 這一部有沒有音軌（沒有就不畫音量列）*/
@@ -1136,6 +1348,14 @@ static void draw_overlay(const video_info_t *v, uint32_t idx, bool paused)
     draw_time(PB_X + PB_W - 60, PB_Y + 30,
               (uint32_t)((uint64_t)v->count * 100u / fps100), COL_DIM);
 
+    /* ±10 秒微調：有沒有音軌都畫 —— 跳的是影格，聲音只是跟著跳。 */
+    gfx_pill(SEEK_BWD_X, SEEK_Y, SEEK_BTN_W, SEEK_H, COL_PANEL);
+    gfx_text_center(SEEK_BWD_X + SEEK_BTN_W / 2, SEEK_Y + 20,
+                    "-10s", COL_TEXT);
+    gfx_pill(SEEK_FWD_X, SEEK_Y, SEEK_BTN_W, SEEK_H, COL_PANEL);
+    gfx_text_center(SEEK_FWD_X + SEEK_BTN_W / 2, SEEK_Y + 20,
+                    "+10s", COL_TEXT);
+
     /* 音量列只在這部片真的有音軌時出現。沒有音軌卻畫一排音量鍵，
      * 就是 18.3 那條「畫面上寫著功能、程式裡沒有做」的反面 ——
      * 按了不會有任何事發生，使用者會以為壞了。 */
@@ -1164,6 +1384,7 @@ static void play_video(const video_info_t *v)
     uint32_t vi  = (uint32_t)(v - g_vids);
     uint32_t idx = 0, next_ms, acc = 0;
     uint32_t frame_us, frame_ms, frame_frac;
+    uint32_t rs_next;         /* 下一次把位置寫進卡的時刻 */
     uint32_t ov_until = 0;
     uint32_t vol_lock = 0u;   /* 按過音量之後要連續幾次讀不到觸控才解鎖 */
     int32_t  dmax = -1000000, dmin = 1000000;   /* 音畫偏差的極值 */
@@ -1224,6 +1445,7 @@ static void play_video(const video_info_t *v)
     frame_ms   = frame_us / 1000u;
     frame_frac = frame_us % 1000u;
     next_ms    = HAL_GetTick();
+    rs_next    = HAL_GetTick() + 60000u;
 
     for (;;) {
         int  x, y;
@@ -1256,6 +1478,16 @@ static void play_video(const video_info_t *v)
         if (!dcache_off && usbaudio_session_active()) {
             SCB_DisableDCache();
             dcache_off = true;
+        }
+
+        /* 斷電記憶：每分鐘把位置寫回卡一次。使用者的情境是「影片
+         * 播著就直接拔電」，只在退出時存的話那一段全丟。單格覆寫
+         * 只有兩個磁區的寫入、每分鐘一次，音訊緩衝（160ms）扛得住。 */
+        if (!paused && (int32_t)(HAL_GetTick() - rs_next) >= 0) {
+            rs_next = HAL_GetTick() + 60000u;
+            if (vi < MAX_VIDEOS && !g_card_sick) {
+                resume_save(v->name, idx);
+            }
         }
 
         audio_wav_pump();
@@ -1373,6 +1605,31 @@ static void play_video(const video_info_t *v)
                     vol_lock = 3u;
                 }
                 ov_until = HAL_GetTick() + OV_MS;   /* 按著就讓控制列別消失 */
+            } else if (y >= SEEK_Y && y < SEEK_Y + SEEK_H &&
+                       ((x >= SEEK_BWD_X && x < SEEK_BWD_X + SEEK_BTN_W) ||
+                        (x >= SEEK_FWD_X && x < SEEK_FWD_X + SEEK_BTN_W))) {
+                /* ±10 秒微調。跟音量鍵同一套不阻塞閂鎖（vol_lock）：
+                 * 按一下跳一次、按住不連跳，播放迴圈全程照常跑
+                 *（wait_release 會把畫面跟音訊都卡住，不能用）。
+                 * 跳完走的是跟拖進度條一模一樣的路（audio seek +
+                 * 重新對時），不另起爐灶。 */
+                if (vol_lock == 0u) {
+                    uint32_t step = (v->fps_x100 ? v->fps_x100 : 2400u) / 10u;
+
+                    if (step == 0u) { step = 1u; }   /* 10 秒的影格數 */
+                    if (x < SEEK_BWD_X + SEEK_BTN_W) {
+                        idx = (idx > step) ? (idx - step) : 0u;
+                    } else {
+                        idx = (idx + step < v->count) ? (idx + step)
+                                                      : (v->count - 1u);
+                    }
+                    (void)audio_wav_seek_ms((uint32_t)((uint64_t)idx * 100000u /
+                                            (v->fps_x100 ? v->fps_x100 : 2400u)));
+                    next_ms  = HAL_GetTick();
+                    acc      = 0;
+                    vol_lock = 3u;
+                }
+                ov_until = HAL_GetTick() + OV_MS;
             } else if (y >= PB_Y - PB_HIT && y < PB_Y + PB_H + PB_HIT) {
                 /* 拖曳 seek。位移表讓任何一格都能直接定址，成本跟播下一格
                  * 一模一樣 —— 這是打包成單一檔案順帶換到的好處。 */
@@ -1391,6 +1648,10 @@ static void play_video(const video_info_t *v)
             } else {
                 paused   = !paused;
                 audio_wav_pause(paused);
+                /* 暫停通常是「等一下再看」，正是該把位置寫進卡的時機。 */
+                if (paused && vi < MAX_VIDEOS && !g_card_sick) {
+                    resume_save(v->name, idx);
+                }
                 ov_until = HAL_GetTick() + OV_MS;
                 wait_release();
             }
@@ -1438,6 +1699,10 @@ static void play_video(const video_info_t *v)
     if (vi < MAX_VIDEOS) {
         g_vid_resume[vi] = idx;
         BBOX[147] = idx;            /* 離開時記住第幾格 */
+        /* 斷電記憶：退出是最可靠的存檔點（卡被拔走時例外）。 */
+        if (sd_present() && !g_card_sick) {
+            resume_save(v->name, idx);
+        }
     }
 
     BBOX[137] = HAL_GetTick();       /* 離開播放的時刻 */
@@ -3078,6 +3343,7 @@ static bool mount_and_scan(void)
     BBOX[11] = g_photo_count;
     /* 影片的順序可能跟上次不一樣，記住的位置就不能再用了。 */
     memset(g_vid_resume, 0, sizeof(g_vid_resume));
+    resume_table_load();     /* 斷電記憶：按檔名從卡上回填 */
 
     /* 只有影片沒有照片也算可用 —— 使用者可能就是拿它當影片播放器。 */
     if (g_photo_count == 0U && g_vid_count == 0U) {
