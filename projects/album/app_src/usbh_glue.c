@@ -93,6 +93,14 @@ void HAL_HCD_MspInit(HCD_HandleTypeDef* hcdHandle)
       USBH_UsrLog("CLK: LSE %s", (lse_ok != 0U) ? "ready" :
                   "TIMEOUT（這塊板子沒有 32.768kHz 晶振）");
 
+      /* 黑盒子 193：USB 時脈到底走了哪條路（相簿沒有 UART，上面那行
+       * UsrLog 看不到）。0xC1C0000１ = HSI48+CRS、0xC1C00002 = 退回
+       * PLL3Q（+2.4%，控制傳輸過得了、等時音訊全滅 —— 「冷上電沒聲音」
+       * 查的就是這個）。附上 tick 佐證是哪一輪寫的。 */
+      ((volatile uint32_t *)0x20004020u)[193] =
+          ((lse_ok != 0U) ? 0xC1000000u : 0xC2000000u) |
+          (HAL_GetTick() & 0x00FFFFFFu);
+
       if (lse_ok != 0U)
       {
         RCC_CRSInitTypeDef crs = {0};

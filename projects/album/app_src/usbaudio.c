@@ -150,6 +150,13 @@ static void usb_poll(void)
 static volatile uint8_t s_appli = 0u;   /* 0 閒置 1 已連接 2 就緒 3 斷線 */
 static volatile uint8_t s_inited = 0u;
 
+/* 冷上電後 dongle 無聲的問題**決定不修**（2026-08-27，使用者的取捨）：
+ * 唯一有效的軟體修法是「開機約 40 秒後補一次列舉」（dongle 通電要約
+ * 半分鐘才真正就緒，太早列舉綁出來的音訊路徑是壞的 —— 10~12 秒重來
+ * 全部無效、36 秒以後重來全部有效，都實測），但使用者說手動重插比
+ * 等 40 秒快，自動重置又會讓掃卡跑兩次。所以維持現狀：**冷上電後
+ * 重插一次 dongle 即可**。完整量測記錄在 projects/usbaudio/README.md。 */
+
 /* 抽送權在誰身上：false = 主迴圈（nap）、true = TIM7 的中斷。
  * 定義放前面是因為 usbaudio_process() 要用到，而它在 pump_start 之前。 */
 static volatile bool s_pump_on = false;
@@ -161,6 +168,7 @@ static void usb_user_process(USBH_HandleTypeDef *phost, uint8_t id)
     switch (id) {
     case HOST_USER_DISCONNECTION:
         s_appli = 3u;
+        UBOX[191]++;               /* 斷線次數（本輪開機） */
         /* **類別沒了就要立刻收攤。** 不收的話 pump 還會繼續呼叫
          * GetOutOffset / ChangeOutBuffer，而那些函式內部也會去
          * 解參照 pActiveClass。 */
@@ -172,6 +180,10 @@ static void usb_user_process(USBH_HandleTypeDef *phost, uint8_t id)
 
     case HOST_USER_CLASS_ACTIVE:
         s_appli = 2u;
+        /* 190：類別掛上的時刻與次數（(次數<<24)|tick）。查「冷上電要重插
+         * dongle 才有聲音」用 —— 分辨列舉是太晚完成、還是反覆重來。 */
+        UBOX[190] = ((UBOX[190] >> 24) + 1u) << 24 |
+                    (HAL_GetTick() & 0x00FFFFFFu);
         UBOX[UB_VIDPID] = ((uint32_t)phost->device.DevDesc.idVendor << 16) |
                           phost->device.DevDesc.idProduct;
         {
@@ -238,6 +250,8 @@ void usbaudio_init(void)
     UBOX[UB_INITED]    = 0xFFFFFFFFu;
     UBOX[188]          = 0xFFFFFFFFu;   /* 卡死探針：0xFFFFFFFF = 還沒跑到 */
     UBOX[189]          = 0xFFFFFFFFu;
+    UBOX[190]          = 0u;            /* 類別掛上：(次數<<24)|tick */
+    UBOX[191]          = 0u;            /* 斷線次數 */
 
     UBOX[UB_MAGIC]    = 0x55534231u;
     UBOX[UB_INIT]     = UB_INIT_ENTER;
