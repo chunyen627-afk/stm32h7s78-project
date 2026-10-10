@@ -1,6 +1,6 @@
 # 賽車儀表（RaceDash）
 
-PC 玩賽車遊戲時，把板子當成 7 吋副儀表。資料由 PC 上的 **SimHub** 從遊戲讀出，
+PC 玩賽車遊戲時，把板子當成 5 吋副儀表。資料由 PC 上的 **SimHub** 從遊戲讀出，
 經 USB 送給板子。
 
 **畫面就是原作**：[caa1211/esp32-gt7-dashboard](https://github.com/caa1211/esp32-gt7-dashboard)
