@@ -53,6 +53,13 @@ namespace lgfx
 #endif
 
 
+#if defined (LGFX_RACEDASH)
+#include "../../hires/hires_api.inc"   // racedash：2 倍抗鋸齒鏡像
+#define LGFX_FONT_DRAWCHAR(font, ...) racedash::draw_char(this, font, __VA_ARGS__)
+#else
+#define LGFX_FONT_DRAWCHAR(font, ...) (font)->drawChar(this, __VA_ARGS__)
+#endif
+
   class LGFXBase
 #if defined (ARDUINO)
   : public Print
@@ -61,6 +68,9 @@ namespace lgfx
   public:
     LGFXBase(void) = default;
     virtual ~LGFXBase(void) = default;
+#if defined (LGFX_RACEDASH)
+    racedash::Hi* _racedash_hi = nullptr;   // racedash：2 倍鏡像（記憶體畫布才有）
+#endif
 
     /// @brief Converts RGB information to 8-bit color code.
     /// @param r red
@@ -695,7 +705,7 @@ namespace lgfx
   #endif
 
            size_t drawChar(uint16_t uniCode, int32_t x, int32_t y, uint8_t font);
-    inline size_t drawChar(uint16_t uniCode, int32_t x, int32_t y) { int32_t dummy_filled_x = 0; return _font->drawChar(this, x, y, uniCode, &_text_style, &_font_metrics, dummy_filled_x); }
+    inline size_t drawChar(uint16_t uniCode, int32_t x, int32_t y) { int32_t dummy_filled_x = 0; return LGFX_FONT_DRAWCHAR(_font, x, y, uniCode, &_text_style, &_font_metrics, dummy_filled_x); }
 
     template<typename T>
     inline size_t drawChar(int32_t x, int32_t y, uint16_t uniCode, T color, T bg, float size) { return drawChar(x, y, uniCode, color, bg, size, size); }
@@ -708,7 +718,7 @@ namespace lgfx
       style.size_x = size_x;
       style.size_y = size_y;
       int32_t dummy_filled_x = 0;
-      return _font->drawChar(this, x, y, uniCode, &style, &_font_metrics, dummy_filled_x);
+      return LGFX_FONT_DRAWCHAR(_font, x, y, uniCode, &style, &_font_metrics, dummy_filled_x);
       //return (fpDrawChar)(this, x, y, uniCode, &style, _font);
     }
 

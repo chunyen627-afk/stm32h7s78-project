@@ -101,6 +101,10 @@ namespace lgfx
     uint_fast16_t _bitwidth;
   };
 
+#if defined (LGFX_RACEDASH)
+#include "../../hires/hires_panel.inc"   // racedash：2 倍抗鋸齒鏡像
+#endif
+
   class LGFX_Sprite : public LovyanGFX
   {
   public:
@@ -141,6 +145,10 @@ namespace lgfx
       _clip_r = -1;
       _clip_b = -1;
 
+#if defined (LGFX_RACEDASH)
+      racedash::detach(_racedash_hi);
+      _racedash_hi = _panel_sprite.hi = nullptr;
+#endif
       _panel_sprite.deleteSprite();
       _img = nullptr;
     }
@@ -172,6 +180,9 @@ namespace lgfx
     void* createSprite(int32_t w, int32_t h)
     {
       _img = _panel_sprite.createSprite(w, h, &_write_conv, _psram);
+#if defined (LGFX_RACEDASH)
+      _racedash_hi = _panel_sprite.hi = _img ? racedash::attach(_racedash_hi, w, h, _write_conv.bits) : (racedash::detach(_racedash_hi), nullptr);
+#endif
       if (_img) {
         if (getColorDepth() & color_depth_t::has_palette)
         {
@@ -374,7 +385,11 @@ namespace lgfx
 
   protected:
 
+#if defined (LGFX_RACEDASH)
+    Panel_SpriteHi _panel_sprite;
+#else
     Panel_Sprite _panel_sprite;
+#endif
     union
     {
       void* _img;
@@ -415,7 +430,13 @@ namespace lgfx
     void push_sprite(LovyanGFX* dst, int32_t x, int32_t y, uint32_t transp = pixelcopy_t::NON_TRANSP)
     {
       pixelcopy_t p(_img, dst->getColorDepth(), getColorDepth(), dst->hasPalette(), _palette, transp);
+#if defined (LGFX_RACEDASH)
+      bool hi = racedash::push_begin(dst->_racedash_hi, _racedash_hi);   // 兩邊都有鏡像：直接貼 2 倍的
+#endif
       dst->pushImage(x, y, _panel_sprite._panel_width, _panel_sprite._panel_height, &p, _panel_sprite.getSpriteBuffer()->use_dma()); // DMA disable with use SPIRAM
+#if defined (LGFX_RACEDASH)
+      if (hi) racedash::push_end(dst->_racedash_hi, _racedash_hi, dst, x, y, transp);
+#endif
     }
 
     void push_rotate_zoom(LovyanGFX* dst, float x, float y, float angle, float zoom_x, float zoom_y, uint32_t transp = pixelcopy_t::NON_TRANSP)

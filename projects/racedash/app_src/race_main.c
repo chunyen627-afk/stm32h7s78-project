@@ -1,10 +1,11 @@
 /**
- * 賽車儀表：SimHub 經 ST-LINK 的虛擬 COM 埠（UART4）送遙測，畫在 7 吋螢幕上。
+ * 賽車儀表：SimHub 經 ST-LINK 的虛擬 COM 埠（UART4）送遙測，畫在 5 吋螢幕上。
  *
  * 畫面整個是原作（caa1211/esp32-gt7-dashboard，MIT）：資料處理、七個主題、
  * 觸控選單都是原作的程式碼，一行不改，畫在 320x240 的畫布上（gt7dash/）。
- * 這裡只負責：收序列埠的行交給原作、跑原作的主迴圈、把畫布放大兩倍貼到
- * 800x480 面板正中央（左右各留 80 像素黑邊），以及把觸控座標換算回 320x240。
+ * 這裡只負責：收序列埠的行交給原作、跑原作的主迴圈、把 2 倍抗鋸齒的畫布
+ * （640x480，gt7dash/hires/）貼到 800x480 面板正中央（左右各留 80 像素黑邊），
+ * 以及把觸控座標換算回 320x240。
  *
  * 螢幕初始化、雙緩衝、垂直消隱換頁照搬 projects/tetris 驗證過的做法。
  */
@@ -30,14 +31,17 @@
 
 /* 狀態放 DTCM，重置不會洗掉，用 SWD 讀得到。
  * [0] "RDSH"  [1] tick  [2] 收到的位元組  [3] 原作判為有效的行  [4] 無效的行
- * [5] 畫了幾格  [7] 一格多少 CPU 週期（原作 + 放大貼圖）  [8] 序列埠溢位
+ * [5] 畫了幾格  [6] 這格貼了幾列  [7] 一格多少 CPU 週期（原作 + 貼圖）
+ * [14] 其中貼圖的週期  [16] 開機以來最慢的一格（寫 0 重新量）  [8] 序列埠溢位
  * [9] 太長被丟的行  [10] 堆積用了多少（PSRAM）
  * [11] 寫 "DEMO" 就由板子自己產生跑圈資料（不用遊戲、不佔 COM 埠）
  * [12] 寫 0x54480000 | 主題（0~6）直接切主題（截圖驗證用）
+ * [13] 寫 "NOHI" 改貼原本 320x240 的放大（跟抗鋸齒版比對用）
  * [15] 寫 "FROZ" 停止貼圖，讀 framebuffer 截圖時用 */
 #define BOX ((volatile uint32_t *)0x20004020u)
 #define DEMO_MAGIC  0x44454D4Fu
 #define FROZ_MAGIC  0x5A4F5246u
+#define NOHI_MAGIC  0x4E4F4849u   /* BOX[13]："NOHI" 貼原本 320x240 的放大，不用抗鋸齒版 */
 
 static uint32_t g_front;
 
@@ -125,14 +129,49 @@ static void present(void)
     g_front ^= 1u;
 }
 
-/* 原作的 320x240 畫布放大兩倍貼到面板正中央。畫布是 LovyanGFX 的 swap565
- * （高位元組在前），面板要的是一般 RGB565，所以每個像素要對調位元組。
- * 一個像素變成橫向兩個：一次寫 32 位元，兩列共用同一份。 */
+/* 畫布貼到面板正中央。畫布是 LovyanGFX 的 swap565（高位元組在前），面板要的是
+ * 一般 RGB565，所以每個像素要對調位元組。
+ *
+ * 平常貼 2 倍抗鋸齒的那張（640x480，REV16 一次對調兩個像素），而且只貼改過的列：
+ * 雙緩衝的後台那張停在兩格之前，所以要補上「上一格和這一格」改過的列。
+ * 開機、切換貼法之後的兩格整張貼。BOX[13] 寫 "NOHI" 改貼原本 320x240 的放大
+ * （一個像素變成橫向兩個，一次寫 32 位元，兩列共用同一份），比對用。 */
+static int  g_full_frames = 2;
+static int  g_prev_y0, g_prev_y1;
+static bool g_last_hi = true;
+
 static void blit_canvas(void)
 {
+    const uint16_t *hi = gt7dash_canvas_hi();
     const uint16_t *src = gt7dash_canvas();
     uint16_t       *fb = back_buffer();
+    bool            use_hi = hi && BOX[13] != NOHI_MAGIC;
 
+    if (use_hi != g_last_hi) { g_full_frames = 2; g_last_hi = use_hi; }
+    if (use_hi) {
+        int c0 = 0, c1 = 0;
+        if (!gt7dash_canvas_hi_dirty(&c0, &c1)) { c0 = c1 = 0; }
+        int y0 = c0, y1 = c1;
+        if (g_prev_y1 > g_prev_y0) {
+            if (y1 <= y0) { y0 = g_prev_y0; y1 = g_prev_y1; }
+            else {
+                if (g_prev_y0 < y0) { y0 = g_prev_y0; }
+                if (g_prev_y1 > y1) { y1 = g_prev_y1; }
+            }
+        }
+        g_prev_y0 = c0;
+        g_prev_y1 = c1;
+        if (g_full_frames > 0) { y0 = 0; y1 = GT7DASH_H * SCALE; g_full_frames--; }
+        BOX[6] = (uint32_t)(y1 > y0 ? y1 - y0 : 0);
+        for (int y = y0; y < y1; y++) {
+            const uint32_t *s = (const uint32_t *)(hi + y * GT7DASH_W * SCALE);
+            uint32_t       *d = (uint32_t *)(fb + y * PHYS_W + OFF_X);
+            for (int x = 0; x < GT7DASH_W * SCALE / 2; x++) {
+                d[x] = __REV16(s[x]);
+            }
+        }
+        return;
+    }
     if (!src) { return; }
     for (int y = 0; y < GT7DASH_H; y++) {
         uint32_t *d0 = (uint32_t *)(fb + (y * SCALE) * PHYS_W + OFF_X);
@@ -290,7 +329,7 @@ void racedash_run(void)
     static char line[512];
     uint32_t    demo_next = 0;
 
-    for (int i = 0; i < 16; i++) {
+    for (int i = 0; i < 17; i++) {
         if (i != 11) { BOX[i] = 0u; }     /* 展示模式的請求跨重置保留 */
     }
     BOX[0] = 0x52445348u;                 /* "RDSH" */
@@ -339,8 +378,11 @@ void racedash_run(void)
 
             gt7dash_step();
             if (BOX[15] != FROZ_MAGIC) {
+                uint32_t t1 = DWT->CYCCNT;
                 blit_canvas();
+                BOX[14] = DWT->CYCCNT - t1;
                 BOX[7] = DWT->CYCCNT - t0;
+                if (BOX[7] > BOX[16]) { BOX[16] = BOX[7]; }
                 present();
                 /* 原作只重畫有變的部分，所以畫布永遠是完整的一格；
                  * 換頁之後兩塊 framebuffer 都要是最新的，下一圈會再貼一次。 */

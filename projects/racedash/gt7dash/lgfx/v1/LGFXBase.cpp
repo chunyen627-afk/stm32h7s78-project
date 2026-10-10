@@ -227,6 +227,9 @@ namespace lgfx
 
   void LGFXBase::drawCircle(int32_t x, int32_t y, int32_t r)
   {
+#if defined (LGFX_RACEDASH)
+    LGFX_RACEDASH_SHAPE(r > 0, drawCircle(x, y, r), draw_circle(this, x, y, r))
+#endif
     if ( r <= 0 ) {
       drawPixel(x, y);
       return;
@@ -298,6 +301,9 @@ namespace lgfx
   }
 
   void LGFXBase::fillCircle(int32_t x, int32_t y, int32_t r) {
+#if defined (LGFX_RACEDASH)
+    LGFX_RACEDASH_SHAPE(r > 0, fillCircle(x, y, r), fill_circle(this, x, y, r))
+#endif
     startWrite();
     writeFastHLine(x - r, y, (r << 1) + 1);
     fillCircleHelper(x, y, r, 3, 0);
@@ -433,6 +439,9 @@ namespace lgfx
 
   void LGFXBase::drawRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r)
   {
+#if defined (LGFX_RACEDASH)
+    LGFX_RACEDASH_SHAPE(w > 0 && h > 0 && r > 0, drawRoundRect(x, y, w, h, r), draw_round_rect(this, x, y, w, h, r))
+#endif
     if (_adjust_abs(x, w)||_adjust_abs(y, h)) return;
     startWrite();
 
@@ -478,6 +487,9 @@ namespace lgfx
 
   void LGFXBase::fillRoundRect(int32_t x, int32_t y, int32_t w, int32_t h, int32_t r)
   {
+#if defined (LGFX_RACEDASH)
+    LGFX_RACEDASH_SHAPE(w > 0 && h > 0 && r > 0, fillRoundRect(x, y, w, h, r), fill_round_rect(this, x, y, w, h, r))
+#endif
     if (_adjust_abs(x, w)||_adjust_abs(y, h)) return;
     startWrite();
     int32_t y2 = y + r;
@@ -510,6 +522,9 @@ namespace lgfx
 
   void LGFXBase::drawLine(int32_t x0, int32_t y0, int32_t x1, int32_t y1)
   {
+#if defined (LGFX_RACEDASH)
+    LGFX_RACEDASH_SHAPE(x0 != x1 || y0 != y1, drawLine(x0, y0, x1, y1), draw_line(this, x0, y0, x1, y1))
+#endif
     bool steep = abs(y1 - y0) > abs(x1 - x0);
 
     int32_t xstart = _clip_l;
@@ -597,6 +612,9 @@ namespace lgfx
 
   void LGFXBase::fillTriangle(int32_t x0, int32_t y0, int32_t x1, int32_t y1, int32_t x2, int32_t y2)
   {
+#if defined (LGFX_RACEDASH)
+    LGFX_RACEDASH_SHAPE((x1 - x0) * (y2 - y0) != (x2 - x0) * (y1 - y0), fillTriangle(x0, y0, x1, y1, x2, y2), fill_triangle(this, x0, y0, x1, y1, x2, y2))
+#endif
     int32_t a, b;
 
     // Sort coordinates by Y order (y2 >= y1 >= y0)
@@ -1912,7 +1930,7 @@ namespace lgfx
     int32_t dummy_filled_x = 0;
     FontMetrics metrics;
     fontdata[font]->getDefaultMetric(&metrics);
-    return fontdata[font]->drawChar(this, x, y, uniCode, &_text_style, &metrics, dummy_filled_x);
+    return LGFX_FONT_DRAWCHAR(fontdata[font], x, y, uniCode, &_text_style, &metrics, dummy_filled_x);
   }
 
   size_t LGFXBase::draw_string(const char *string, int32_t x, int32_t y, textdatum_t datum, const IFont* font)
@@ -1998,7 +2016,7 @@ namespace lgfx
           } while (uniCode < 0x20 && *++string);
           if (uniCode < 0x20) break;
         }
-        sumX += font->drawChar(this, x + sumX, y, uniCode, &_text_style, &metrics, dummy_filled_x);
+        sumX += LGFX_FONT_DRAWCHAR(font, x + sumX, y, uniCode, &_text_style, &metrics, dummy_filled_x);
       } while (*(++string));
     }
     this->endWrite();
@@ -2070,7 +2088,7 @@ namespace lgfx
 
       if (y <= _clip_b + h)
       {
-        _cursor_x += _font->drawChar(this, _cursor_x, y, uniCode, &_text_style, &_font_metrics, _filled_x);
+        _cursor_x += LGFX_FONT_DRAWCHAR(_font, _cursor_x, y, uniCode, &_text_style, &_font_metrics, _filled_x);
       }
       else
       {

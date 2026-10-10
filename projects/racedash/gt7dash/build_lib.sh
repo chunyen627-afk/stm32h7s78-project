@@ -21,7 +21,7 @@ CFLAGS="$COMMON -std=gnu11"
 OUT="$HERE/build"
 mkdir -p "$OUT"
 
-CXX_SRC="port.cpp orig/GT7DerivedMetrics.cpp orig/GT7UDPParser.cpp
+CXX_SRC="port.cpp hires/hires.cpp orig/GT7DerivedMetrics.cpp orig/GT7UDPParser.cpp
 lgfx/v1/LGFXBase.cpp lgfx/v1/LGFX_Sprite.cpp lgfx/v1/lgfx_fonts.cpp
 lgfx/v1/misc/SpriteBuffer.cpp lgfx/v1/misc/common_function.cpp lgfx/v1/misc/pixelcopy.cpp
 lgfx/v1/panel/Panel_Device.cpp"
@@ -29,12 +29,14 @@ C_SRC="lgfx/utility/lgfx_pngle.c lgfx/utility/lgfx_qoi.c lgfx/utility/lgfx_qrcod
 
 # port.cpp 把原作整個 include 進來，原作或相容層任何一個改了都要重編它。
 DEPS_PORT=$(ls -t orig/*.h orig/dashboard/*.inc orig/dashboard/themes/*.inc compat/*.h compat/lgfx_user/*.hpp gt7dash.h 2>/dev/null | head -1)
+# LovyanGFX 的標頭或高解析度鏡像的介面（hires/*.inc）改了，每個檔案都要重編。
+DEPS_ALL=$(ls -t lgfx/v1/*.hpp lgfx/v1/*/*.hpp hires/*.inc hires/*.h 2>/dev/null | head -1)
 
 objs=""
 build() {   # build <編譯器> <旗標> <原始檔>
     local src="$3" obj="$OUT/$(echo "$3" | tr '/' '_' | sed 's/\.[a-z]*$/.o/')"
     objs="$objs $obj"
-    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || { [ "$src" = port.cpp ] && [ "$DEPS_PORT" -nt "$obj" ]; }; then
+    if [ ! -f "$obj" ] || [ "$src" -nt "$obj" ] || [ "$DEPS_ALL" -nt "$obj" ] || { [ "$src" = port.cpp ] && [ "$DEPS_PORT" -nt "$obj" ]; }; then
         echo "  $src"
         $1 $2 -c "$src" -o "$obj"
     fi

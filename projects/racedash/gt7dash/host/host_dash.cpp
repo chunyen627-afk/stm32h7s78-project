@@ -53,6 +53,36 @@ static void dump(const char *path)
   fclose(f);
 }
 
+/* 2 倍抗鋸齒畫布（板子實際顯示的那張），swap565 */
+static bool dump_hi(const char *path)
+{
+  const uint16_t *b = lgfx::racedash::buffer(tft._racedash_hi);
+  if (!b) return false;
+  FILE *f = fopen(path, "wb"); fprintf(f, "P6 640 480 255\n");
+  for (int i = 0; i < 640 * 480; i++) {
+    uint16_t c = (uint16_t)((b[i] >> 8) | (b[i] << 8));
+    unsigned char rgb[3] = { (unsigned char)(((c >> 11) & 31) * 255 / 31), (unsigned char)(((c >> 5) & 63) * 255 / 63), (unsigned char)((c & 31) * 255 / 31) };
+    fwrite(rgb, 1, 3, f);
+  }
+  fclose(f);
+  return true;
+}
+
+static void step(SHCustomProtocol &dash, const char *line, int i)
+{
+  g_fake_ms += 100;
+  /* 序號每次要變，不然會被當成重複 */
+  char seq[16]; snprintf(seq, sizeof(seq), "%d", 100 + i);
+  String l = String(line); int a = l.indexOf(';'), b = l.indexOf(';', a + 1);
+  String nl = l.substring(0, a + 1) + seq + l.substring(b);
+  strncpy(dash.customLine, nl.c_str(), sizeof(dash.customLine) - 1);
+  dash.acceptSimHubFrame();
+  dash.loop();
+}
+
+/* 用法：host_dash [主題] [DSH1 一行] [跑幾格] [點擊 x,y ...]
+ * 輸出 theme<主題>.ppm（原本的 320x240）與 theme<主題>_hi.ppm（2 倍抗鋸齒）。
+ * 點擊座標是 320x240 的，每個點按住 3 格、放開 10 格，用來叫出設定畫面。 */
 int main(int argc, char **argv)
 {
   int theme = argc > 1 ? atoi(argv[1]) : 1;
@@ -67,19 +97,17 @@ int main(int argc, char **argv)
   dash.setup();
   dash.initializeTelemetry();
   int iters = argc > 3 ? atoi(argv[3]) : 40;
-  for (int i = 0; i < iters; i++) {
-    g_fake_ms += 100;
-    strncpy(dash.customLine, line, sizeof(dash.customLine) - 1);
-    /* 序號每次要變，不然會被當成重複 */
-    char seq[16]; snprintf(seq, sizeof(seq), "%d", 100 + i);
-    String l = String(line); int a = l.indexOf(';'), b = l.indexOf(';', a + 1);
-    String nl = l.substring(0, a + 1) + seq + l.substring(b);
-    strncpy(dash.customLine, nl.c_str(), sizeof(dash.customLine) - 1);
-    dash.acceptSimHubFrame();
-    dash.loop();
+  int n = 0;
+  for (int i = 0; i < iters; i++) step(dash, line, n++);
+  for (int k = 4; k < argc; k++) {
+    if (sscanf(argv[k], "%d,%d", &g_tx, &g_ty) != 2) continue;
+    for (int i = 0; i < 3; i++) step(dash, line, n++);
+    g_tx = g_ty = -1;
+    for (int i = 0; i < 10; i++) step(dash, line, n++);
   }
-  printf("state.gear=[%s] prev gt3Gear=[%s] theme=%d\n", dash.gear.c_str(), prevData[String("gt3Gear")].c_str(), (int)dash.activeDashboardTheme);
   dump(out);
   printf("wrote %s\n", out);
+  snprintf(out, sizeof(out), "theme%d_hi.ppm", theme);
+  if (dump_hi(out)) printf("wrote %s\n", out);
   return 0;
 }

@@ -18,5 +18,25 @@ platformio.ini 與 lib/GT7Udp/LICENSE）。
 
 https://github.com/lovyan03/LovyanGFX ，原作專案收錄的版本。完整授權見
 `lgfx/LICENSE-LovyanGFX.txt`（含 LovyanGFX 沿用的 Adafruit GFX、TFT_eSPI 等來源聲明）。
-只取記憶體畫布、字型與工具函式；修補三處，都只在 `LGFX_RACEDASH` 時生效
+只取記憶體畫布、字型與工具函式；修補四處，都只在 `LGFX_RACEDASH` 時生效
 （見 ../README.md）。
+
+## hires/ —— 高解析度鏡像
+
+- `stb_truetype.h`：https://github.com/nothings/stb v1.26，Sean Barrett，公有領域
+  （或 MIT，擇一；授權寫在檔案結尾）。用它的掃描線把輪廓畫成抗鋸齒
+- `hires_fonts.inc`：由 `tools/gen_hires_fonts.c` 從下面兩套字型取出 ASCII 字元的
+  輪廓。原作的 FreeSans、DejaVu 點陣字（LovyanGFX 收錄）本來就是從這兩套轉出來的
+  - **FreeSans**：GNU FreeFont 20120503，https://ftp.gnu.org/gnu/freefont/
+    （`freefont-ttf-20120503.zip` 裡的 `FreeSans.ttf`）。GPLv3 或之後版本，
+    附字型例外條款；輪廓資料沿用同一授權
+  - **DejaVu Sans**：DejaVu Fonts 2.37，https://github.com/dejavu-fonts/dejavu-fonts
+    （`dejavu-fonts-ttf-2.37.zip` 裡的 `DejaVuSans.ttf`）。Bitstream Vera 字型授權
+    （DejaVu 的修改部分為公有領域）
+
+TTF 本身不放在 repo 裡；要重新產生 `hires_fonts.inc` 時照上面的網址下載，然後：
+
+```bash
+gcc -O2 -o gen_hires_fonts hires/tools/gen_hires_fonts.c -lm
+./gen_hires_fonts FreeSans.ttf DejaVuSans.ttf > hires/hires_fonts.inc
+```

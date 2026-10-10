@@ -80,6 +80,20 @@ extern "C" const uint16_t *gt7dash_canvas(void)
     return (const uint16_t *)tft.getBuffer();
 }
 
+extern "C" const uint16_t *gt7dash_canvas_hi(void)
+{
+    return lgfx::racedash::buffer(tft._racedash_hi);
+}
+
+extern "C" int gt7dash_canvas_hi_dirty(int *y0, int *y1)
+{
+    int32_t a, b;
+    if (!lgfx::racedash::take_dirty(tft._racedash_hi, &a, &b)) { return 0; }
+    *y0 = a;
+    *y1 = b;
+    return 1;
+}
+
 /* 除錯：直接切主題（0 Classic、1 GT3、2 Retro、3 Radar、4 Mono、5 Pocket、6 Endurance），
  * 跟使用者在原作選單裡選一樣，也會記進設定。截圖驗證時用，不用人去點。 */
 extern "C" void gt7dash_set_theme(int theme)

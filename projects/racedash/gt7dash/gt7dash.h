@@ -15,6 +15,11 @@ int  gt7dash_feed(const char *line);
 void gt7dash_step(void);
 /* 320x240 的畫布，16 位元，位元組順序是 LovyanGFX 的 swap565（高位元組在前）。 */
 const uint16_t *gt7dash_canvas(void);
+/* 同一個畫面的 2 倍抗鋸齒版本（640x480，同樣是 swap565），見 hires/hires.cpp。
+ * 記憶體不夠配不出來時回 NULL，那就用上面那張放大。 */
+const uint16_t *gt7dash_canvas_hi(void);
+/* 上次呼叫之後 2 倍畫布改過的列 [y0, y1)。沒改過回 0。 */
+int gt7dash_canvas_hi_dirty(int *y0, int *y1);
 
 /* ---- 由 C 這邊（race_main.c）提供 ---- */
 /* 觸控：座標已換算成畫布的 320x240。沒按回 false。 */
