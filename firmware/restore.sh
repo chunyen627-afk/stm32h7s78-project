@@ -4,9 +4,11 @@
 # 540MB 的 ST 韌體包 —— 燒的是這個目錄裡存好的快照，跟當下的建置環境無關
 # （別的專案把 cube/ 改成什麼樣都不影響）。
 #
-#   ./firmware/restore.sh 相簿          相簿（含影片播放、USB 隨身碟、USB 耳機）
+#   ./firmware/restore.sh 相簿
 #   ./firmware/restore.sh 俄羅斯方塊
-#   ./firmware/restore.sh 影片燒卡工具  獨立影片播放器＋用 ST-LINK 寫 SD 卡
+#   ./firmware/restore.sh            不給名字：列出所有可以燒回的專案
+#
+# 有哪些專案、各自的別名與要燒的檔案，寫在 firmware/<目錄>/project.conf。
 #
 # **每次都整套燒，連 bootloader 一起。** 別的專案常會換掉內部 Flash 的
 # bootloader，而相簿那顆有補開 HSE —— 少了它隨身碟模式會完全不列舉，
@@ -26,29 +28,38 @@ EL="$(dirname "$CLI")/ExternalLoader/MX66UW1G45G_STM32H7S78-DK.stldr"
 
 [ -f "$CLI" ] || { echo "找不到 STM32_Programmer_CLI：$CLI"; exit 1; }
 
-# 名稱 -> 目錄。中英文、常見說法都收；使用者心裡「影片播放」「隨身碟」
-# 「耳機」都是相簿的功能，不是獨立的東西。
-case "$1" in
-    相簿|album|電子相簿|影片|影片播放|隨身碟|USB隨身碟|耳機|USB耳機|無線耳機)
-        NAME=album ;;
-    俄羅斯方塊|方塊|tetris)
-        NAME=tetris ;;
-    影片燒卡工具|影片播放器|燒卡|video|video_player)
-        NAME=video ;;
-    *)
-        echo "用法：$0 <專案>"
-        echo "  相簿          電子相簿（含影片播放、USB 隨身碟、USB 耳機）"
-        echo "  俄羅斯方塊"
-        echo "  影片燒卡工具  獨立影片播放器＋ST-LINK 寫 SD 卡"
-        exit 1 ;;
-esac
+# 名稱 -> 專案。每個 firmware/<目錄>/project.conf 宣告自己的名稱與別名，
+# 新增專案只要加一個資料夾，這個腳本不用改。
+# 設定檔先去掉 CR 再載入：Git 在 Windows 會把它轉成 CRLF 行尾。
+load_conf() {
+    TITLE=""; DESC=""; ALIASES=""; ITEMS=""; SOURCE=""
+    source <(tr -d '\r' < "$1")
+}
 
-# 每個專案燒哪些東西：檔名:外部 Flash 位址。bootloader 另外處理。
-case "$NAME" in
-    album)  ITEMS="album.bin:0x70000000 usbdrive.bin:0x71000000" ;;
-    tetris) ITEMS="tetris.bin:0x70000000" ;;
-    video)  ITEMS="video_player.bin:0x70000000" ;;
-esac
+list_projects() {
+    echo "可以燒回的專案："
+    for c in "$HERE"/*/project.conf; do
+        load_conf "$c"
+        echo "  【$TITLE】$DESC"
+        echo "      也可以說：$ALIASES"
+    done
+}
+
+NAME=""
+for c in "$HERE"/*/project.conf; do
+    load_conf "$c"
+    for a in $ALIASES; do
+        if [ "$a" = "$1" ]; then NAME=$(basename "$(dirname "$c")"); break 2; fi
+    done
+done
+
+if [ -z "$NAME" ]; then
+    [ -n "$1" ] && echo "!! 不認得「$1」"
+    echo "用法：$0 <專案>"
+    list_projects
+    exit 1
+fi
+load_conf "$HERE/$NAME/project.conf"
 
 DIR="$HERE/$NAME"
 
@@ -58,7 +69,7 @@ if "$CLI" -l st-link 2>&1 | grep -q "No ST-Link detected"; then
     exit 1
 fi
 
-echo "==> 燒回「$1」（firmware/$NAME）"
+echo "==> 燒回「$TITLE」（firmware/$NAME，快照來源 $SOURCE）"
 
 echo "==> bootloader -> 內部 Flash"
 "$CLI" -c port=SWD mode=UR -w "$DIR/boot.hex" -v |

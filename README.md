@@ -40,7 +40,8 @@ cube/                 ST 韌體包 STM32CubeH7RS（gitignore，所有專案共�
 ./firmware/restore.sh 影片燒卡工具
 ```
 
-專案怎麼分、各燒到哪、硬體前提，見 [firmware/README.md](firmware/README.md)。
+不給名字會列出目前所有可燒回的專案。**每個專案有哪些功能、之後怎麼新增一個**，
+見 [firmware/README.md](firmware/README.md)。板子要直插電腦，經過 USB 集線器認不到。
 
 ## 建置
 

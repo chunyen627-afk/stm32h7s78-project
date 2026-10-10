@@ -23,6 +23,7 @@ Release/
 !firmware/**/*.hex
 
 # 測試中間檔
+projects/video/.cache/
 test/*.elf
 shots/*.raw
 

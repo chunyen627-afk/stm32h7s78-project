@@ -11,8 +11,9 @@
 | `0x70000000` | 相簿（bootloader 永遠跳這裡） |
 | `0x71000000` | 隨身碟（ST 的 `MSC_Standalone`，經 `tools/patch_project.py` 改過） |
 
-相簿在 `watchdog_feed()` 裡量 CN18 的 VBUS，偵測到就在 AXI SRAM 頂端
-`0x24071BF0` 留下暗號 `"USBD"` 並重置；相簿的 `main()` **第一行**看到暗號就
+相簿在 `watchdog_feed()` 裡量 CN18 的 VBUS，偵測到就在 DTCM `0x20004000`
+留下暗號 `"USBD"` 並重置（原本放 AXI SRAM `0x24071BF0`，會被 bootloader 的
+堆疊踩掉，「有時候回得來有時候回不來」）；相簿的 `main()` **第一行**看到暗號就
 跳過去。暗號一次有效（跳之前就清掉），所以隨身碟 app 之後不管是拔線重置還是
 當掉重置，下一次開機一定回到相簿，**不會卡在隨身碟模式**。
 
