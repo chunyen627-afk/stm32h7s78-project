@@ -29,6 +29,19 @@ F1、Forza 等大部分 PC 賽車遊戲（官網 simhubdash.com）。
    - 頻率選 10Hz（免費版上限）
 4. 開遊戲，板子會從等待畫面切到儀表
 
+新版 SimHub（9.13）的 Settings 裡已經沒有 Plugins 分頁，啟用功能改在左側選單的
+**Add/remove features**。
+
+**設定備份**：[`simhub/CustomSerialPlugin.GeneralSettings2.json`](simhub/CustomSerialPlugin.GeneralSettings2.json)
+是這台電腦設定好的完整檔案（COM3、115200、自動重連、公式）。重灌或換電腦時，
+**先從系統匣的 SimHub 圖示選 Exit SimHub**（直接關視窗只會縮到系統匣，而且 SimHub
+結束時才會寫設定檔，會把你複製進去的蓋掉），再把它複製到
+`C:\Program Files (x86)\SimHub\PluginsData\Common\`，然後重開 SimHub。
+COM 埠號不同的話要改檔案裡的 `SerialPortName`。
+
+2026-10-10 實機驗證：SimHub 9.13.2 免費版，每秒穩定 10 行，1066 行零錯誤；
+重開 SimHub 會自己接回板子。
+
 板子的等待畫面會告訴你卡在哪一步：
 
 | 畫面顯示 | 意思 |
