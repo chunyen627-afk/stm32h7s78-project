@@ -20,6 +20,8 @@ const uint16_t *gt7dash_canvas(void);
 const uint16_t *gt7dash_canvas_hi(void);
 /* 上次呼叫之後 2 倍畫布改過的列 [y0, y1)。沒改過回 0。 */
 int gt7dash_canvas_hi_dirty(int *y0, int *y1);
+/* gt7dash_init() 之前呼叫：要不要配 2 倍鏡像（預設要）。 */
+void gt7dash_hires_set(int on);
 
 /* ---- 由 C 這邊（race_main.c）提供 ---- */
 /* 觸控：座標已換算成畫布的 320x240。沒按回 false。 */

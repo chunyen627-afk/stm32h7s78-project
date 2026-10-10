@@ -33,6 +33,9 @@
  * [0] "RDSH"  [1] tick  [2] 收到的位元組  [3] 原作判為有效的行  [4] 無效的行
  * [5] 畫了幾格  [6] 這格貼了幾列  [7] 一格多少 CPU 週期（原作 + 貼圖）
  * [14] 其中貼圖的週期  [16] 開機以來最慢的一格（寫 0 重新量）  [8] 序列埠溢位
+ * [17] 展示模式的資料間隔（毫秒，0 = 100；16 = 一秒 60 次）
+ * [18] / [19] 掉格數 / 換頁次數（各寫 0 重新數；掉格 = 跟上一格隔超過 20.8ms）
+ * [20] 寫 "LOWR" 再重置就不用高解析度（量原作本身的時間）
  * [9] 太長被丟的行  [10] 堆積用了多少（PSRAM）
  * [11] 寫 "DEMO" 就由板子自己產生跑圈資料（不用遊戲、不佔 COM 埠）
  * [12] 寫 0x54480000 | 主題（0~6）直接切主題（截圖驗證用）
@@ -41,6 +44,7 @@
 #define BOX ((volatile uint32_t *)0x20004020u)
 #define DEMO_MAGIC  0x44454D4Fu
 #define FROZ_MAGIC  0x5A4F5246u
+#define LOWR_MAGIC  0x4C4F5752u   /* BOX[20]："LOWR" 重置後不用高解析度 */
 #define NOHI_MAGIC  0x4E4F4849u   /* BOX[13]："NOHI" 貼原本 320x240 的放大，不用抗鋸齒版 */
 
 static uint32_t g_front;
@@ -136,6 +140,30 @@ static void present(void)
  * 雙緩衝的後台那張停在兩格之前，所以要補上「上一格和這一格」改過的列。
  * 開機、切換貼法之後的兩格整張貼。BOX[13] 寫 "NOHI" 改貼原本 320x240 的放大
  * （一個像素變成橫向兩個，一次寫 32 位元，兩列共用同一份），比對用。 */
+/* DMA2D 把 2 倍畫布的 rows 列搬到 framebuffer，順便對調位元組（OPFCCR.SB）。
+ * framebuffer 是 write-through，CPU 一個字一個字寫進 PSRAM 很慢（Radar 轉速錶
+ * 一格要貼 350 列，CPU 要 7.5ms）；DMA2D 成批搬。來源在可快取的 PSRAM，
+ * 啟動前先把 D-Cache 寫回，不然 DMA2D 會讀到還沒寫回的舊資料。 */
+static void dma2d_copy_swap(const uint16_t *src, uint16_t *dst, int rows)
+{
+    const int w = GT7DASH_W * SCALE;
+
+    SCB_CleanDCache();
+    __HAL_RCC_DMA2D_CLK_ENABLE();
+    DMA2D->CR      = DMA2D_CR_MODE_0;                 /* 記憶體到記憶體＋像素格式轉換 */
+    DMA2D->FGMAR   = (uint32_t)src;
+    DMA2D->FGOR    = 0u;
+    DMA2D->FGPFCCR = DMA2D_INPUT_RGB565;
+    DMA2D->OMAR    = (uint32_t)dst;
+    DMA2D->OOR     = (uint32_t)(PHYS_W - w);
+    DMA2D->OPFCCR  = DMA2D_OUTPUT_RGB565 | DMA2D_OPFCCR_SB;
+    DMA2D->NLR     = ((uint32_t)w << DMA2D_NLR_PL_Pos) | (uint32_t)rows;
+    DMA2D->CR     |= DMA2D_CR_START;
+    for (uint32_t guard = 0; guard < 20000000u; guard++) {
+        if ((DMA2D->CR & DMA2D_CR_START) == 0u) { break; }
+    }
+}
+
 static int  g_full_frames = 2;
 static int  g_prev_y0, g_prev_y1;
 static bool g_last_hi = true;
@@ -163,12 +191,8 @@ static void blit_canvas(void)
         g_prev_y1 = c1;
         if (g_full_frames > 0) { y0 = 0; y1 = GT7DASH_H * SCALE; g_full_frames--; }
         BOX[6] = (uint32_t)(y1 > y0 ? y1 - y0 : 0);
-        for (int y = y0; y < y1; y++) {
-            const uint32_t *s = (const uint32_t *)(hi + y * GT7DASH_W * SCALE);
-            uint32_t       *d = (uint32_t *)(fb + y * PHYS_W + OFF_X);
-            for (int x = 0; x < GT7DASH_W * SCALE / 2; x++) {
-                d[x] = __REV16(s[x]);
-            }
+        if (y1 > y0) {
+            dma2d_copy_swap(hi + y0 * GT7DASH_W * SCALE, fb + y0 * PHYS_W + OFF_X, y1 - y0);
         }
         return;
     }
@@ -291,7 +315,7 @@ void racedash_pref_clear(void)
 /* ------------------------------------------------------------------ */
 /* 展示模式：板子自己產生一行 DSH1（跟 tools/fake_simhub.ps1 一樣的動作）  */
 /* ------------------------------------------------------------------ */
-static void demo_line(char *out, int cap, uint32_t now)
+static void demo_line(char *out, int cap, uint32_t now, uint32_t period)
 {
     static uint32_t seq;
     static int32_t  rpm = 3000;
@@ -302,12 +326,12 @@ static void demo_line(char *out, int cap, uint32_t now)
 
     if (t < 9000u) {
         thr = 100; brk = 0;
-        rpm += 900;
+        rpm += (int32_t)(9u * period);      /* 每 0.1 秒 +900，間隔變短就等比例變小 */
         if (rpm > 8200 && gear < 6) { gear++; rpm = 5600; }
         if (rpm > 8400) { rpm = 8400; }
     } else {
         thr = 0; brk = 85;
-        rpm -= 1200;
+        rpm -= (int32_t)(12u * period);
         if (rpm < 4200 && gear > 2) { gear--; rpm = 6800; }
         if (rpm < 2000) { rpm = 2000; }
     }
@@ -329,8 +353,8 @@ void racedash_run(void)
     static char line[512];
     uint32_t    demo_next = 0;
 
-    for (int i = 0; i < 17; i++) {
-        if (i != 11) { BOX[i] = 0u; }     /* 展示模式的請求跨重置保留 */
+    for (int i = 0; i < 20; i++) {
+        if (i != 11) { BOX[i] = 0u; }     /* 展示模式的請求跨重置保留；[20] 也是 */
     }
     BOX[0] = 0x52445348u;                 /* "RDSH" */
 
@@ -351,6 +375,8 @@ void racedash_run(void)
         Error_Handler();
     }
 
+    /* BOX[20] 寫 "LOWR" 再重置：不配 2 倍鏡像，只跑原作（量原作本身的時間用） */
+    gt7dash_hires_set(BOX[20] != LOWR_MAGIC);
     gt7dash_init();
 
     for (;;) {
@@ -364,8 +390,11 @@ void racedash_run(void)
         if (BOX[11] == DEMO_MAGIC && (int32_t)(now - demo_next) >= 0) {
             char demo[160];
 
-            demo_next = now + 100u;          /* 跟 SimHub 免費版一樣一秒 10 次 */
-            demo_line(demo, sizeof(demo), now);
+            /* 預設跟 SimHub 免費版一樣一秒 10 次；BOX[17] 可改間隔（毫秒），
+             * 寫 16 就是授權版的一秒 60 次 */
+            uint32_t period = (BOX[17] >= 1u && BOX[17] <= 1000u) ? BOX[17] : 100u;
+            demo_next = now + period;
+            demo_line(demo, sizeof(demo), now, period);
             if (gt7dash_feed(demo)) { BOX[3]++; } else { BOX[4]++; }
         }
         if ((BOX[12] & 0xFFFF0000u) == 0x54480000u) {
@@ -384,6 +413,14 @@ void racedash_run(void)
                 BOX[7] = DWT->CYCCNT - t0;
                 if (BOX[7] > BOX[16]) { BOX[16] = BOX[7]; }
                 present();
+                /* 跟上一格換頁的間隔超過 1.25 個 60Hz 週期（20.8ms）就是掉格 */
+                {
+                    static uint32_t last_present;
+                    uint32_t        t2 = DWT->CYCCNT;
+                    if (last_present && t2 - last_present > (SystemCoreClock / 48u)) { BOX[18]++; }
+                    BOX[19]++;
+                    last_present = t2;
+                }
                 /* 原作只重畫有變的部分，所以畫布永遠是完整的一格；
                  * 換頁之後兩塊 framebuffer 都要是最新的，下一圈會再貼一次。 */
             }

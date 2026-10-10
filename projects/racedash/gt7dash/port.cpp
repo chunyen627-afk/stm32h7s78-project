@@ -85,6 +85,11 @@ extern "C" const uint16_t *gt7dash_canvas_hi(void)
     return lgfx::racedash::buffer(tft._racedash_hi);
 }
 
+extern "C" void gt7dash_hires_set(int on)
+{
+    lgfx::racedash::set_enabled(on != 0);
+}
+
 extern "C" int gt7dash_canvas_hi_dirty(int *y0, int *y1)
 {
     int32_t a, b;

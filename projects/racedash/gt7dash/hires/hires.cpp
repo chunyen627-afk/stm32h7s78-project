@@ -171,6 +171,28 @@ namespace lgfx
       return true;
     }
 
+    /* 一列像素搬過去。newlib-nano 的 memcpy 是為了省空間寫的，不快；這裡一次搬 4 位元組。
+     * 關掉 loop-distribute-patterns，免得編譯器又把迴圈換回 memcpy。 */
+    __attribute__((optimize("no-tree-loop-distribute-patterns")))
+    static void copy16(uint16_t* d, const uint16_t* s, int32_t n)
+    {
+      if ((((uintptr_t)d | (uintptr_t)s) & 3) == 0)
+      {
+        auto d32 = (uint32_t*)d;
+        auto s32 = (const uint32_t*)s;
+        int32_t n2 = n >> 1, k = 0;
+        for (; k + 4 <= n2; k += 4)
+        {
+          uint32_t a = s32[k], b = s32[k + 1], c = s32[k + 2], e = s32[k + 3];
+          d32[k] = a; d32[k + 1] = b; d32[k + 2] = c; d32[k + 3] = e;
+        }
+        for (; k < n2; ++k) d32[k] = s32[k];
+        if (n & 1) d[n - 1] = s[n - 1];
+        return;
+      }
+      for (int32_t i = 0; i < n; ++i) d[i] = s[i];
+    }
+
     void push_end(Hi* dst, Hi* src, LGFXBase* g, int32_t x, int32_t y, uint32_t transp)
     {
       dst->sup--;
@@ -186,7 +208,7 @@ namespace lgfx
       {
         const uint16_t* s = src->buf + (size_t)(Y - y * 2) * src->w - x * 2;
         uint16_t* d = dst->buf + (size_t)Y * dst->w;
-        if (!key) { memcpy(d + X0, s + X0, (X1 - X0) * 2); continue; }
+        if (!key) { copy16(d + X0, s + X0, X1 - X0); continue; }
         for (int32_t X = X0; X < X1; ++X)
           if (s[X] != (uint16_t)transp) d[X] = s[X];
       }
@@ -338,26 +360,156 @@ namespace lgfx
 //----------------------------------------------------------------------------
 // 圖形：原本 1 倍的幾何換算成 2 倍。1 倍的像素 (x,y) 佔 2 倍的 [2x,2x+2)，中心 2x+1。
 
+    /* 圓、圓角框直接用距離算覆蓋率（像素中心到邊界的距離 → 0~1），不走掃描線：
+     * 掃描線要把整個外框範圍逐列算一遍，Classic 每格重畫的大圓角框光這一步就 1ms 以上。
+     * 這裡內部、直的邊整段直接填（2 倍座標的邊都對齊像素，本來就沒有鋸齒），
+     * 只有轉角和圓周的像素逐一算。 */
+
+    /* 2 倍畫布上的裁切範圍 [L,R) x [T,B) */
+    static void hi_clip(LGFXBase* g, Hi* hi, int32_t* L, int32_t* T, int32_t* R, int32_t* B)
+    {
+      int32_t cx, cy, cw, ch;
+      g->getClipRect(&cx, &cy, &cw, &ch);
+      *L = std::max<int32_t>(cx * 2, 0);
+      *T = std::max<int32_t>(cy * 2, 0);
+      *R = std::min<int32_t>((cx + cw) * 2, hi->w);
+      *B = std::min<int32_t>((cy + ch) * 2, hi->h);
+    }
+
+    /* 一列的 [x0,x1) 以覆蓋率 a 疊上 color（已裁切過的列範圍） */
+    static inline void span(uint16_t* row, int32_t x0, int32_t x1, uint16_t color, int a)
+    {
+      if (a <= 0 || x0 >= x1) return;
+      if (a >= 255) { for (int32_t x = x0; x < x1; ++x) row[x] = color; return; }
+      for (int32_t x = x0; x < x1; ++x) row[x] = blend(row[x], color, (unsigned)a);
+    }
+
+    static inline int cov255(float c)
+    {
+      return c <= 0.0f ? 0 : c >= 1.0f ? 255 : (int)(c * 255.0f + 0.5f);
+    }
+
+    /* 圓環（Ri <= 0 就是實心圓），圓心 (cx, cy)，2 倍座標 */
+    static void aa_ring(LGFXBase* g, float cx, float cy, float Ro, float Ri, uint16_t color)
+    {
+      Hi* hi = g->_racedash_hi;
+      if (!hi) return;
+      int32_t L, T, R, B;
+      hi_clip(g, hi, &L, &T, &R, &B);
+      int32_t ys = std::max<int32_t>(T, (int32_t)floorf(cy - Ro - 1));
+      int32_t ye = std::min<int32_t>(B, (int32_t)ceilf(cy + Ro + 1));
+      if (ys >= ye) return;
+      mark(hi, ys, ye);
+      // 像素中心到圓心的水平距離 ≤ D 的像素範圍
+      auto inside = [&](float D, int32_t& x0, int32_t& x1) {
+        x0 = (int32_t)ceilf(cx - D - 0.5f);
+        x1 = (int32_t)floorf(cx + D - 0.5f) + 1;
+      };
+      for (int32_t y = ys; y < ye; ++y)
+      {
+        float dy = y + 0.5f - cy, dy2 = dy * dy;
+        float t = (Ro + 0.5f) * (Ro + 0.5f) - dy2;
+        if (t <= 0) continue;
+        int32_t ax0, ax1, fx0 = 0, fx1 = 0, hx0 = 0, hx1 = 0, ix0 = 0, ix1 = 0;
+        inside(sqrtf(t), ax0, ax1);                         // 外圓有碰到
+        t = (Ro - 0.5f) * (Ro - 0.5f) - dy2;
+        if (t > 0) inside(sqrtf(t), fx0, fx1);              // 外圓整格在內
+        if (Ri > 0)
+        {
+          t = (Ri + 0.5f) * (Ri + 0.5f) - dy2;
+          if (t > 0) inside(sqrtf(t), ix0, ix1);            // 內圓有碰到（要扣掉）
+          t = (Ri - 0.5f) * (Ri - 0.5f) - dy2;
+          if (t > 0) inside(sqrtf(t), hx0, hx1);            // 內圓整格在內（洞）
+        }
+        ax0 = std::max(ax0, L);
+        ax1 = std::min(ax1, R);
+        uint16_t* row = hi->buf + (size_t)y * hi->w;
+        for (int32_t x = ax0; x < ax1; ++x)
+        {
+          bool full = x >= fx0 && x < fx1 && !(x >= ix0 && x < ix1);
+          if (full) { row[x] = color; continue; }
+          if (x >= hx0 && x < hx1) { x = std::min(hx1, ax1) - 1; continue; }   // 洞，整段跳過
+          float dx = x + 0.5f - cx;
+          float d = sqrtf(dx * dx + dy2);
+          float c = std::min(std::max(Ro + 0.5f - d, 0.0f), 1.0f);
+          if (Ri > 0) c -= std::min(std::max(Ri + 0.5f - d, 0.0f), 1.0f);
+          int a = cov255(c);
+          if (a) row[x] = blend(row[x], color, (unsigned)a);
+        }
+      }
+    }
+
+    /* 圓角矩形到點的帶號距離（裡面為負）。中心 (cx,cy)、半寬高 (hw,hh)、圓角 r */
+    static inline float sd_rrect(float px, float py, float cx, float cy, float hw, float hh, float r)
+    {
+      float qx = fabsf(px - cx) - (hw - r), qy = fabsf(py - cy) - (hh - r);
+      float ox = std::max(qx, 0.0f), oy = std::max(qy, 0.0f);
+      return sqrtf(ox * ox + oy * oy) + std::min(std::max(qx, qy), 0.0f) - r;
+    }
+
+    /* 圓角矩形 [X0,X1) x [Y0,Y1)（2 倍座標，整數）、圓角 r；th > 0 是框線粗細（內框圓角 r-th） */
+    static void aa_rrect(LGFXBase* g, int32_t X0, int32_t Y0, int32_t X1, int32_t Y1, float r, int32_t th, uint16_t color)
+    {
+      Hi* hi = g->_racedash_hi;
+      if (!hi || X0 >= X1 || Y0 >= Y1) return;
+      int32_t L, T, R, B;
+      hi_clip(g, hi, &L, &T, &R, &B);
+      int32_t ys = std::max(Y0, T), ye = std::min(Y1, B);
+      if (ys >= ye) return;
+      mark(hi, ys, ye);
+      const float cx = (X0 + X1) * 0.5f, cy = (Y0 + Y1) * 0.5f;
+      const float hw = (X1 - X0) * 0.5f, hh = (Y1 - Y0) * 0.5f;
+      const bool ring = th > 0 && X1 - X0 > th * 2 && Y1 - Y0 > th * 2;
+      const float ri = std::max(r - th, 0.0f);
+      const int32_t rc = (int32_t)ceilf(r) + 1;            // 轉角影響的範圍
+      auto cov = [&](float px, float py) {
+        float c = std::min(std::max(0.5f - sd_rrect(px, py, cx, cy, hw, hh, r), 0.0f), 1.0f);
+        if (ring) c -= std::min(std::max(0.5f - sd_rrect(px, py, cx, cy, hw - th, hh - th, ri), 0.0f), 1.0f);
+        return cov255(c);
+      };
+      for (int32_t y = ys; y < ye; ++y)
+      {
+        uint16_t* row = hi->buf + (size_t)y * hi->w;
+        bool corner_row = y < Y0 + rc || y >= Y1 - rc;
+        if (!corner_row)
+        {
+          // 直的那段：外框整列都在裡面；框線只有左右兩條
+          if (ring)
+          {
+            span(row, std::max(X0, L), std::min(X0 + th, R), color, 255);
+            span(row, std::max(X1 - th, L), std::min(X1, R), color, 255);
+          }
+          else span(row, std::max(X0, L), std::min(X1, R), color, 255);
+          continue;
+        }
+        // 轉角那幾列：兩端逐格算，中間一段覆蓋率都一樣
+        int32_t m0 = std::min(X0 + rc, X1), m1 = std::max(X1 - rc, m0);
+        for (int32_t x = std::max(X0, L); x < std::min(m0, R); ++x)
+        {
+          int a = cov(x + 0.5f, y + 0.5f);
+          if (a) row[x] = blend(row[x], color, (unsigned)a);
+        }
+        if (m1 > m0) span(row, std::max(m0, L), std::min(m1, R), color, cov(cx, y + 0.5f));
+        for (int32_t x = std::max(m1, L); x < std::min(X1, R); ++x)
+        {
+          int a = cov(x + 0.5f, y + 0.5f);
+          if (a) row[x] = blend(row[x], color, (unsigned)a);
+        }
+      }
+    }
+
     void fill_circle(LGFXBase* g, int32_t x, int32_t y, int32_t r)
     {
       lines_flush();
       // 原本：以 (x,y) 為中心、直徑 2r+1 個像素
-      s_path.reset();
-      int n = circle_points(x * 2 + 1.0f, y * 2 + 1.0f, r * 2 + 1.0f, s_pts);
-      s_path.contour(s_pts, n, false);
-      path_fill(g, s_path, raw_color(g));
+      aa_ring(g, x * 2 + 1.0f, y * 2 + 1.0f, r * 2 + 1.0f, 0, raw_color(g));
     }
 
     void draw_circle(LGFXBase* g, int32_t x, int32_t y, int32_t r)
     {
       lines_flush();
       // 原本：1 像素寬的圓周，半徑 r → 2 倍是半徑 2r-1 到 2r+1 的圓環
-      s_path.reset();
-      int n = circle_points(x * 2 + 1.0f, y * 2 + 1.0f, r * 2 + 1.0f, s_pts);
-      s_path.contour(s_pts, n, false);
-      n = circle_points(x * 2 + 1.0f, y * 2 + 1.0f, r * 2 - 1.0f, s_pts);
-      s_path.contour(s_pts, n, true);
-      path_fill(g, s_path, raw_color(g));
+      aa_ring(g, x * 2 + 1.0f, y * 2 + 1.0f, r * 2 + 1.0f, r * 2 - 1.0f, raw_color(g));
     }
 
     /* 原本的圓角：角的圓心在 (x+r, y+r) 那一格、半徑 r → 2 倍的圓角半徑 2r+1，
@@ -370,26 +522,13 @@ namespace lgfx
     void fill_round_rect(LGFXBase* g, int32_t x, int32_t y, int32_t w, int32_t h, int32_t r)
     {
       lines_flush();
-      s_path.reset();
-      int n = round_rect_points(x * 2.0f, y * 2.0f, (x + w) * 2.0f, (y + h) * 2.0f, corner(w, h, r), s_pts);
-      s_path.contour(s_pts, n, false);
-      path_fill(g, s_path, raw_color(g));
+      aa_rrect(g, x * 2, y * 2, (x + w) * 2, (y + h) * 2, corner(w, h, r), 0, raw_color(g));
     }
 
     void draw_round_rect(LGFXBase* g, int32_t x, int32_t y, int32_t w, int32_t h, int32_t r)
     {
       lines_flush();
-      s_path.reset();
-      float rr = corner(w, h, r);
-      int n = round_rect_points(x * 2.0f, y * 2.0f, (x + w) * 2.0f, (y + h) * 2.0f, rr, s_pts);
-      s_path.contour(s_pts, n, false);
-      if (w > 2 && h > 2)
-      {
-        n = round_rect_points(x * 2 + 2.0f, y * 2 + 2.0f, (x + w) * 2 - 2.0f, (y + h) * 2 - 2.0f,
-                              std::max(0.0f, rr - 2.0f), s_pts);
-        s_path.contour(s_pts, n, true);
-      }
-      path_fill(g, s_path, raw_color(g));
+      aa_rrect(g, x * 2, y * 2, (x + w) * 2, (y + h) * 2, corner(w, h, r), 2, raw_color(g));
     }
 
     /* 原本的三角形每一行從左邊界那格填到右邊界那格（含），等於頂點在像素中心、
@@ -421,9 +560,81 @@ namespace lgfx
         out[i * 2] = px[i] + sx / den;
         out[i * 2 + 1] = py[i] + sy / den;
       }
-      s_path.reset();
-      s_path.contour(out, 3, false);
-      path_fill(g, s_path, raw_color(g));
+      // 外推後的三角形 n·p ≤ k。像素中心到三條邊的最近距離當覆蓋率（跟掃描線
+      // 只差在尖角附近）；Radar 的轉速錶每格重畫幾十個三角形，掃描線每個要 0.09ms
+      Hi* hi = g->_racedash_hi;
+      if (!hi) return;
+      int32_t L, T, R, B;
+      hi_clip(g, hi, &L, &T, &R, &B);
+      float bx0 = std::min(out[0], std::min(out[2], out[4])), bx1 = std::max(out[0], std::max(out[2], out[4]));
+      float by0 = std::min(out[1], std::min(out[3], out[5])), by1 = std::max(out[1], std::max(out[3], out[5]));
+      int32_t X0 = std::max<int32_t>(L, (int32_t)floorf(bx0)), X1 = std::min<int32_t>(R, (int32_t)ceilf(bx1));
+      int32_t Y0 = std::max<int32_t>(T, (int32_t)floorf(by0)), Y1 = std::min<int32_t>(B, (int32_t)ceilf(by1));
+      if (X0 >= X1 || Y0 >= Y1) return;
+      mark(hi, Y0, Y1);
+      // 用外推後（尖角已限制長度）的三角形本身的三條邊；直接用外推的邊線，很尖的角會長出細刺
+      float k[3];
+      for (int i = 0; i < 3; ++i)
+      {
+        int j = (i + 1) % 3;
+        float dx = out[j * 2] - out[i * 2], dy = out[j * 2 + 1] - out[i * 2 + 1];
+        float len = sqrtf(dx * dx + dy * dy);
+        if (len <= 0) return;
+        float ox = -dy / len, oy = dx / len;          // 外法向量（朝向離開重心的一側）
+        float mx = (out[i * 2] + out[j * 2]) / 2 - cx, my = (out[i * 2 + 1] + out[j * 2 + 1]) / 2 - cy;
+        if (ox * mx + oy * my < 0) { ox = -ox; oy = -oy; }
+        nx[i] = ox; ny[i] = oy;
+        k[i] = ox * out[i * 2] + oy * out[i * 2 + 1];
+      }
+      const uint16_t color = raw_color(g);
+      for (int32_t y = Y0; y < Y1; ++y)
+      {
+        uint16_t* row = hi->buf + (size_t)y * hi->w;
+        float yc = y + 0.5f;
+        // 這一列（y ~ y+1 的帶狀範圍）跟三角形相交的左右界，只算這一段（細長的斜三角形
+        // 外框範圍大半是空的）。左右各多算一格給抗鋸齒的邊
+        float lo = 1e9f, hi_x = -1e9f;
+        for (int i = 0; i < 3; ++i)
+        {
+          int j = (i + 1) % 3;
+          float ax = out[i * 2], ay = out[i * 2 + 1], bx = out[j * 2], by = out[j * 2 + 1];
+          float ya = std::max(std::min(ay, by), (float)y), yb = std::min(std::max(ay, by), (float)(y + 1));
+          if (ya > yb) continue;
+          float xa, xb;
+          if (by == ay) { xa = ax; xb = bx; }
+          else
+          {
+            xa = ax + (bx - ax) * (ya - ay) / (by - ay);
+            xb = ax + (bx - ax) * (yb - ay) / (by - ay);
+          }
+          lo = std::min(lo, std::min(xa, xb));
+          hi_x = std::max(hi_x, std::max(xa, xb));
+        }
+        if (lo > hi_x) continue;
+        int32_t xs = std::max<int32_t>(X0, (int32_t)floorf(lo) - 1), xe = std::min<int32_t>(X1, (int32_t)ceilf(hi_x) + 1);
+        // 一列裡覆蓋率是「中間一段全滿、兩端漸淡」：從兩端往內算到全滿為止，中間直接填
+        auto cov_at = [&](int32_t x) {
+          float xc = x + 0.5f;
+          float d = std::min(k[0] - nx[0] * xc - ny[0] * yc,
+                    std::min(k[1] - nx[1] * xc - ny[1] * yc, k[2] - nx[2] * xc - ny[2] * yc));
+          return cov255(d + 0.5f);
+        };
+        int32_t x = xs;
+        for (; x < xe; ++x)
+        {
+          int a = cov_at(x);
+          if (a >= 255) break;
+          if (a) row[x] = blend(row[x], color, (unsigned)a);
+        }
+        int32_t xr = xe - 1;
+        for (; xr > x; --xr)
+        {
+          int a = cov_at(xr);
+          if (a >= 255) break;
+          if (a) row[xr] = blend(row[xr], color, (unsigned)a);
+        }
+        for (; x <= xr && x < xe; ++x) row[x] = color;
+      }
     }
 
     /* 線：1 像素寬、兩端各含端點那一格 → 2 倍是寬 2、兩端各延長 1 的長條。
@@ -528,7 +739,7 @@ namespace lgfx
 //----------------------------------------------------------------------------
 // 字
 
-    struct Src { const IFont* font; const HiFace* face; float ppem; };
+    struct Src { const IFont* font; const HiFace* face; float ppem; bool smooth, join; };
 
     static const Src* find_src(const IFont* f)
     {
@@ -543,9 +754,11 @@ namespace lgfx
         { &fonts::DejaVu18, &hf_dejavu, 18 }, { &fonts::DejaVu24, &hf_dejavu, 24 },
         { &fonts::DejaVu40, &hf_dejavu, 40 }, { &fonts::DejaVu56, &hf_dejavu, 56 },
         { &fonts::DejaVu72, &hf_dejavu, 72 },
-        // 點陣字：沒有輪廓，EPX 放大
-        { &fonts::Font0, nullptr, 0 }, { &fonts::Font2, nullptr, 0 },
-        { &fonts::Font4, nullptr, 0 }, { &fonts::Font7, nullptr, 0 },
+        // 點陣字：沒有輪廓，描邊轉成輪廓（見 vectorize）。Font2/Font4（圓弧造型）、
+        // Font7（七段顯示器）整個外框平滑；Font0 是 5x7 像素字，平滑會變形（3 倍以上
+        // 的大字筆畫長出尖角），只拉直斜筆。七段的各段是分開的，角上相接不算相連
+        { &fonts::Font0, nullptr, 0, false, true }, { &fonts::Font2, nullptr, 0, true, true },
+        { &fonts::Font4, nullptr, 0, true, true },  { &fonts::Font7, nullptr, 0, true, false },
       };
       for (auto& s : tab) if (s.font == f) return &s;
       return nullptr;
@@ -564,11 +777,14 @@ namespace lgfx
     static constexpr int CACHE = 1024;
     static Cov* s_cache[CACHE];
 
-    /* 點陣字形轉輪廓：沿像素邊界描出外框（只在角上相接的像素也算相連），再把連續兩個
-     * 以上「兩邊都只有 1 格長」的轉角 —— 也就是 45° 的階梯 —— 換成穿過邊中點的斜線。
-     * 有一邊長於 1 格的轉角是字本來的直角，保持方正；所以字的樣子不變，只是斜的筆畫
-     * 不再是一格一格的鋸齒。結果寫進 s_path（字格內、以 2 倍像素為單位），回傳是否成功。 */
-    static bool vectorize(const uint8_t* bm, int W, int H, float kx, float ky)
+    /* 點陣字形轉輪廓：沿像素邊界描出外框（只在角上相接的像素也算相連），然後：
+     *  - 方塊造型的字（smooth = false）：只把連續兩個以上「兩邊都只有 1 格長」的轉角
+     *    —— 也就是 45° 的階梯 —— 換成穿過邊中點的斜線，其他直角保持方正
+     *  - 圓弧造型的字（smooth = true）：每段邊取靠近兩端（最多 1 格）的點連起來，
+     *    長短不一的階梯就變成順著弧的折線；只有「兩邊都至少 2 格長、而且不是凸凹交替
+     *    的階梯」的轉角（筆畫的端點、真正的直角）保留
+     * 結果寫進 s_path（字格內、以 2 倍像素為單位），回傳是否成功。 */
+    static bool vectorize(const uint8_t* bm, int W, int H, float kx, float ky, bool smooth, bool join)
     {
       struct Edge { int16_t sx, sy, ex, ey, pix, next; };
       const int VW = W + 1;
@@ -605,8 +821,8 @@ namespace lgfx
       for (int first = 0; first < ne; ++first)
       {
         if (used[first]) continue;
-        // 描一圈：在某個頂點有兩條路可走時（兩個像素只在角上相接），走向另一個像素，
-        // 讓斜角相接的像素連成一筆
+        // 描一圈：在某個頂點有兩條路可走時（兩個像素只在角上相接），join 就走向另一個
+        // 像素，讓斜角相接的像素連成一筆；不 join 就繞回同一個像素，兩邊各自封閉
         int n = 0, cur = first;
         do
         {
@@ -614,7 +830,7 @@ namespace lgfx
           px[n] = edges[cur].sx; py[n] = edges[cur].sy; ++n;
           int v = edges[cur].ey * VW + edges[cur].ex, pick = -1;
           for (int e = head[v]; e >= 0; e = edges[e].next)
-            if (pick < 0 || (edges[e].pix != edges[cur].pix && edges[pick].pix == edges[cur].pix)) pick = e;
+            if (pick < 0 || ((edges[e].pix != edges[cur].pix) == join && (edges[pick].pix != edges[cur].pix) != join)) pick = e;
           cur = pick;
         } while (cur >= 0 && !used[cur] && n < ne);
 
@@ -639,7 +855,19 @@ namespace lgfx
           int a = (i + m - 1) % m, b = (i + 1) % m;
           return (px[i] - px[a]) * (py[b] - py[i]) - (py[i] - py[a]) * (px[b] - px[i]) > 0;
         };
-        for (int i = 0; i < m && k < 1022; ++i)
+        auto put = [&](float x, float y) { if (k < 1022) { out[k * 2] = x * kx; out[k * 2 + 1] = y * ky; ++k; } };
+        for (int i = 0; i < m && smooth; ++i)
+        {
+          int a = (i + m - 1) % m, b = (i + 1) % m;
+          bool sharp = m <= 4 || (std::min(len(a), len(i)) >= 2 && (turn(a) == turn(i) || turn(b) == turn(i)));
+          if (sharp) put(px[i], py[i]);
+          int L = len(i);
+          float dx = (float)((px[b] > px[i]) - (px[b] < px[i])), dy = (float)((py[b] > py[i]) - (py[b] < py[i]));
+          float d = std::min(L * 0.5f, 1.0f);
+          put(px[i] + dx * d, py[i] + dy * d);
+          if (L > 2) put(px[b] - dx * d, py[b] - dy * d);
+        }
+        for (int i = 0; i < m && !smooth && k < 1022; ++i)
         {
           int a = (i + m - 1) % m, b = (i + 1) % m;
           bool cut = m > 4 && cand(i) &&
@@ -693,7 +921,7 @@ namespace lgfx
       return cv;
     }
 
-    static Cov* make_bitmap(const IFont* font, uint16_t c, float sx, float sy, const TextStyle* st)
+    static Cov* make_bitmap(const IFont* font, uint16_t c, float sx, float sy, const TextStyle* st, bool smooth, bool join)
     {
       FontMetrics mm;
       font->getDefaultMetric(&mm);
@@ -720,7 +948,7 @@ namespace lgfx
         for (int x = 0; x < W; ++x)
           b1[y * W + x] = scratch->readPixelValue(x, y) ? 1 : 0;
       // 1 倍字格的一格 = 2 倍畫布的 2*size 像素
-      bool ok = vectorize(b1, W, H, 2 * sx, 2 * sy);
+      bool ok = vectorize(b1, W, H, 2 * sx, 2 * sy, smooth, join);
       free(b1);
       if (!ok) return nullptr;
 
@@ -749,7 +977,7 @@ namespace lgfx
       uint32_t hsh = (uint32_t)(uintptr_t)src->font * 2654435761u ^ c * 40503u ^ bx * 7919u ^ by * 104729u;
       Cov*& slot = s_cache[(hsh ^ (hsh >> 13)) % CACHE];
       if (slot && slot->font == src->font && slot->c == c && slot->sx == sx && slot->sy == sy) return slot;
-      Cov* cv = src->face ? make_outline(src, c, sx, sy, m) : make_bitmap(src->font, c, sx, sy, st);
+      Cov* cv = src->face ? make_outline(src, c, sx, sy, m) : make_bitmap(src->font, c, sx, sy, st, src->smooth, src->join);
       if (!cv) return nullptr;
       cv->font = src->font;
       cv->c = c;
