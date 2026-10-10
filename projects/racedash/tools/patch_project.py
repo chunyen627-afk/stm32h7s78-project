@@ -51,7 +51,7 @@ COMPONENTS = [
     "aps256xx/aps256xx.c", "mx66uw1g45g/mx66uw1g45g.c",
 ]
 
-DASH_SOURCES = ["race_main.c", "dash.c", "dsh1.c", "serial.c", "numfont.c",
+DASH_SOURCES = ["race_main.c", "dash.c", "themes.c", "dsh1.c", "serial.c", "numfont.c",
                 "gfx.c", "font_zh.c", "dma2d.c"]
 
 INCLUDES = [

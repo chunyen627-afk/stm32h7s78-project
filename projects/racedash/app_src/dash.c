@@ -6,26 +6,10 @@
  *
  * 大數字是 Bahnschrift 預先渲染的平滑字（tools/gennum.py），標籤用 24px 中文字型。缺的值（遊戲沒提供）一律畫成 "--"。 */
 #include "dash.h"
-#include "gfx.h"
-#include "numfont.h"
+#include "dash_priv.h"
 #include <stdio.h>
 #include <string.h>
 
-#define W 800
-#define H 480
-
-#define C_BG      RGB565(  0,   0,   0)
-#define C_PANEL   RGB565( 22,  24,  30)
-#define C_LINE    RGB565( 55,  60,  70)
-#define C_TEXT    RGB565(235, 235, 240)
-#define C_DIM     RGB565(120, 125, 135)
-#define C_GREEN   RGB565( 40, 210,  80)
-#define C_YELLOW  RGB565(250, 200,  30)
-#define C_RED     RGB565(240,  45,  45)
-#define C_BLUE    RGB565( 50, 130, 255)
-#define C_ORANGE  RGB565(255, 140,   0)
-#define C_PURPLE  RGB565(190,  90, 255)
-#define C_OFF     RGB565( 35,  38,  45)   /* 沒亮的燈、長條的底槽 */
 
 /* ------------------------------------------------------------------ */
 /* 大數字：Bahnschrift 預先渲染的 4 bit 灰度字（core/numfont.c）          */
@@ -42,7 +26,7 @@ static const nf_glyph_t *nf_find(const nf_font_t *f, char c)
     return 0;
 }
 
-static int nf_width(const nf_font_t *f, const char *s)
+int nf_width(const nf_font_t *f, const char *s)
 {
     int w = 0;
 
@@ -53,7 +37,7 @@ static int nf_width(const nf_font_t *f, const char *s)
     return w;
 }
 
-static uint16_t mix565(uint16_t bg, uint16_t fg, int a /* 0..15 */)
+uint16_t mix565(uint16_t bg, uint16_t fg, int a /* 0..15 */)
 {
     int r = ((bg >> 11) * (15 - a) + (fg >> 11) * a) / 15;
     int g = (((bg >> 5) & 63) * (15 - a) + ((fg >> 5) & 63) * a) / 15;
@@ -62,7 +46,7 @@ static uint16_t mix565(uint16_t bg, uint16_t fg, int a /* 0..15 */)
 }
 
 /* align: 0 = 左對齊 x、1 = 置中於 x、2 = 右對齊 x；y 是字的上緣。 */
-static void nf_text(const nf_font_t *f, int x, int y, const char *s,
+void nf_text(const nf_font_t *f, int x, int y, const char *s,
                     uint16_t fg, uint16_t bg, int align)
 {
     uint16_t  lut[16];
@@ -101,14 +85,14 @@ static void nf_text(const nf_font_t *f, int x, int y, const char *s,
 /* ------------------------------------------------------------------ */
 /* 小工具                                                               */
 /* ------------------------------------------------------------------ */
-static void fmt_lap(char *out, int cap, int32_t ms)
+void fmt_lap(char *out, int cap, int32_t ms)
 {
     if (ms == DSH1_NA) { snprintf(out, (size_t)cap, "-:--.---"); return; }
     snprintf(out, (size_t)cap, "%ld:%02ld.%03ld", (long)(ms / 60000),
              (long)((ms / 1000) % 60), (long)(ms % 1000));
 }
 
-static void fmt_int(char *out, int cap, int32_t v)
+void fmt_int(char *out, int cap, int32_t v)
 {
     if (v == DSH1_NA) { snprintf(out, (size_t)cap, "--"); return; }
     snprintf(out, (size_t)cap, "%ld", (long)v);
@@ -120,7 +104,7 @@ static void label(int x, int y, const char *s)
 }
 
 /* 水平長條：底槽 + 百分比填色 */
-static void hbar(int x, int y, int w, int h, int32_t pct, uint16_t col)
+void hbar(int x, int y, int w, int h, int32_t pct, uint16_t col)
 {
     gfx_fill_rect(x, y, w, h, C_OFF);
     if (pct != DSH1_NA && pct > 0) {
@@ -129,7 +113,7 @@ static void hbar(int x, int y, int w, int h, int32_t pct, uint16_t col)
 }
 
 /* 垂直長條（踏板），由下往上長 */
-static void vbar(int x, int y, int w, int h, int32_t pct, uint16_t col)
+void vbar(int x, int y, int w, int h, int32_t pct, uint16_t col)
 {
     gfx_fill_rect(x, y, w, h, C_OFF);
     if (pct != DSH1_NA && pct > 0) {
@@ -140,7 +124,7 @@ static void vbar(int x, int y, int w, int h, int32_t pct, uint16_t col)
 
 /* 胎溫的顏色。各遊戲的「適溫」不同，這裡用常見的乾地胎區間：
  * 太冷藍、適溫綠、偏熱黃、過熱紅。 */
-static uint16_t tyre_color(int32_t t_x10)
+uint16_t tyre_color(int32_t t_x10)
 {
     if (t_x10 == DSH1_NA) { return C_OFF; }
     if (t_x10 < 600)  { return C_BLUE; }
@@ -292,14 +276,14 @@ static void page_full(const dsh1_t *d, uint32_t now)
 /* ------------------------------------------------------------------ */
 /* 其他儀表頁（點一下螢幕切換，見 race_main.c）                        */
 /* ------------------------------------------------------------------ */
-static void fmt_fuel_laps(char *out, int cap, int32_t x10)
+void fmt_fuel_laps(char *out, int cap, int32_t x10)
 {
     if (x10 == DSH1_NA) { snprintf(out, (size_t)cap, "--"); return; }
     snprintf(out, (size_t)cap, "%ld.%ld", (long)(x10 / 10), (long)(x10 % 10));
 }
 
 /* 上一圈跟最佳圈的差距（秒，三位小數）。慢了是正的、快了是負的。 */
-static uint16_t fmt_delta(char *out, int cap, int32_t last, int32_t best)
+uint16_t fmt_delta(char *out, int cap, int32_t last, int32_t best)
 {
     int32_t d;
 
@@ -313,7 +297,7 @@ static uint16_t fmt_delta(char *out, int cap, int32_t last, int32_t best)
     return (d <= 0) ? C_GREEN : C_RED;
 }
 
-static void fmt_laps(char *out, int cap, const dsh1_t *d)
+void fmt_laps(char *out, int cap, const dsh1_t *d)
 {
     if (d->lap == DSH1_NA) {
         snprintf(out, (size_t)cap, "--");
@@ -429,7 +413,10 @@ static void page_tyres(const dsh1_t *d, uint32_t now)
     vbar(640, 356, 140, 100, d->brake, C_RED);
 }
 
-static const char *const s_page_names[DASH_PAGES] = { "完整", "大字", "圈速", "輪胎油量" };
+static const char *const s_page_names[DASH_PAGES] = {
+    "完整", "大字", "圈速", "輪胎油量",
+    "Classic", "GT3", "Radar", "Retro", "Mono", "Pocket",
+};
 
 const char *dash_page_name(int page)
 {
@@ -442,6 +429,12 @@ void dash_draw(int page, const dsh1_t *d, uint32_t now)
     case 1:  page_big(d, now);    break;
     case 2:  page_timing(d, now); break;
     case 3:  page_tyres(d, now);  break;
+    case 4:  theme_classic(d, now); break;
+    case 5:  theme_gt3(d, now);     break;
+    case 6:  theme_radar(d, now);   break;
+    case 7:  theme_retro(d, now);   break;
+    case 8:  theme_mono(d, now);    break;
+    case 9:  theme_pocket(d, now);  break;
     default: page_full(d, now);   break;
     }
 }
@@ -456,6 +449,41 @@ void dash_draw_page_badge(int page)
     w = gfx_text_width(buf) + 48;
     gfx_pill(W / 2 - w / 2, H - 76, w, 56, C_BLUE);
     gfx_text_center(W / 2, H - 60, buf, C_TEXT);
+}
+
+/* 長按叫出的選單：兩欄、每欄五個，點一下直接換過去。 */
+#define MENU_X0   30
+#define MENU_Y0   74
+#define MENU_W    360
+#define MENU_H    66
+#define MENU_GAPX 20
+#define MENU_GAPY 12
+
+void dash_draw_menu(int current)
+{
+    gfx_fill_rect(0, 0, W, H, RGB565(10, 12, 18));
+    gfx_text_center(W / 2, 26, "選擇儀表（點一下套用）", C_TEXT);
+    for (int i = 0; i < DASH_PAGES; i++) {
+        int      x = MENU_X0 + (i / 5) * (MENU_W + MENU_GAPX);
+        int      y = MENU_Y0 + (i % 5) * (MENU_H + MENU_GAPY);
+        char     buf[32];
+        uint16_t bg = (i == current) ? C_BLUE : C_PANEL;
+
+        gfx_pill(x, y, MENU_W, MENU_H, bg);
+        snprintf(buf, sizeof(buf), "%d  %s", i + 1, dash_page_name(i));
+        gfx_text_center(x + MENU_W / 2, y + 20, buf, C_TEXT);
+    }
+}
+
+int dash_menu_hit(int x, int y)
+{
+    for (int i = 0; i < DASH_PAGES; i++) {
+        int bx = MENU_X0 + (i / 5) * (MENU_W + MENU_GAPX);
+        int by = MENU_Y0 + (i % 5) * (MENU_H + MENU_GAPY);
+
+        if (x >= bx && x < bx + MENU_W && y >= by && y < by + MENU_H) { return i; }
+    }
+    return -1;
 }
 
 void dash_draw_waiting(const dash_link_t *link, uint32_t now)

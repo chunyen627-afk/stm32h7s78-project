@@ -42,6 +42,8 @@ static uint32_t g_front;
 #define PAGE_TAG    0x9A6E0000u
 #define BADGE_MS    1200u       /* 切頁後名稱顯示多久 */
 #define TOUCH_MS    40u         /* 觸控輪詢間隔（每格都問 I2C 沒必要） */
+#define LONG_MS     700u        /* 按住這麼久叫出選單 */
+#define MENU_MS     8000u       /* 選單沒動作多久自己關 */
 
 /* 展示模式：SWD 寫 BOX[11] = "DEMO"（0x44454D4F）就由板子自己產生跑圈資料，
  * 不用開遊戲、也不用佔 COM 埠（SimHub 開著時電腦端的 fake_simhub.ps1 用不了）。
@@ -101,22 +103,15 @@ static bool touch_init(void)
     return BSP_TS_Init(0, &ts) == BSP_ERROR_NONE;
 }
 
-/* 回傳 true = 這一下是新的「按下」。
- * 電容觸控按著的時候偶爾會漏報一兩次（board-notes 14.7），所以要連續
- * 好幾次讀不到才算放開，不然手指按著不動也會連跳好幾頁。 */
-static bool touch_tapped(void)
+/* 讀一次觸控。座標是面板座標（橫向 800x480，跟畫面一致）。 */
+static bool touch_read(int *x, int *y)
 {
-    static int up_count = 99;
     TS_State_t st;
-    bool       down = (BSP_TS_GetState(0, &st) == BSP_ERROR_NONE) && st.TouchDetected;
 
-    if (down) {
-        bool fresh = (up_count >= 3);
-        up_count = 0;
-        return fresh;
-    }
-    if (up_count < 99) { up_count++; }
-    return false;
+    if (BSP_TS_GetState(0, &st) != BSP_ERROR_NONE || !st.TouchDetected) { return false; }
+    *x = (int)st.TouchX;
+    *y = (int)st.TouchY;
+    return true;
 }
 
 static void cycle_counter_init(void)
@@ -193,6 +188,11 @@ void racedash_run(void)
     int           page = 0;
     uint32_t      badge_until = 0, next_touch = 0;
     bool          have_touch;
+    /* 觸控狀態機：放開才判斷是「點一下」；按住超過 LONG_MS 就開選單。
+     * 電容觸控按著會偶爾漏報（board-notes 14.7），連續 3 次讀不到才算放開。 */
+    bool          pressing = false, long_fired = false, menu = false;
+    int           up_count = 0, press_x = 0, press_y = 0;
+    uint32_t      press_t = 0, menu_until = 0;
 
     if ((BOX[14] & 0xFFFF0000u) == PAGE_TAG && (BOX[14] & 0xFFFFu) < DASH_PAGES) {
         page = (int)(BOX[14] & 0xFFFFu);
@@ -244,7 +244,13 @@ void racedash_run(void)
             continue;
         }
 
-        /* 除錯：SWD 寫 BOX[12] = 0x50470000 | 頁 就切到那一頁（不用人去點螢幕）。 */
+        /* 除錯：SWD 寫 BOX[12] = 0x50470000 | 頁 就切到那一頁；寫 "MENU"（0x4D454E55）
+         * 就叫出選單 —— 不用人去點螢幕也能截圖驗證。 */
+        if (BOX[12] == 0x4D454E55u) {
+            BOX[12] = 0u;
+            menu = true;
+            menu_until = now + MENU_MS;
+        }
         if ((BOX[12] & 0xFFFF0000u) == 0x50470000u && (BOX[12] & 0xFFu) < DASH_PAGES) {
             page = (int)(BOX[12] & 0xFFu);
             BOX[12] = 0u;
@@ -252,13 +258,36 @@ void racedash_run(void)
         }
 
         if (have_touch && (int32_t)(now - next_touch) >= 0) {
+            int tx, ty;
+
             next_touch = now + TOUCH_MS;
-            if (touch_tapped()) {
-                page = (page + 1) % DASH_PAGES;
-                badge_until = now + BADGE_MS;
-                BOX[13]++;
-                BOX[14] = PAGE_TAG | (uint32_t)page;
+            if (touch_read(&tx, &ty)) {
+                up_count = 0;
+                if (!pressing) {
+                    pressing = true; long_fired = false;
+                    press_t = now; press_x = tx; press_y = ty;
+                } else if (!long_fired && !menu && (now - press_t) >= LONG_MS) {
+                    long_fired = true;            /* 長按：開選單，放開時不再換頁 */
+                    menu = true;
+                    menu_until = now + MENU_MS;
+                }
+            } else if (pressing && ++up_count >= 3) {
+                pressing = false;
+                if (!long_fired) {
+                    int pick = menu ? dash_menu_hit(press_x, press_y) : -1;
+
+                    if (menu) {
+                        menu = false;             /* 點到選項就套用，點空白處只關選單 */
+                        if (pick >= 0) { page = pick; badge_until = now + BADGE_MS; }
+                    } else {
+                        page = (page + 1) % DASH_PAGES;
+                        badge_until = now + BADGE_MS;
+                    }
+                    BOX[13]++;
+                    BOX[14] = PAGE_TAG | (uint32_t)page;
+                }
             }
+            if (menu && (int32_t)(now - menu_until) >= 0) { menu = false; }
         }
 
         {
@@ -272,7 +301,9 @@ void racedash_run(void)
             } else {
                 dash_draw_waiting(&link, now);
             }
-            if ((int32_t)(badge_until - now) > 0) {
+            if (menu) {
+                dash_draw_menu(page);
+            } else if ((int32_t)(badge_until - now) > 0) {
                 dash_draw_page_badge(page);
             }
             BOX[7] = DWT->CYCCNT - t0;
