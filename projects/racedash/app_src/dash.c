@@ -192,7 +192,8 @@ static void draw_indicator(int x, int y, const char *txt, int8_t on, uint16_t co
     gfx_text_center(x + 45, y + 10, txt, fg);
 }
 
-void dash_draw(const dsh1_t *d, uint32_t now)
+/* 完整：什麼都有。 */
+static void page_full(const dsh1_t *d, uint32_t now)
 {
     char buf[24];
 
@@ -286,6 +287,175 @@ void dash_draw(const dsh1_t *d, uint32_t now)
             gfx_text_center(x + 32, y + 12, buf, C_BG);
         }
     }
+}
+
+/* ------------------------------------------------------------------ */
+/* 其他儀表頁（點一下螢幕切換，見 race_main.c）                        */
+/* ------------------------------------------------------------------ */
+static void fmt_fuel_laps(char *out, int cap, int32_t x10)
+{
+    if (x10 == DSH1_NA) { snprintf(out, (size_t)cap, "--"); return; }
+    snprintf(out, (size_t)cap, "%ld.%ld", (long)(x10 / 10), (long)(x10 % 10));
+}
+
+/* 上一圈跟最佳圈的差距（秒，三位小數）。慢了是正的、快了是負的。 */
+static uint16_t fmt_delta(char *out, int cap, int32_t last, int32_t best)
+{
+    int32_t d;
+
+    if (last == DSH1_NA || best == DSH1_NA || best == 0) {
+        snprintf(out, (size_t)cap, "--");
+        return C_DIM;
+    }
+    d = last - best;
+    snprintf(out, (size_t)cap, "%c%ld.%03ld", d < 0 ? '-' : '+',
+             (long)((d < 0 ? -d : d) / 1000), (long)((d < 0 ? -d : d) % 1000));
+    return (d <= 0) ? C_GREEN : C_RED;
+}
+
+static void fmt_laps(char *out, int cap, const dsh1_t *d)
+{
+    if (d->lap == DSH1_NA) {
+        snprintf(out, (size_t)cap, "--");
+    } else if (d->laps_total == DSH1_NA || d->laps_total == 0) {
+        snprintf(out, (size_t)cap, "%ld", (long)d->lap);
+    } else {
+        snprintf(out, (size_t)cap, "%ld/%ld", (long)d->lap, (long)d->laps_total);
+    }
+}
+
+/* 大字：開車時瞄一眼用。只有換檔燈、超大檔位、車速、轉速、踏板。 */
+static void page_big(const dsh1_t *d, uint32_t now)
+{
+    char buf[24];
+
+    gfx_clear(C_BG);
+    draw_shift_lights(d, now);
+
+    gfx_fill_rect(250, 76, 300, 300, C_PANEL);
+    buf[0] = d->gear ? d->gear : '-';
+    buf[1] = '\0';
+    nf_text(&nf_xl, 400, 126, buf, (d->gear == 'R') ? C_RED : C_TEXT, C_PANEL, 1);
+
+    label(24, 96, "速度");
+    fmt_int(buf, sizeof(buf), d->speed);
+    nf_text(&nf_l, 230, 160, buf, C_TEXT, C_BG, 2);
+    gfx_text(166, 276, "km/h", C_DIM);
+
+    label(580, 96, "轉速");
+    fmt_int(buf, sizeof(buf), d->rpm);
+    nf_text(&nf_l, 780, 160, buf, C_TEXT, C_BG, 2);
+
+    /* 底下兩條橫的踏板：上油門、下煞車 */
+    hbar(24, 404, W - 48, 26, d->throttle, C_GREEN);
+    hbar(24, 440, W - 48, 26, d->brake, C_RED);
+}
+
+/* 圈速：跑計時賽、練習時看。目前圈速放最大，加上跟最佳圈的差距。 */
+static void page_timing(const dsh1_t *d, uint32_t now)
+{
+    char     buf[24];
+    uint16_t c;
+
+    gfx_clear(C_BG);
+    draw_shift_lights(d, now);
+
+    label(24, 72, "目前");
+    fmt_lap(buf, sizeof(buf), d->lap_ms[0]);
+    nf_text(&nf_l, 400, 100, buf, (d->lap_invalid == 1) ? C_RED : C_TEXT, C_BG, 1);
+
+    gfx_fill_rect(0, 222, W, 2, C_LINE);
+
+    label(24, 236, "上一圈");
+    fmt_lap(buf, sizeof(buf), d->lap_ms[1]);
+    nf_text(&nf_m, 24, 266, buf, C_TEXT, C_BG, 0);
+
+    label(420, 236, "最佳");
+    fmt_lap(buf, sizeof(buf), d->lap_ms[2]);
+    nf_text(&nf_m, 420, 266, buf, C_PURPLE, C_BG, 0);
+
+    gfx_fill_rect(0, 336, W, 2, C_LINE);
+
+    label(24, 350, "差距");
+    c = fmt_delta(buf, sizeof(buf), d->lap_ms[1], d->lap_ms[2]);
+    nf_text(&nf_m, 24, 382, buf, c, C_BG, 0);
+
+    label(330, 350, "圈數");
+    fmt_laps(buf, sizeof(buf), d);
+    nf_text(&nf_m, 330, 382, buf, C_TEXT, C_BG, 0);
+
+    label(560, 350, "名次");
+    fmt_int(buf, sizeof(buf), d->position);
+    nf_text(&nf_m, 560, 382, buf, C_YELLOW, C_BG, 0);
+}
+
+/* 輪胎油量：耐久賽、要管輪胎跟油的時候看。 */
+static void page_tyres(const dsh1_t *d, uint32_t now)
+{
+    static const char *const names[4] = { "左前", "右前", "左後", "右後" };
+    char buf[24];
+
+    gfx_clear(C_BG);
+    draw_shift_lights(d, now);
+
+    for (int i = 0; i < 4; i++) {
+        int      x = 24 + (i & 1) * 220, y = 72 + (i >> 1) * 200;
+        uint16_t bg = tyre_color(d->tyre_x10[i]);
+        uint16_t fg = (d->tyre_x10[i] == DSH1_NA) ? C_DIM : C_BG;
+
+        gfx_fill_rect(x, y, 204, 188, bg);
+        gfx_text(x + 12, y + 10, names[i], fg);
+        if (d->tyre_x10[i] == DSH1_NA) {
+            snprintf(buf, sizeof(buf), "--");
+        } else {
+            snprintf(buf, sizeof(buf), "%ld", (long)(d->tyre_x10[i] / 10));
+        }
+        nf_text(&nf_l, x + 102, y + 60, buf, fg, bg, 1);
+    }
+
+    label(480, 72, "油量");
+    fmt_int(buf, sizeof(buf), d->fuel_pct);
+    if (d->fuel_pct != DSH1_NA) { strcat(buf, "%"); }
+    nf_text(&nf_l, 780, 100, buf, C_TEXT, C_BG, 2);
+    hbar(480, 216, 300, 18, d->fuel_pct,
+         (d->fuel_pct != DSH1_NA && d->fuel_pct < 15) ? C_RED : C_ORANGE);
+
+    label(480, 256, "可跑");
+    fmt_fuel_laps(buf, sizeof(buf), d->fuel_laps_x10);
+    nf_text(&nf_m, 740, 284, buf, C_TEXT, C_BG, 2);
+    gfx_text(748, 304, "圈", C_DIM);
+
+    vbar(480, 356, 140, 100, d->throttle, C_GREEN);
+    vbar(640, 356, 140, 100, d->brake, C_RED);
+}
+
+static const char *const s_page_names[DASH_PAGES] = { "完整", "大字", "圈速", "輪胎油量" };
+
+const char *dash_page_name(int page)
+{
+    return s_page_names[(page >= 0 && page < DASH_PAGES) ? page : 0];
+}
+
+void dash_draw(int page, const dsh1_t *d, uint32_t now)
+{
+    switch (page) {
+    case 1:  page_big(d, now);    break;
+    case 2:  page_timing(d, now); break;
+    case 3:  page_tyres(d, now);  break;
+    default: page_full(d, now);   break;
+    }
+}
+
+/* 切換時在畫面下方中央顯示「2/4 大字」，讓使用者知道換到哪一頁。 */
+void dash_draw_page_badge(int page)
+{
+    char buf[32];
+    int  w;
+
+    snprintf(buf, sizeof(buf), "%d/%d  %s", page + 1, DASH_PAGES, dash_page_name(page));
+    w = gfx_text_width(buf) + 48;
+    gfx_pill(W / 2 - w / 2, H - 76, w, 56, C_BLUE);
+    gfx_text_center(W / 2, H - 60, buf, C_TEXT);
 }
 
 void dash_draw_waiting(const dash_link_t *link, uint32_t now)

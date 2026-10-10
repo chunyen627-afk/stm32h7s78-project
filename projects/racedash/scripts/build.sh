@@ -16,9 +16,11 @@ GCC_BIN="/c/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.
 
 echo "==> 產生字型"
 # 中文標籤字型每次重掃（很快），畫面上的中文改了就自動補字。
-# 大數字字型很大、而且只跟 gennum.py 有關，沒有才產生。
 (cd "$ROOT" && python tools/genfont.py >/dev/null)
-[ -f "$ROOT/core/numfont.c" ] || (cd "$ROOT" && PYTHONIOENCODING=utf-8 python tools/gennum.py)
+# 大數字字型很大，只在沒有、或 gennum.py 改過（例如加了字）時才重產生。
+if [ ! -f "$ROOT/core/numfont.c" ] || [ "$ROOT/tools/gennum.py" -nt "$ROOT/core/numfont.c" ]; then
+    (cd "$ROOT" && PYTHONIOENCODING=utf-8 python tools/gennum.py)
+fi
 
 echo "==> 同步原始碼"
 cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/*.c "$ROOT"/app_src/*.h "$REPO"/shared/gfx.c "$REPO"/shared/gfx.h "$PROJ/Appli/Dash/"

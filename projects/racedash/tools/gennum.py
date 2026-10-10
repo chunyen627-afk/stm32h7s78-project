@@ -19,8 +19,8 @@ HERE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 # 名稱：(數字高度 px, 字體變化, 要收的字)
 SIZES = {
     "xl": (200, "Bold",                   "0123456789NR-"),     # 檔位
-    "l":  (104, "Bold",                   "0123456789-"),       # 車速、等待畫面
-    "m":  (52,  "SemiBold SemiCondensed", "0123456789:.-"),     # 目前圈速
+    "l":  (104, "Bold",                   "0123456789-:.%"),    # 車速、大字版的圈速與油量
+    "m":  (52,  "SemiBold SemiCondensed", "0123456789:.-+/"),   # 目前圈速、差距、胎溫大格
     "s":  (38,  "SemiBold SemiCondensed", "0123456789:.-/%"),   # 上一圈、最佳、轉速、油量、圈數
     "xs": (30,  "SemiBold SemiCondensed", "0123456789.-"),      # 可跑圈數
 }

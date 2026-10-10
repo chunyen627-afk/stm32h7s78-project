@@ -12,8 +12,16 @@ typedef struct {
     uint32_t lines_bad;     /* 格式不對的行數 */
 } dash_link_t;
 
-/* 畫一整格儀表（800x480 橫向）。now_ms 用來做換檔燈閃爍。 */
-void dash_draw(const dsh1_t *d, uint32_t now_ms);
+/* 儀表有幾種版面，點一下螢幕切到下一種（race_main.c）。 */
+#define DASH_PAGES 4
+
+/* 畫一整格儀表（800x480 橫向）。page 是第幾種版面，now_ms 用來做換檔燈閃爍。 */
+void dash_draw(int page, const dsh1_t *d, uint32_t now_ms);
+
+const char *dash_page_name(int page);
+
+/* 剛切換時疊在畫面下方的「2/4 大字」。 */
+void dash_draw_page_badge(int page);
 
 /* 沒有資料時的等待畫面。 */
 void dash_draw_waiting(const dash_link_t *link, uint32_t now_ms);
