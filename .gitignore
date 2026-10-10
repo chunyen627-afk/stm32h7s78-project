@@ -31,6 +31,11 @@ shots/*.raw
 # scripts/setup.sh 會在缺少時自動產生。
 projects/album/core/font_zh.c
 projects/album/core/font_zh.h
+# 賽車儀表的字型：建置時由 tools/ 產生。數字字型是 Windows 內建 Bahnschrift
+# 渲染出來的，1.3MB 而且不在公開倉庫散布
+projects/racedash/core/font_zh.*
+projects/racedash/core/numfont.*
+projects/racedash/test/*.exe
 
 # 韌體包位置（舊版 album 用過，已不需要）
 .cube_path

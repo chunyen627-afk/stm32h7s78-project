@@ -11,6 +11,7 @@
 | [projects/usbdrive](projects/usbdrive) | 隨身碟模式：相簿的第二個 app，USB1 插上電腦就把 SD 卡直接掛給電腦 |
 | [projects/usbaudio](projects/usbaudio) | USB 無線耳機的開發治具與量測記錄（功能已整合進相簿）|
 | [projects/video](projects/video) | MJPEG 影片工具鏈：mp4 轉檔、獨立播放器、透過 ST-LINK 寫 SD 卡 |
+| [projects/racedash](projects/racedash) | 賽車儀表：PC 玩賽車遊戲時當 7 吋副儀表，SimHub 經 USB 送遙測（開發中）|
 
 ## 目錄結構
 
