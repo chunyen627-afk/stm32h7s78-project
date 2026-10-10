@@ -76,8 +76,8 @@ for it in $ITEMS; do
     "$CLI" -c port=SWD mode=UR -el "$EL" -w "$DIR/$F" "$A" |
         grep -iE "error|complete" || true
 
-    "$CLI" -c port=SWD mode=UR -el "$EL" -r "$A" "$SIZE" "$TMP/got.bin" \
-        >/dev/null 2>&1
+    # 一行寫完，不用行尾的反斜線：Windows 行尾下續行會失效（build.sh 踩過）。
+    "$CLI" -c port=SWD mode=UR -el "$EL" -r "$A" "$SIZE" "$TMP/got.bin" >/dev/null 2>&1
     python - "$DIR/$F" "$TMP/got.bin" "$A" <<'PY' || FAIL=1
 import sys
 want = open(sys.argv[1], 'rb').read()
