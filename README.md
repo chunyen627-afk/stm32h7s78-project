@@ -7,9 +7,10 @@
 | 專案 | 說明 |
 |---|---|
 | [projects/tetris](projects/tetris) | 直立版俄羅斯方塊，繁體中文介面，超任風格觸控手把 |
-| [projects/album](projects/album) | 電子相簿，讀 SD 卡照片輪播（FAT32／exFAT），全觸控操作、我的最愛，也能播 MJPEG 影片 |
-| [projects/video](projects/video) | MJPEG 影片播放與工具鏈：mp4 轉檔、SD 卡／外部 Flash 兩種來源、透過 ST-LINK 寫卡 |
-| [projects/usbdrive](projects/usbdrive) | 隨身碟模式：USB1 插上電腦就把 SD 卡直接掛給電腦，不用拔卡 |
+| [projects/album](projects/album) | 電子相簿，讀 SD 卡照片輪播（FAT32／exFAT），全觸控操作、我的最愛，也能播 MJPEG 影片（含音軌、USB 無線耳機）|
+| [projects/usbdrive](projects/usbdrive) | 隨身碟模式：相簿的第二個 app，USB1 插上電腦就把 SD 卡直接掛給電腦 |
+| [projects/usbaudio](projects/usbaudio) | USB 無線耳機的開發治具與量測記錄（功能已整合進相簿）|
+| [projects/video](projects/video) | MJPEG 影片工具鏈：mp4 轉檔、獨立播放器、透過 ST-LINK 寫 SD 卡 |
 
 ## 目錄結構
 
@@ -28,17 +29,18 @@ cube/                 ST 韌體包 STM32CubeH7RS（gitignore，所有專案共�
 `cube/` 有 540MB，只放一份。任何專案的 `scripts/setup.sh` 都會抓進來，
 已經有了就跳過。
 
-## 換新板子：直接燒預編譯檔
+## 燒回某個專案（或換新板子）
 
-不想裝 540MB 的韌體包與 CubeIDE 的話，[firmware/](firmware) 裡有可以直上的
-燒錄檔：
+[firmware/](firmware) 存了每個專案的完整快照（bootloader + app），
+一行燒回，不需要 CubeIDE 與 540MB 的韌體包：
 
 ```bash
-./firmware/flash.sh --boot     # 新板子第一次：bootloader + 相簿
-./firmware/flash.sh            # 之後只更新相簿
+./firmware/restore.sh 相簿           # 含影片播放、USB 隨身碟、USB 耳機
+./firmware/restore.sh 俄羅斯方塊
+./firmware/restore.sh 影片燒卡工具
 ```
 
-硬體前提、PSRAM 時脈要不要改回 200MHz，見 [firmware/README.md](firmware/README.md)。
+專案怎麼分、各燒到哪、硬體前提，見 [firmware/README.md](firmware/README.md)。
 
 ## 建置
 
