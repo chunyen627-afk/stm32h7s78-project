@@ -1,119 +1,69 @@
 /**
  * 賽車儀表：SimHub 經 ST-LINK 的虛擬 COM 埠（UART4）送遙測，畫在 7 吋螢幕上。
  *
- * 資料格式是 DSH1（沿用 caa1211/esp32-gt7-dashboard，MIT），SimHub 那邊用
- * Custom Serial devices 外掛、公式在 projects/racedash/simhub/。
+ * 畫面整個是原作（caa1211/esp32-gt7-dashboard，MIT）：資料處理、七個主題、
+ * 觸控選單都是原作的程式碼，一行不改，畫在 320x240 的畫布上（gt7dash/）。
+ * 這裡只負責：收序列埠的行交給原作、跑原作的主迴圈、把畫布放大兩倍貼到
+ * 800x480 面板正中央（左右各留 80 像素黑邊），以及把觸控座標換算回 320x240。
  *
- * 螢幕初始化、雙緩衝、垂直消隱換頁照搬 projects/tetris 驗證過的做法
- * （為什麼這樣寫的說明在那邊的 game_main.c），差別是這裡用橫向 800x480。
+ * 螢幕初始化、雙緩衝、垂直消隱換頁照搬 projects/tetris 驗證過的做法。
  */
 #include "main.h"
 #include "stm32h7s78_discovery.h"
 #include "stm32h7s78_discovery_lcd.h"
 #include "stm32h7s78_discovery_ts.h"
 
-#include "gfx.h"
-#include "dsh1.h"
-#include "dash.h"
 #include "serial.h"
+#include "gt7dash.h"
 
+#include <stdio.h>
 #include <string.h>
 
-void dma2d_init(void);
-void dma2d_wait(void);
-void dma2d_fill(uint16_t *dst, int px, int py, int pw, int ph, uint16_t color);
-
+#define PHYS_W     800
+#define PHYS_H     480
 #define FB0_ADDR   LCD_LAYER_0_ADDRESS   /* 0x90000000，PSRAM */
 #define FB1_ADDR   LCD_LAYER_1_ADDRESS   /* 0x90200000 */
+#define SCALE      2                     /* 320x240 -> 640x480 */
+#define OFF_X      ((PHYS_W - GT7DASH_W * SCALE) / 2)
 
 #define SERIAL_BAUD   115200u
-#define STALE_MS      2000u     /* 這麼久沒收到有效的一行就回等待畫面 */
 
-/* 狀態放 DTCM，重置不會洗掉，用 SWD 讀得到（相簿黑盒子同一個位置，
- * 兩個專案不會同時在板子上）。[0] 魔術字 "RDSH"、[1] tick、[2] 收到的位元組、
- * [3] 有效行、[4] 無效行、[5] 畫了幾格、[6] 最後的序號、[7] 一格畫多少週期、
- * [8] 序列埠溢位、[9] 太長被丟的行、[11] 展示模式、[12] SWD 切頁請求、[13] 觸控切頁次數、
- * [14] 目前頁面（0x9A6E0000 | 頁），開機時沿用 —— 重置後還記得選哪頁、
- *      斷電才回第一頁（DTCM 斷電是亂數，所以要有識別碼） */
+/* 狀態放 DTCM，重置不會洗掉，用 SWD 讀得到。
+ * [0] "RDSH"  [1] tick  [2] 收到的位元組  [3] 原作判為有效的行  [4] 無效的行
+ * [5] 畫了幾格  [7] 一格多少 CPU 週期（原作 + 放大貼圖）  [8] 序列埠溢位
+ * [9] 太長被丟的行  [10] 堆積用了多少（PSRAM）
+ * [11] 寫 "DEMO" 就由板子自己產生跑圈資料（不用遊戲、不佔 COM 埠）
+ * [12] 寫 0x54480000 | 主題（0~6）直接切主題（截圖驗證用）
+ * [15] 寫 "FROZ" 停止貼圖，讀 framebuffer 截圖時用 */
 #define BOX ((volatile uint32_t *)0x20004020u)
+#define DEMO_MAGIC  0x44454D4Fu
+#define FROZ_MAGIC  0x5A4F5246u
 
 static uint32_t g_front;
 
-#define PAGE_TAG    0x9A6E0000u
-#define BADGE_MS    1200u       /* 切頁後名稱顯示多久 */
-#define TOUCH_MS    40u         /* 觸控輪詢間隔（每格都問 I2C 沒必要） */
-#define LONG_MS     700u        /* 按住這麼久叫出選單 */
-#define MENU_MS     8000u       /* 選單沒動作多久自己關 */
+/* ------------------------------------------------------------------ */
+/* 堆積放 PSRAM                                                         */
+/* ------------------------------------------------------------------ */
+/* 原作會開一張 320x240 的主畫布（150KB）加好幾張小畫布，還有大量 String，
+ * 內部 SRAM 不夠放。PSRAM 前 4MB 是兩塊 framebuffer，之後的空間給堆積。
+ * newlib 的 malloc 透過 _sbrk 要記憶體；定義在這裡會蓋過 libnosys 的版本。 */
+#define HEAP_START  0x90400000u
+#define HEAP_END    0x91000000u
 
-/* 展示模式：SWD 寫 BOX[11] = "DEMO"（0x44454D4F）就由板子自己產生跑圈資料，
- * 不用開遊戲、也不用佔 COM 埠（SimHub 開著時電腦端的 fake_simhub.ps1 用不了）。
- * 動作跟 fake_simhub.ps1 一樣：加速換檔、偶爾煞車。 */
-#define DEMO_MAGIC  0x44454D4Fu
-
-static void demo_fill(dsh1_t *d, uint32_t now)
+void *_sbrk(ptrdiff_t incr)
 {
-    static uint32_t last;
-    static int32_t  rpm = 3000;
-    static int      gear = 1;
-    uint32_t        t = now % 12000u;
+    static uint8_t *brk = (uint8_t *)HEAP_START;
+    uint8_t        *prev = brk;
 
-    if (now - last < 100u) { return; }      /* 跟 SimHub 一樣一秒 10 次 */
-    last = now;
-    if (t < 9000u) {
-        d->throttle = 100; d->brake = 0;
-        rpm += 900;
-        if (rpm > 8200 && gear < 6) { gear++; rpm = 5600; }
-        if (rpm > 8400) { rpm = 8400; }
-    } else {
-        d->throttle = 0; d->brake = 85;
-        rpm -= 1200;
-        if (rpm < 4200 && gear > 2) { gear--; rpm = 6800; }
-        if (rpm < 2000) { rpm = 2000; }
-    }
-    d->seq++;
-    d->running     = true;
-    d->gear        = (char)('0' + gear);
-    d->rpm         = rpm;
-    d->rpm_pct     = rpm * 100 / 8500;
-    d->redline_pct = 92;
-    d->speed       = gear * 38 + (rpm - 2000) * 40 / 6500;
-    d->lap_ms[0]   = (int32_t)(now % 84000u);
-    d->lap_ms[1]   = 84631;
-    d->lap_ms[2]   = 83912;
-    d->fuel_pct    = 96;
-    d->fuel_laps_x10 = 128;
-    d->position    = 5;
-    d->lap         = 3;
-    d->laps_total  = 10;
-    d->tc          = (t > 2000u && t < 2600u) ? 1 : 0;
-    d->abs         = (t > 9400u && t < 10200u) ? 1 : 0;
-    d->lap_invalid = 0;
-    d->tyre_x10[0] = 784; d->tyre_x10[1] = 852;
-    d->tyre_x10[2] = 961; d->tyre_x10[3] = 1093;
+    if ((uint32_t)(brk + incr) > HEAP_END) { return (void *)-1; }
+    brk += incr;
+    BOX[10] = (uint32_t)(brk - (uint8_t *)HEAP_START);
+    return prev;
 }
 
-static bool touch_init(void)
-{
-    TS_Init_t ts;
-
-    ts.Width       = PHYS_W;
-    ts.Height      = PHYS_H;
-    ts.Orientation = TS_SWAP_NONE;
-    ts.Accuracy    = 2;
-    return BSP_TS_Init(0, &ts) == BSP_ERROR_NONE;
-}
-
-/* 讀一次觸控。座標是面板座標（橫向 800x480，跟畫面一致）。 */
-static bool touch_read(int *x, int *y)
-{
-    TS_State_t st;
-
-    if (BSP_TS_GetState(0, &st) != BSP_ERROR_NONE || !st.TouchDetected) { return false; }
-    *x = (int)st.TouchX;
-    *y = (int)st.TouchY;
-    return true;
-}
-
+/* ------------------------------------------------------------------ */
+/* 螢幕                                                                 */
+/* ------------------------------------------------------------------ */
 static void cycle_counter_init(void)
 {
     CoreDebug->DEMCR |= CoreDebug_DEMCR_TRCENA_Msk;
@@ -121,8 +71,8 @@ static void cycle_counter_init(void)
     DWT->CTRL |= DWT_CTRL_CYCCNTENA_Msk;
 }
 
-/* framebuffer 設成 write-through：CPU 寫的東西要立刻落到 PSRAM，
- * LTDC 繞過快取直接讀（tetris 的 game_main.c 有完整說明）。 */
+/* framebuffer 設成 write-through：CPU 寫的東西要立刻落到 PSRAM，LTDC 繞過
+ * 快取直接讀（tetris 的 game_main.c 有完整說明）。只蓋前 4MB，堆積不受影響。 */
 static void framebuffer_mpu_init(void)
 {
     MPU_Region_InitTypeDef mpu = {0};
@@ -157,163 +107,248 @@ static void screen_init(void)
     BSP_LCD_SetLayerAddress(0, 0, FB0_ADDR);
     BSP_LCD_Reload(0, BSP_LCD_RELOAD_NONE);
     BSP_LCD_DisplayOn(0);
-
     g_front = 0;
-    gfx_set_orientation(true);                   /* 儀表是橫的：800x480 */
-    gfx_set_framebuffer((uint16_t *)FB1_ADDR);
+}
+
+static uint16_t *back_buffer(void)
+{
+    return (uint16_t *)(g_front ? FB0_ADDR : FB1_ADDR);
 }
 
 static void present(void)
 {
-    dma2d_wait();
     LTDC_Layer1->CFBAR = g_front ? FB0_ADDR : FB1_ADDR;
     LTDC->SRCR = LTDC_SRCR_VBR;
     for (uint32_t guard = 0; guard < 2000000u; guard++) {
         if ((LTDC->SRCR & LTDC_SRCR_VBR) == 0u) { break; }
     }
     g_front ^= 1u;
-    gfx_set_framebuffer((uint16_t *)(g_front ? FB0_ADDR : FB1_ADDR));
 }
+
+/* 原作的 320x240 畫布放大兩倍貼到面板正中央。畫布是 LovyanGFX 的 swap565
+ * （高位元組在前），面板要的是一般 RGB565，所以每個像素要對調位元組。
+ * 一個像素變成橫向兩個：一次寫 32 位元，兩列共用同一份。 */
+static void blit_canvas(void)
+{
+    const uint16_t *src = gt7dash_canvas();
+    uint16_t       *fb = back_buffer();
+
+    if (!src) { return; }
+    for (int y = 0; y < GT7DASH_H; y++) {
+        uint32_t *d0 = (uint32_t *)(fb + (y * SCALE) * PHYS_W + OFF_X);
+        uint32_t *d1 = (uint32_t *)(fb + (y * SCALE + 1) * PHYS_W + OFF_X);
+        const uint16_t *s = src + y * GT7DASH_W;
+
+        for (int x = 0; x < GT7DASH_W; x++) {
+            uint16_t v = (uint16_t)((s[x] >> 8) | (s[x] << 8));
+            uint32_t two = ((uint32_t)v << 16) | v;
+            d0[x] = two;
+            d1[x] = two;
+        }
+    }
+}
+
+/* ------------------------------------------------------------------ */
+/* 給原作的平台功能：觸控、背光、設定                                     */
+/* ------------------------------------------------------------------ */
+static bool g_have_touch;
+
+bool racedash_touch(int *x, int *y)
+{
+    TS_State_t st;
+    int        tx, ty;
+
+    if (!g_have_touch) { return false; }
+    if (BSP_TS_GetState(0, &st) != BSP_ERROR_NONE || !st.TouchDetected) { return false; }
+    /* 面板座標 -> 畫布座標：扣掉左邊黑邊、除以放大倍率。點到黑邊就貼齊畫布邊緣。 */
+    tx = ((int)st.TouchX - OFF_X) / SCALE;
+    ty = (int)st.TouchY / SCALE;
+    if (tx < 0) { tx = 0; }
+    if (tx >= GT7DASH_W) { tx = GT7DASH_W - 1; }
+    if (ty >= GT7DASH_H) { ty = GT7DASH_H - 1; }
+    *x = tx;
+    *y = ty;
+    return true;
+}
+
+/* 原作給 0~255。0 要把背光腳切成 GPIO 拉低：BSP 的 0% 會整數下溢反而全亮
+ * （board-notes 14.2，相簿的 brightness_set 同一套）。 */
+void racedash_backlight(unsigned char b)
+{
+    GPIO_InitTypeDef bl = {0};
+    uint32_t         pct = ((uint32_t)b * 100u + 254u) / 255u;
+
+    bl.Pull  = GPIO_NOPULL;
+    bl.Speed = GPIO_SPEED_FREQ_MEDIUM;
+    bl.Pin   = LCD_BL_CTRL_PIN;
+    if (pct == 0u) {
+        bl.Mode = GPIO_MODE_OUTPUT_PP;
+        HAL_GPIO_Init(LCD_BL_CTRL_GPIO_PORT, &bl);
+        HAL_GPIO_WritePin(LCD_BL_CTRL_GPIO_PORT, LCD_BL_CTRL_PIN, GPIO_PIN_RESET);
+        return;
+    }
+    bl.Mode      = GPIO_MODE_AF_PP;
+    bl.Alternate = LCD_LPTIMx_CHANNEL_AF;
+    HAL_GPIO_Init(LCD_BL_CTRL_GPIO_PORT, &bl);
+    (void)BSP_LCD_SetBrightness(0, pct);
+}
+
+/* 原作的設定（主題、亮度、觸控方向、連線方式）原本存在 ESP32 的 NVS。
+ * 這裡放 DTCM：重置後還在，斷電才會回預設。 */
+#define PREF_MAGIC  0x50524546u   /* "PREF" */
+#define PREF_MAX    16
+typedef struct {
+    uint32_t magic;
+    struct { char key[12]; uint8_t used, value; } e[PREF_MAX];
+} prefs_t;
+#define PREFS ((volatile prefs_t *)0x20005000u)
+
+static void prefs_check(void)
+{
+    if (PREFS->magic != PREF_MAGIC) {
+        memset((void *)PREFS, 0, sizeof(prefs_t));
+        PREFS->magic = PREF_MAGIC;
+    }
+}
+
+int racedash_pref_get(const char *key, unsigned char *value)
+{
+    prefs_check();
+    for (int i = 0; i < PREF_MAX; i++) {
+        if (PREFS->e[i].used && strncmp((const char *)PREFS->e[i].key, key, 11) == 0) {
+            *value = PREFS->e[i].value;
+            return 1;
+        }
+    }
+    return 0;
+}
+
+void racedash_pref_put(const char *key, unsigned char value)
+{
+    int free_i = -1;
+
+    prefs_check();
+    for (int i = 0; i < PREF_MAX; i++) {
+        if (PREFS->e[i].used && strncmp((const char *)PREFS->e[i].key, key, 11) == 0) {
+            PREFS->e[i].value = value;
+            return;
+        }
+        if (!PREFS->e[i].used && free_i < 0) { free_i = i; }
+    }
+    if (free_i >= 0) {
+        strncpy((char *)PREFS->e[free_i].key, key, 11);
+        PREFS->e[free_i].key[11] = 0;
+        PREFS->e[free_i].value = value;
+        PREFS->e[free_i].used = 1;
+    }
+}
+
+void racedash_pref_clear(void)
+{
+    memset((void *)PREFS, 0, sizeof(prefs_t));
+    PREFS->magic = PREF_MAGIC;
+}
+
+/* ------------------------------------------------------------------ */
+/* 展示模式：板子自己產生一行 DSH1（跟 tools/fake_simhub.ps1 一樣的動作）  */
+/* ------------------------------------------------------------------ */
+static void demo_line(char *out, int cap, uint32_t now)
+{
+    static uint32_t seq;
+    static int32_t  rpm = 3000;
+    static int      gear = 1;
+    uint32_t        t = now % 12000u;
+    int             thr, brk, speed;
+    uint32_t        lap = now % 84000u;
+
+    if (t < 9000u) {
+        thr = 100; brk = 0;
+        rpm += 900;
+        if (rpm > 8200 && gear < 6) { gear++; rpm = 5600; }
+        if (rpm > 8400) { rpm = 8400; }
+    } else {
+        thr = 0; brk = 85;
+        rpm -= 1200;
+        if (rpm < 4200 && gear > 2) { gear--; rpm = 6800; }
+        if (rpm < 2000) { rpm = 2000; }
+    }
+    speed = gear * 38 + (rpm - 2000) * 40 / 6500;
+    snprintf(out, (size_t)cap,
+             "DSH1;%lu;1;%d;%d;%ld;%ld;92;%02lu:%02lu.%03lu;01:24.631;01:23.912;12.8;5;3;10;96;%d;%d;0;0;0;78.4;85.2;96.1;109.3",
+             (unsigned long)++seq, speed, gear, (long)rpm, (long)(rpm * 100 / 8500),
+             (unsigned long)(lap / 60000u), (unsigned long)((lap / 1000u) % 60u),
+             (unsigned long)(lap % 1000u), thr, brk);
+}
+
+/* ------------------------------------------------------------------ */
+/* 主迴圈                                                               */
+/* ------------------------------------------------------------------ */
+void gt7dash_set_theme(int theme);   /* port.cpp，除錯用 */
 
 void racedash_run(void)
 {
-    static char   line[512];
-    static char   work[512];
-    static dsh1_t tel;
-    static dsh1_t demo;
-    dash_link_t   link = {0};
-    uint32_t      last_ok = 0;
-    bool          have = false;
+    static char line[512];
+    uint32_t    demo_next = 0;
 
-    int           page = 0;
-    uint32_t      badge_until = 0, next_touch = 0;
-    bool          have_touch;
-    /* 觸控狀態機：放開才判斷是「點一下」；按住超過 LONG_MS 就開選單。
-     * 電容觸控按著會偶爾漏報（board-notes 14.7），連續 3 次讀不到才算放開。 */
-    bool          pressing = false, long_fired = false, menu = false;
-    int           up_count = 0, press_x = 0, press_y = 0;
-    uint32_t      press_t = 0, menu_until = 0;
-
-    if ((BOX[14] & 0xFFFF0000u) == PAGE_TAG && (BOX[14] & 0xFFFFu) < DASH_PAGES) {
-        page = (int)(BOX[14] & 0xFFFFu);
+    for (int i = 0; i < 16; i++) {
+        if (i != 11) { BOX[i] = 0u; }     /* 展示模式的請求跨重置保留 */
     }
-    for (int i = 0; i < 16; i++) { BOX[i] = 0u; }
-    BOX[0]  = 0x52445348u;                       /* "RDSH" */
-    BOX[14] = PAGE_TAG | (uint32_t)page;
+    BOX[0] = 0x52445348u;                 /* "RDSH" */
 
     cycle_counter_init();
     framebuffer_mpu_init();
     screen_init();
-    dma2d_init();
-    gfx_set_fill_hw(dma2d_fill);
-    gfx_set_sync_hw(dma2d_wait);
 
+    {
+        TS_Init_t ts;
+
+        ts.Width       = PHYS_W;
+        ts.Height      = PHYS_H;
+        ts.Orientation = TS_SWAP_NONE;
+        ts.Accuracy    = 2;
+        g_have_touch = (BSP_TS_Init(0, &ts) == BSP_ERROR_NONE);
+    }
     if (!serial_init(SERIAL_BAUD)) {
         Error_Handler();
     }
-    have_touch = touch_init();   /* 觸控起不來也照樣顯示儀表，只是不能切頁 */
+
+    gt7dash_init();
 
     for (;;) {
         uint32_t now = HAL_GetTick();
         int      n;
 
-
         while ((n = serial_read_line(line, sizeof(line))) >= 0) {
-            if (n == 0) { continue; }
-            memcpy(work, line, (size_t)n + 1u);  /* 解析會切開字串，留原文好除錯 */
-            if (dsh1_parse(work, &tel)) {
-                /* 還沒跑完一圈時 SimHub 把上一圈／最佳送成 0:00.000（EVO 實測），
-                 * 畫成 -:--.--- 才不會像是跑了一圈零秒。目前這圈是 0 是合理的。 */
-                if (tel.lap_ms[1] == 0) { tel.lap_ms[1] = DSH1_NA; }
-                if (tel.lap_ms[2] == 0) { tel.lap_ms[2] = DSH1_NA; }
-                link.lines_ok++;
-                last_ok = now;
-                have = true;
-                BOX[6] = tel.seq;
-            } else {
-                link.lines_bad++;
-            }
+            if (n == 0 || BOX[11] == DEMO_MAGIC) { continue; }
+            if (gt7dash_feed(line)) { BOX[3]++; } else { BOX[4]++; }
         }
-        link.rx_bytes = g_serial_rx_bytes;
+        if (BOX[11] == DEMO_MAGIC && (int32_t)(now - demo_next) >= 0) {
+            char demo[160];
 
-        /* 截圖用：SWD 寫 BOX[15] = "FROZ" 就停止重畫。從板子讀一整張畫面要
-         * 將近一秒，期間儀表會重畫幾十次（每次先清黑再畫），讀到的是很多格
-         * 混在一起的橫紋。凍住之後兩塊 framebuffer 都是完整的一格。 */
-        if (BOX[15] == 0x5A4F5246u) {
-            BOX[1] = now;          /* 序列埠照收（上面），只是不畫，不然緩衝會滿 */
-            continue;
+            demo_next = now + 100u;          /* 跟 SimHub 免費版一樣一秒 10 次 */
+            demo_line(demo, sizeof(demo), now);
+            if (gt7dash_feed(demo)) { BOX[3]++; } else { BOX[4]++; }
         }
-
-        /* 除錯：SWD 寫 BOX[12] = 0x50470000 | 頁 就切到那一頁；寫 "MENU"（0x4D454E55）
-         * 就叫出選單 —— 不用人去點螢幕也能截圖驗證。 */
-        if (BOX[12] == 0x4D454E55u) {
+        if ((BOX[12] & 0xFFFF0000u) == 0x54480000u) {
+            gt7dash_set_theme((int)(BOX[12] & 0xFFu));
             BOX[12] = 0u;
-            menu = true;
-            menu_until = now + MENU_MS;
-        }
-        if ((BOX[12] & 0xFFFF0000u) == 0x50470000u && (BOX[12] & 0xFFu) < DASH_PAGES) {
-            page = (int)(BOX[12] & 0xFFu);
-            BOX[12] = 0u;
-            BOX[14] = PAGE_TAG | (uint32_t)page;
-        }
-
-        if (have_touch && (int32_t)(now - next_touch) >= 0) {
-            int tx, ty;
-
-            next_touch = now + TOUCH_MS;
-            if (touch_read(&tx, &ty)) {
-                up_count = 0;
-                if (!pressing) {
-                    pressing = true; long_fired = false;
-                    press_t = now; press_x = tx; press_y = ty;
-                } else if (!long_fired && !menu && (now - press_t) >= LONG_MS) {
-                    long_fired = true;            /* 長按：開選單，放開時不再換頁 */
-                    menu = true;
-                    menu_until = now + MENU_MS;
-                }
-            } else if (pressing && ++up_count >= 3) {
-                pressing = false;
-                if (!long_fired) {
-                    int pick = menu ? dash_menu_hit(press_x, press_y) : -1;
-
-                    if (menu) {
-                        menu = false;             /* 點到選項就套用，點空白處只關選單 */
-                        if (pick >= 0) { page = pick; badge_until = now + BADGE_MS; }
-                    } else {
-                        page = (page + 1) % DASH_PAGES;
-                        badge_until = now + BADGE_MS;
-                    }
-                    BOX[13]++;
-                    BOX[14] = PAGE_TAG | (uint32_t)page;
-                }
-            }
-            if (menu && (int32_t)(now - menu_until) >= 0) { menu = false; }
         }
 
         {
             uint32_t t0 = DWT->CYCCNT;
 
-            if (BOX[11] == DEMO_MAGIC) {
-                demo_fill(&demo, now);         /* 自己一份，不跟 SimHub 的真資料混在一起 */
-                dash_draw(page, &demo, now);
-            } else if (have && tel.running && (now - last_ok) < STALE_MS) {
-                dash_draw(page, &tel, now);
-            } else {
-                dash_draw_waiting(&link, now);
+            gt7dash_step();
+            if (BOX[15] != FROZ_MAGIC) {
+                blit_canvas();
+                BOX[7] = DWT->CYCCNT - t0;
+                present();
+                /* 原作只重畫有變的部分，所以畫布永遠是完整的一格；
+                 * 換頁之後兩塊 framebuffer 都要是最新的，下一圈會再貼一次。 */
             }
-            if (menu) {
-                dash_draw_menu(page);
-            } else if ((int32_t)(badge_until - now) > 0) {
-                dash_draw_page_badge(page);
-            }
-            BOX[7] = DWT->CYCCNT - t0;
         }
-        present();
 
         BOX[1] = now;
-        BOX[2] = link.rx_bytes;
-        BOX[3] = link.lines_ok;
-        BOX[4] = link.lines_bad;
+        BOX[2] = g_serial_rx_bytes;
         BOX[5]++;
         BOX[8] = g_serial_rx_overrun;
         BOX[9] = g_serial_line_dropped;

@@ -28,7 +28,7 @@ python "$ROOT/tools/patch_project.py"
 
 echo "==> 複製儀表原始碼"
 mkdir -p "$PROJ/Appli/Dash"
-cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/*.c "$ROOT"/app_src/*.h "$REPO"/shared/gfx.c "$REPO"/shared/gfx.h "$PROJ/Appli/Dash/"
+cp "$ROOT"/app_src/*.c "$ROOT"/app_src/*.h "$ROOT"/gt7dash/gt7dash.h "$PROJ/Appli/Dash/"
 
 echo
 echo "完成。接著執行 scripts/build.sh 編譯、scripts/flash.sh 燒錄。"

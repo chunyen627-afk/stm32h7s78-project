@@ -1,135 +1,125 @@
 # 賽車儀表（RaceDash）
 
-PC 玩賽車遊戲時，把板子當成 7 吋的副儀表：換檔燈、檔位、車速、轉速、
-圈速、油量、TC／ABS、胎溫、油門煞車。資料由 PC 上的 **SimHub** 從遊戲讀出，
+PC 玩賽車遊戲時，把板子當成 7 吋副儀表。資料由 PC 上的 **SimHub** 從遊戲讀出，
 經 USB 送給板子。
 
-移植自 [caa1211/esp32-gt7-dashboard](https://github.com/caa1211/esp32-gt7-dashboard)
-（MIT License）的 SimHub 模式：資料格式（DSH1）與 SimHub 公式沿用，畫面照
-800x480 重新排版。原專案的「PS5 GT7 Wi-Fi 直連」模式沒有移植 —— 這塊板子沒有 Wi-Fi。
+**畫面就是原作**：[caa1211/esp32-gt7-dashboard](https://github.com/caa1211/esp32-gt7-dashboard)
+（MIT License）的整個儀表 App —— 資料處理、七個主題、觸控選單、設定畫面 ——
+**原始碼一行不改**編進板子，連同它用的繪圖函式庫 LovyanGFX（FreeBSD License）。
+原作畫在 320x240，這裡整數放大兩倍到 640x480，置中在 800x480 面板上（左右各 80
+像素黑邊），所以配色、字型、間距都跟原作一模一樣。
 
-## 十種儀表：點一下換下一種、長按叫出選單
+原作的「PS5 GT7 Wi-Fi 直連」模式不能用 —— 板子沒有 Wi-Fi。
 
-| | 儀表 | 內容 |
-|---|---|---|
-| 1 | 完整 | 什麼都有：換檔燈、檔位、車速轉速、三個圈速、油量、圈數名次、TC/ABS、胎溫、踏板 |
-| 2 | 大字 | 開車時瞄一眼用：換檔燈、超大檔位、車速、轉速、踏板 |
-| 3 | 圈速 | 目前圈速放最大，上一圈、最佳、差距（上一圈減最佳，快了綠、慢了紅）、圈數、名次 |
-| 4 | 輪胎油量 | 四輪胎溫大格（藍冷、綠適溫、黃偏熱、紅過熱）、油量、可跑圈數、踏板 |
-| 5 | Classic | 白色圓角框、萊姆綠轉速條、黃色液晶檔位 |
-| 6 | GT3 | 深藍框、漸層轉速條、括號包住的大檔位 |
-| 7 | Radar | 圓弧轉速環為核心，兩側遙測 |
-| 8 | Retro | 米色紙底、深色字、液晶數字 |
-| 9 | Mono | 黑底白字、等寬字、分段換檔燈 |
-| 10 | Pocket | Game Boy 黃綠液晶、像素字 |
+## 七個主題
 
-5～10 移植自原專案的同名主題（MIT），從 320x240 照 800x480 重新排版。
+Classic、GT3（預設）、Retro、Radar、Mono、Pocket、Endurance。
 
-- **點一下**螢幕任何地方：換下一種，下方顯示「6/10 GT3」一秒多
-- **按住 0.7 秒**：叫出選單，十種一次列出來，點想要的那個直接套用；點空白處或 8 秒沒動作就關掉
-- 選的頁面重置後還記得，完全斷電才回到第一頁
-
-各主題畫一格的時間（600MHz）：Classic 23ms、GT3 24ms、Radar 21ms，其餘 12～15ms。
-資料每秒只更新 10 次，所以 40fps 跟 60fps 看不出差別。
+**切換方法照原作**：螢幕亮著時點一下叫出原作的設定畫面，選 **SELECT THEME**。
+主題、亮度記在 DTCM，板子重置後還在，**完全斷電會回到 GT3**（原作存在 ESP32 的
+NVS，這塊板子還沒接上永久儲存）。
 
 ## 接線
 
-**只要一條線：板子的 CN7（ST-LINK）接電腦。** 它在電腦上會出現一個
+**只要一條線：板子的 CN7（ST-LINK）接電腦。** 它在電腦上是
 「STMicroelectronics STLink Virtual COM Port」（這台電腦是 COM3），
 供電、燒錄、遙測都走這一條。**要直插電腦**，經過 USB 集線器實測認不到。
 
 ## SimHub 設定
 
-SimHub 是 PC 上免費的賽車遙測軟體，支援 Assetto Corsa、ACC、iRacing、
-F1、Forza 等大部分 PC 賽車遊戲（官網 simhubdash.com）。
+SimHub 是 PC 上免費的賽車遙測軟體（simhubdash.com），支援 Assetto Corsa、
+AC EVO、ACC、iRacing、F1、Forza 等。
 
-1. 設定 → Plugins，啟用 **Custom Serial devices**，左側選單會多出這一項
-2. Custom Serial devices → 新增裝置：
-   - Serial port：ST-LINK 的 COM 埠
-   - Baudrate：**115200**
-3. Update messages → 新增一則：
-   - 勾 **Use JavaScript**
-   - 把 [`simhub/racedash-serial.js`](simhub/racedash-serial.js) **整個檔案**貼進去
-   - 頻率選 10Hz（免費版上限）
-4. 開遊戲，板子會從等待畫面切到儀表
-
-新版 SimHub（9.13）的 Settings 裡已經沒有 Plugins 分頁，啟用功能改在左側選單的
-**Add/remove features**。
+1. 左側選單 **Add/remove features**，打開 **Custom serial devices**
+   （新版 Settings 裡已經沒有 Plugins 分頁）
+2. Custom serial devices → **Add new serial device**：COM 埠選 ST-LINK 那個、Baudrate **115200**
+3. Update messages 的 **EDIT** → 打開 **Use javascript** → 把
+   [`simhub/racedash-serial.js`](simhub/racedash-serial.js) **整個檔案**貼進去
+4. 打開 **Automatic reconnect**
+5. **免費版不會自動切換遊戲**：在 SimHub 先選好要玩的遊戲（例如 AC EVO），
+   沒選對的話板子收得到資料但一直顯示等待
 
 **設定備份**：[`simhub/CustomSerialPlugin.GeneralSettings2.json`](simhub/CustomSerialPlugin.GeneralSettings2.json)
-是這台電腦設定好的完整檔案（COM3、115200、自動重連、公式）。重灌或換電腦時，
-**先從系統匣的 SimHub 圖示選 Exit SimHub**（直接關視窗只會縮到系統匣，而且 SimHub
-結束時才會寫設定檔，會把你複製進去的蓋掉），再把它複製到
-`C:\Program Files (x86)\SimHub\PluginsData\Common\`，然後重開 SimHub。
-COM 埠號不同的話要改檔案裡的 `SerialPortName`。
+是設定好的完整檔案。重灌時**先從系統匣的 SimHub 圖示選 Exit SimHub**（關視窗只會
+縮到系統匣，而且 SimHub 結束時才寫設定檔，會把複製進去的蓋掉），再把它複製到
+`C:\Program Files (x86)\SimHub\PluginsData\Common\`，重開 SimHub。
 
-2026-10-10 實機驗證：SimHub 9.13.2 免費版，每秒穩定 10 行，1066 行零錯誤；
-重開 SimHub 會自己接回板子。
+免費版每秒更新 10 次。
 
-板子的等待畫面會告訴你卡在哪一步：
+## 架構
 
-| 畫面顯示 | 意思 |
-|---|---|
-| 還沒收到任何資料 | SimHub 沒開、COM 埠選錯、或鮑率不是 115200 |
-| 有收到資料但格式不對 | 公式沒貼完整，或沒勾 Use JavaScript |
-| 連線中，遊戲目前沒有在跑 | 一切正常，進賽道就會出現 |
-
-最下面一行 `RX / OK / BAD` 是收到的位元組數、有效行數、無效行數。
-
-**免費版每秒更新 10 次**，車速、檔位夠用，轉速條會有點跳；SimHub 付費版可以更快。
-
-## 不開遊戲也能看：假 SimHub
-
-```bash
-powershell -ExecutionPolicy Bypass -File tools/fake_simhub.ps1              # 送 60 秒模擬跑圈資料到 COM3
-powershell -ExecutionPolicy Bypass -File tools/fake_simhub.ps1 -Seconds 0   # 一直送
-powershell -ExecutionPolicy Bypass -File tools/fake_simhub.ps1 -Bad         # 混入壞資料，驗證不會被弄亂
+```
+SimHub ──USB(COM3)──> UART4 ──> race_main.c ──一行 DSH1──> 原作 SHCustomProtocol
+                                    │                         │（解析、主題、觸控 UI）
+                                    │                         ▼
+                                    │                LovyanGFX 320x240 記憶體畫布
+                                    └── 放大兩倍貼到 framebuffer <───┘
 ```
 
-SimHub 跟這個工具不能同時開同一個 COM 埠。
+| 位置 | 內容 |
+|---|---|
+| `app_src/race_main.c` | 螢幕、序列埠、放大貼圖、觸控座標換算、背光、設定儲存、PSRAM 堆積 |
+| `app_src/serial.c` | UART4 中斷接收、逐行取出 |
+| `gt7dash/orig/` | **原作檔案，不修改**（SHCustomProtocol.h、七個主題、SimHub 解析、GT7 解析器…）|
+| `gt7dash/lgfx/` | LovyanGFX（只取記憶體畫布與字型），三處修補見下 |
+| `gt7dash/compat/` | Arduino／ESP32 相容層：String、Preferences（NVS）、Wi-Fi 空殼、`tft` 畫布 |
+| `gt7dash/port.cpp` | 銜接層：對 C 開 `gt7dash_init/feed/step/canvas` |
+| `gt7dash/build_lib.sh` | 用同一套 ARM 編譯器把上面編成 `libgt7dash.a` |
+| `gt7dash/host/host_dash.cpp` | 電腦端參考渲染器：同一份原作程式碼在電腦上畫成圖，跟板子比對 |
+
+CubeIDE 專案是 C 專案，不會編 C++。原作那一塊另外編成函式庫，由
+`scripts/build.sh` 從 make 命令列帶進連結（`USER_OBJS` / `LIBS`），不必改專案檔。
+
+**LovyanGFX 的修補**（都只在 `LGFX_RACEDASH` 時生效，其他平台不受影響）：
+1. `platforms/racedash/`：新平台，只提供計時與記憶體配置（不接任何面板）
+2. `lgfx_fonts.cpp`：排除 120MB 的中日韓點陣字型（儀表用不到）
+3. `LGFXBase.hpp`：有相容層的 `String` 時打開 `drawString(String, ...)`
+
+**踩過的坑**：
+- 相容層的 `min`/`max` 第一版回傳參照（`decltype(a < b ? a : b)` 在兩個同型別參數時
+  推成參照），回傳的是已經消失的參數 —— GT3 的檔位算出亂數座標、整個不見
+- 範本 `sysmem.c` 的 `_sbrk` 以為堆疊緊接在堆積後面，但這個範本的堆疊在 DTCM，
+  上限比堆積起點還低，**任何 malloc 都失敗**。`patch_project.py` 把它停用，改用
+  `race_main.c` 放在 PSRAM（0x90400000 起）的版本
+
+## 不開遊戲也能看
+
+- **展示模式**：SWD 寫 `0x2000404C = 0x44454D4F`（"DEMO"），板子自己產生跑圈資料
+- **假 SimHub**：`powershell -ExecutionPolicy Bypass -File tools/fake_simhub.ps1`
+  （SimHub 開著時 COM 埠被佔，用不了）
 
 ## 建置與燒錄
 
 ```bash
 ./scripts/setup.sh      # 第一次：從 Template_XIP 建 CubeIDE 專案
-./scripts/build.sh      # 編譯（改過 tools/patch_project.py 的原始碼清單要加 FORCE_IDE=1）
+./scripts/build.sh      # 先編原作函式庫，再編專案（改過原始碼清單要 FORCE_IDE=1）
 ./scripts/flash.sh      # 燒錄（含原廠 bootloader）
 ```
 
-| 檔案 | 內容 |
-|---|---|
-| `app_src/race_main.c` | 初始化、主迴圈、雙緩衝換頁 |
-| `app_src/serial.c` | UART4（ST-LINK 虛擬 COM 埠）中斷接收、逐行取出 |
-| `app_src/dsh1.c` | DSH1 解析與驗證（壞的一行不會蓋掉畫面上的好資料）|
-| `app_src/dash.c` | 畫面 |
-| `app_src/themes.c` | 移植的六個主題（Classic、GT3、Radar、Retro、Mono、Pocket）與圓角框、扇形、像素字等繪圖元件 |
-| `core/numfont.c` | 平滑字型，`tools/gennum.py` 產生：Bahnschrift 數字與英文標籤、Consolas 等寬、自畫的七段液晶、像素字（4 bit 灰度）|
-| `core/font_zh.c` | 標籤用的中文字型，`tools/genfont.py` 自動掃描畫面用到的字 |
-| `test/dsh1_test.c` | 解析器的電腦端測試：`gcc -I../app_src dsh1_test.c ../app_src/dsh1.c && ./a.exe` |
-
 ## 量到的數字
 
-- 通訊：送 137 行（含 19 行故意的壞資料），板子判 118 行有效、19 行無效，一行不差，溢位 0
-- 畫一格約 15ms（600MHz），在面板 60Hz 的 16.7ms 預算內
+- 原作畫圖＋放大貼圖：一格約 11.5ms，面板 60Hz 下每秒約 60 格
+- 堆積（PSRAM）：約 192KB（主畫布 150KB ＋主題用的小畫布、String）
+- SimHub 實機：AC EVO，原作解析器 0 行無效
 
 ## 除錯
 
-狀態寫在 DTCM `0x20004020`（用 SWD `mode=HOTPLUG` 讀，不會重置板子）：
+狀態寫在 DTCM `0x20004020`（SWD `mode=HOTPLUG` 讀，不會重置板子）：
 
 | 格 | 內容 |
 |---|---|
 | 0 | 魔術字 `0x52445348`（"RDSH"）|
-| 1 | tick |
-| 2 / 3 / 4 | 收到的位元組 / 有效行 / 無效行 |
-| 5 | 畫了幾格 |
-| 6 | 最後一行的序號 |
-| 7 | 畫一格花幾個 CPU 週期 |
+| 1 / 2 | tick / 收到的位元組 |
+| 3 / 4 | 原作判為有效 / 無效的行 |
+| 5 / 7 | 畫了幾格 / 一格多少 CPU 週期 |
 | 8 / 9 | 序列埠溢位 / 太長被丟的行 |
-| 11 | 寫 `0x44454D4F`（"DEMO"）開展示模式：板子自己產生跑圈資料，不用遊戲也不佔 COM 埠 |
-| 12 | 寫 `0x50470000 \| 頁` 切到那一頁（0~9）；寫 `0x4D454E55`（"MENU"）叫出選單 |
-| 13 / 14 | 觸控切頁次數 / 目前頁面（`0x9A6E0000 \| 頁`）|
-| 15 | 寫 `0x5A4F5246`（"FROZ"）就停止重畫，截圖用 |
+| 10 | 堆積用了多少 |
+| 11 | 寫 "DEMO" 開展示模式 |
+| 12 | 寫 `0x54480000 \| 主題` 切主題（0 Classic、1 GT3、2 Retro、3 Radar、4 Mono、5 Pocket、6 Endurance）|
+| 15 | 寫 "FROZ" 停止貼圖，截圖用 |
 
-**截圖要先凍結。** 從板子讀一整張畫面要將近一秒，期間儀表重畫幾十次
-（每次先清黑再畫），沒凍結的話讀到的是很多格混在一起的橫紋 —— 看起來像
-螢幕壞了，其實是截圖的問題。
+**截圖要先凍結**，不然讀到的是很多格混在一起。設定（主題、亮度）存在 DTCM `0x20005000`。
+
+## 下一步（使用者要求的順序：先一模一樣，再優化）
+
+高解析度、去鋸齒：原作座標與排版不變，但改用 2 倍解析度、抗鋸齒重畫文字與圓弧。

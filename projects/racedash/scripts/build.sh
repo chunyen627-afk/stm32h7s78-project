@@ -14,20 +14,18 @@ GCC_BIN="/c/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.
 
 [ -d "$PROJ" ] || { echo "專案不存在，請先跑 scripts/setup.sh"; exit 1; }
 
-echo "==> 產生字型"
-# 中文標籤字型每次重掃（很快），畫面上的中文改了就自動補字。
-(cd "$ROOT" && python tools/genfont.py >/dev/null)
-# 大數字字型很大，只在沒有、或 gennum.py 改過（例如加了字）時才重產生。
-if [ ! -f "$ROOT/core/numfont.c" ] || [ "$ROOT/tools/gennum.py" -nt "$ROOT/core/numfont.c" ]; then
-    (cd "$ROOT" && PYTHONIOENCODING=utf-8 python tools/gennum.py)
-fi
+echo "==> 原作儀表函式庫（C++）"
+"$ROOT/gt7dash/build_lib.sh"
+LIB="$ROOT/gt7dash/build/libgt7dash.a"
+# 原作用到 C++ 標準函式庫；-u _printf_float 讓 newlib-nano 的 snprintf 印得出小數。
+LINK_LIBS="-lstdc++ -lsupc++ -lm -u _printf_float"
 
 echo "==> 同步原始碼"
-cp "$ROOT"/core/*.c "$ROOT"/core/*.h "$ROOT"/app_src/*.c "$ROOT"/app_src/*.h "$REPO"/shared/gfx.c "$REPO"/shared/gfx.h "$PROJ/Appli/Dash/"
+cp "$ROOT"/app_src/*.c "$ROOT"/app_src/*.h "$ROOT"/gt7dash/gt7dash.h "$PROJ/Appli/Dash/"
 
 if [ -f "$DEBUG_DIR/makefile" ] && [ -z "$FORCE_IDE" ]; then
     echo "==> 編譯（make）"
-    PATH="$GCC_BIN:$PATH" make -C "$DEBUG_DIR" -j8 all 2>&1 | grep -iE "error|warning|No rule|Stop\.|\.elf|^ +[0-9]+ +[0-9]+" || true
+    PATH="$GCC_BIN:$PATH" make -C "$DEBUG_DIR" -j8 all USER_OBJS="$LIB" LIBS="$LINK_LIBS" 2>&1 | grep -iE "error|warning|No rule|Stop\.|\.elf|^ +[0-9]+ +[0-9]+" || true
     exit 0
 fi
 
@@ -37,3 +35,6 @@ echo "==> 首次編譯（CubeIDE headless，順便產生 makefile）"
 WS=$(cygpath -w "C:/STM32CubeIDE/ws_headless_racedash")
 IMPORT=$(cygpath -w "$PROJ/STM32CubeIDE/Appli")
 "$IDE" --launcher.suppressErrors -nosplash -application org.eclipse.cdt.managedbuilder.core.headlessbuild -data "$WS" -import "$IMPORT" -build 'RaceDash_Appli/Debug' 2>&1 | grep -iE "error|warning|Build Finished|Build Failed|^ +[0-9]+ +[0-9]+" || true
+# CubeIDE 自己連結時不知道原作的函式庫，產生 makefile 之後再用 make 正式連結一次。
+echo "==> 連結（make，帶原作函式庫）"
+PATH="$GCC_BIN:$PATH" make -C "$DEBUG_DIR" -j8 all USER_OBJS="$LIB" LIBS="$LINK_LIBS" 2>&1 | grep -iE "error|warning|No rule|Stop\.|\.elf|^ +[0-9]+ +[0-9]+" || true

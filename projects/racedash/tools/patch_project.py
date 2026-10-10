@@ -51,8 +51,9 @@ COMPONENTS = [
     "aps256xx/aps256xx.c", "mx66uw1g45g/mx66uw1g45g.c",
 ]
 
-DASH_SOURCES = ["race_main.c", "dash.c", "themes.c", "dsh1.c", "serial.c", "numfont.c",
-                "gfx.c", "font_zh.c", "dma2d.c"]
+DASH_SOURCES = ["race_main.c", "serial.c"]
+# 畫面是原作的 C++ 程式碼，另外編成 gt7dash/build/libgt7dash.a（gt7dash/build_lib.sh），
+# 由 scripts/build.sh 從 make 命令列帶進連結，不放進這個 C 專案的原始碼清單。
 
 INCLUDES = [
     f"{'../' * 7}Drivers/BSP/STM32H7S78-DK",
@@ -123,6 +124,19 @@ def add_sources():
         items.append((f"Drivers/BSP/Components/{f}",
                       f"{PKG}/Drivers/BSP/Components/{f}"))
 
+    # 拿掉清單裡已經沒有的 Application/Dash 檔（換掉的舊畫面程式碼），
+    # 不然 CubeIDE 產生的 makefile 會去找不存在的檔案。
+    keep = {f"Application/Dash/{f}" for f in DASH_SOURCES}
+    removed = 0
+    for m in list(re.finditer(r"\s*<link>\s*<name>(Application/Dash/[^<]+)</name>.*?</link>", s, re.S)):
+        if m.group(1) not in keep:
+            s = s.replace(m.group(0), "", 1)
+            removed += 1
+    have = set(re.findall(r"<name>([^<]+\.c)</name>", s))
+    if removed:
+        io.open(path, "w", encoding="utf-8").write(s)
+        print(f"  移除過時的原始碼連結: {removed}")
+
     block = "".join(link(n, u) for n, u in items if n not in have)
     added = sum(1 for n, _ in items if n not in have)
     if block:
@@ -181,6 +195,26 @@ def patch_main():
     print("  main.c 已接上 racedash_run()")
 
 
+def disable_template_sbrk():
+    """範本 sysmem.c 的 _sbrk 改名停用，改用 race_main.c 放在 PSRAM 的版本。
+
+    範本假設堆疊緊接在堆積後面，上限算成「_estack - 堆疊大小」；但這個範本
+    的堆疊在 DTCM（0x2000xxxx），比堆積起點（AXI SRAM 0x24xxxxxx）還低，
+    所以任何 malloc 都會回 ENOMEM。原作（C++）一啟動就要配置畫布與 String，
+    不換掉一定跑不起來。"""
+    path = os.path.join(APPLI, "Application", "User", "sysmem.c")
+    if not os.path.isfile(path):
+        print("  sysmem.c 不在，略過")
+        return
+    s = io.open(path, encoding="utf-8").read()
+    if "_sbrk_template_disabled" in s:
+        print("  sysmem.c 已改過")
+        return
+    s = s.replace("void *_sbrk(ptrdiff_t incr)", "void *_sbrk_template_disabled(ptrdiff_t incr)", 1)
+    io.open(path, "w", encoding="utf-8").write(s)
+    print("  sysmem.c 的 _sbrk 已停用（改用 PSRAM 堆積）")
+
+
 def main():
     if not os.path.isdir(PROJ):
         print(f"找不到專案目錄: {PROJ}")
@@ -192,6 +226,7 @@ def main():
     add_sources()
     add_includes()
     patch_main()
+    disable_template_sbrk()
     return 0
 
 
