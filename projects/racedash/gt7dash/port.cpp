@@ -99,11 +99,19 @@ extern "C" int gt7dash_canvas_hi_dirty(int *y0, int *y1)
     return 1;
 }
 
-/* 除錯：直接切主題（0 Classic、1 GT3、2 Retro、3 Radar、4 Mono、5 Pocket、6 Endurance），
- * 跟使用者在原作選單裡選一樣，也會記進設定。截圖驗證時用，不用人去點。 */
+/* 直接切主題（0 Classic、1 GT3、2 Retro、3 Radar、4 Mono、5 Pocket、6 Endurance），
+ * 跟使用者在原作選單裡選一樣，也會記進設定。黑邊的切換按鈕與截圖驗證（BOX[12]）用。 */
 extern "C" void gt7dash_set_theme(int theme)
 {
     if (!s_dash || theme < 0 || theme > 6) { return; }
     s_dash->activeDashboardTheme = static_cast<DashboardTheme>(theme);
     racedash_pref_put("theme", (unsigned char)theme);
+}
+
+extern "C" int gt7dash_step_theme(int dir)
+{
+    if (!s_dash || s_dash->settingsScreen != SHCustomProtocol::SettingsScreen::Closed) { return 0; }
+    int t = ((int)s_dash->activeDashboardTheme + dir + 7) % 7;
+    gt7dash_set_theme(t);
+    return 1;
 }

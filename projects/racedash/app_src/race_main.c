@@ -33,7 +33,7 @@
  * [0] "RDSH"  [1] tick  [2] 收到的位元組  [3] 原作判為有效的行  [4] 無效的行
  * [5] 畫了幾格  [6] 這格貼了幾列  [7] 一格多少 CPU 週期（原作 + 貼圖）
  * [14] 其中貼圖的週期  [16] 開機以來最慢的一格（寫 0 重新量）  [8] 序列埠溢位
- * [17] 展示模式的資料間隔（毫秒，0 = 100；16 = 一秒 60 次）
+ * [17] 展示模式的資料間隔（毫秒，0 = 16 即一秒 60 次；100 = 一秒 10 次）
  * [18] / [19] 掉格數 / 換頁次數（各寫 0 重新數；掉格 = 跟上一格隔超過 20.8ms）
  * [20] 寫 "LOWR" 再重置就不用高解析度（量原作本身的時間）
  * [9] 太長被丟的行  [10] 堆積用了多少（PSRAM）
@@ -216,23 +216,6 @@ static void blit_canvas(void)
 /* ------------------------------------------------------------------ */
 static bool g_have_touch;
 
-bool racedash_touch(int *x, int *y)
-{
-    TS_State_t st;
-    int        tx, ty;
-
-    if (!g_have_touch) { return false; }
-    if (BSP_TS_GetState(0, &st) != BSP_ERROR_NONE || !st.TouchDetected) { return false; }
-    /* 面板座標 -> 畫布座標：扣掉左邊黑邊、除以放大倍率。點到黑邊就貼齊畫布邊緣。 */
-    tx = ((int)st.TouchX - OFF_X) / SCALE;
-    ty = (int)st.TouchY / SCALE;
-    if (tx < 0) { tx = 0; }
-    if (tx >= GT7DASH_W) { tx = GT7DASH_W - 1; }
-    if (ty >= GT7DASH_H) { ty = GT7DASH_H - 1; }
-    *x = tx;
-    *y = ty;
-    return true;
-}
 
 /* 原作給 0~255。0 要把背光腳切成 GPIO 拉低：BSP 的 0% 會整數下溢反而全亮
  * （board-notes 14.2，相簿的 brightness_set 同一套）。 */
@@ -315,38 +298,356 @@ void racedash_pref_clear(void)
 /* ------------------------------------------------------------------ */
 /* 展示模式：板子自己產生一行 DSH1（跟 tools/fake_simhub.ps1 一樣的動作）  */
 /* ------------------------------------------------------------------ */
-static void demo_line(char *out, int cap, uint32_t now, uint32_t period)
-{
-    static uint32_t seq;
-    static int32_t  rpm = 3000;
-    static int      gear = 1;
-    uint32_t        t = now % 12000u;
-    int             thr, brk, speed;
-    uint32_t        lap = now % 84000u;
+/* ------------------------------------------------------------------ */
+/* 展示模式：板子自己模擬跑圈                                           */
+/* ------------------------------------------------------------------ */
+/* 不用遊戲、不用 SimHub 就能看儀表動起來。一圈由直線、煞車、彎道組成：
+ * 直線全油門、轉速到頂升檔；進彎前重煞（ABS 閃）、降檔；彎中半油門；
+ * 出彎低檔 TC 介入。每圈結束更新上一圈／最佳圈、圈數，油量逐圈下降，
+ * 胎溫隨彎道升降，偶爾換名次、偶爾一圈被判無效。
+ * 每段的長度與彎速每圈有一點變化，所以每圈時間都不一樣。 */
+typedef struct {
+    uint16_t ms;        /* 這段的長度 */
+    uint8_t  mode;      /* 0 全油門  1 煞車到 target  2 彎中維持 target */
+    uint8_t  target;    /* 彎速 km/h */
+} demo_seg_t;
 
-    if (t < 9000u) {
-        thr = 100; brk = 0;
-        rpm += (int32_t)(9u * period);      /* 每 0.1 秒 +900，間隔變短就等比例變小 */
-        if (rpm > 8200 && gear < 6) { gear++; rpm = 5600; }
-        if (rpm > 8400) { rpm = 8400; }
-    } else {
-        thr = 0; brk = 85;
-        rpm -= (int32_t)(12u * period);
-        if (rpm < 4200 && gear > 2) { gear--; rpm = 6800; }
-        if (rpm < 2000) { rpm = 2000; }
+static const demo_seg_t k_demo_track[] = {
+    {6500, 0,   0}, {1800, 1,  92}, {2600, 2,  92},
+    {8200, 0,   0}, {1400, 1, 145}, {1800, 2, 145},
+    {5200, 0,   0}, {2200, 1,  68}, {3000, 2,  68},
+    {9800, 0,   0}, {1600, 1, 118}, {2400, 2, 118},
+    {7000, 0,   0}, {1200, 1, 172}, {1500, 2, 172},
+    {4800, 0,   0}, {2000, 1,  84}, {2600, 2,  84},
+    {6000, 0,   0},
+};
+#define DEMO_SEGS    (int)(sizeof(k_demo_track) / sizeof(k_demo_track[0]))
+#define DEMO_LAPS    10
+#define DEMO_MAX_RPM 8500.0f
+
+static struct {
+    bool     started;
+    uint32_t last_now, lap_start, rng;
+    int      seg, gear, lap, pos;
+    uint32_t seg_t, seg_len, last_ms, best_ms;
+    float    target, speed, fuel, tyre[4];
+    bool     invalid, invalid_next;
+} g_sim;
+
+static uint32_t sim_rand(void)
+{
+    g_sim.rng = g_sim.rng * 1664525u + 1013904223u;
+    return g_sim.rng >> 8;
+}
+
+/* 進到第 seg 段：長度 ±5%、彎速 ±6% 的變化 */
+static void sim_enter_segment(int seg)
+{
+    const demo_seg_t *d = &k_demo_track[seg];
+
+    g_sim.seg = seg;
+    g_sim.seg_t = 0;
+    g_sim.seg_len = d->ms * (950u + sim_rand() % 101u) / 1000u;
+    g_sim.target = d->target * (0.94f + (float)(sim_rand() % 121u) / 1000.0f);
+    if (d->mode == 2 && g_sim.invalid_next && (sim_rand() % 3u) == 0u) {
+        g_sim.invalid = true;           /* 這個彎出界，這圈不算 */
+        g_sim.invalid_next = false;
     }
-    speed = gear * 38 + (rpm - 2000) * 40 / 6500;
+}
+
+static void sim_reset(uint32_t now)
+{
+    memset(&g_sim, 0, sizeof(g_sim));
+    g_sim.started = true;
+    g_sim.rng = now ^ 0x5EED1234u;
+    g_sim.last_now = now;
+    g_sim.lap_start = now;
+    g_sim.gear = 1;
+    g_sim.lap = 1;
+    g_sim.pos = 5;
+    g_sim.fuel = 96.0f;
+    for (int i = 0; i < 4; i++) { g_sim.tyre[i] = 74.0f + (float)i; }
+    sim_enter_segment(0);
+}
+
+static void sim_fmt_lap(char *out, size_t cap, uint32_t ms)
+{
+    if (ms == 0u) { snprintf(out, cap, "--"); return; }
+    snprintf(out, cap, "%02lu:%02lu.%03lu", (unsigned long)(ms / 60000u),
+             (unsigned long)((ms / 1000u) % 60u), (unsigned long)(ms % 1000u));
+}
+
+static void demo_line(char *out, int cap, uint32_t now)
+{
+    static const float k_kph_per_krpm[6] = {7.6f, 11.8f, 16.0f, 20.4f, 24.8f, 29.0f};
+    static const float k_accel[6] = {30.0f, 24.0f, 18.0f, 13.0f, 9.0f, 6.5f};   /* km/h 每秒 */
+    static uint32_t seq;
+    const demo_seg_t *d;
+    uint32_t dt;
+    float    dts, thr = 0.0f, brk = 0.0f, rpm;
+    bool     abs_on = false, tc_on = false;
+    char     cur[16], last[16], best[16];
+
+    if (!g_sim.started) { sim_reset(now); }
+    dt = now - g_sim.last_now;
+    if (dt > 100u) { dt = 100u; }
+    g_sim.last_now = now;
+    dts = (float)dt / 1000.0f;
+
+    /* 這一段跑完就換下一段；最後一段跑完就是一圈 */
+    g_sim.seg_t += dt;
+    if (g_sim.seg_t >= g_sim.seg_len) {
+        int next = g_sim.seg + 1;
+        if (next >= DEMO_SEGS) {
+            uint32_t lap_ms = now - g_sim.lap_start;
+            g_sim.last_ms = lap_ms;
+            if (!g_sim.invalid && (g_sim.best_ms == 0u || lap_ms < g_sim.best_ms)) { g_sim.best_ms = lap_ms; }
+            g_sim.lap_start = now;
+            g_sim.lap = g_sim.lap >= DEMO_LAPS ? 1 : g_sim.lap + 1;
+            if (sim_rand() % 3u == 0u) {                        /* 超車或被超 */
+                g_sim.pos += (sim_rand() & 1u) ? -1 : 1;
+                if (g_sim.pos < 1) { g_sim.pos = 1; }
+                if (g_sim.pos > 12) { g_sim.pos = 12; }
+            }
+            g_sim.invalid = false;
+            g_sim.invalid_next = (sim_rand() % 6u) == 0u;
+            if (g_sim.fuel < 8.0f) { g_sim.fuel = 100.0f; }   /* 進站加油 */
+            next = 0;
+        }
+        sim_enter_segment(next);
+    }
+    d = &k_demo_track[g_sim.seg];
+
+    /* 油門、煞車與速度 */
+    switch (d->mode) {
+    case 0:
+        thr = 100.0f;
+        g_sim.speed += (k_accel[g_sim.gear - 1] - 0.00012f * g_sim.speed * g_sim.speed) * dts;
+        tc_on = g_sim.gear <= 3 && g_sim.seg_t < 1500u && ((now / 70u) & 1u);   /* 出彎打滑 */
+        break;
+    case 1:
+        if (g_sim.speed > g_sim.target + 1.0f) {
+            brk = 88.0f;
+            g_sim.speed -= (55.0f + 0.00012f * g_sim.speed * g_sim.speed) * dts;
+            abs_on = g_sim.speed > 60.0f && g_sim.seg_t < g_sim.seg_len * 6u / 10u && (now / 90u) % 3u != 0u;
+        } else {
+            thr = 20.0f;
+        }
+        break;
+    default:
+        thr = 42.0f + (float)(sim_rand() % 16u);
+        g_sim.speed += (g_sim.target - g_sim.speed) * 0.8f * dts;
+        break;
+    }
+    if (g_sim.speed < 0.0f) { g_sim.speed = 0.0f; }
+
+    /* 檔位與轉速：到頂升檔、轉速掉了降檔（煞車時早一點降） */
+    rpm = g_sim.speed / k_kph_per_krpm[g_sim.gear - 1] * 1000.0f;
+    if (rpm > 8100.0f && g_sim.gear < 6) { g_sim.gear++; }
+    else if (rpm < (brk > 0.0f ? 4800.0f : 3300.0f) && g_sim.gear > 1) { g_sim.gear--; }
+    rpm = g_sim.speed / k_kph_per_krpm[g_sim.gear - 1] * 1000.0f;
+    if (rpm < 1500.0f) { rpm = 1500.0f; }
+    if (rpm > DEMO_MAX_RPM) { rpm = DEMO_MAX_RPM; }
+
+    /* 胎溫：彎道和煞車加熱（左右彎輪流），直線慢慢降 */
+    {
+        bool  left = (g_sim.seg / 3) & 1;
+        float heat_f = d->mode == 1 ? 8.0f : d->mode == 2 ? 6.0f : -2.5f;
+        float heat_r = d->mode == 2 ? 4.5f : d->mode == 1 ? 2.0f : -2.0f;
+
+        g_sim.tyre[0] += heat_f * (left ? 0.6f : 1.0f) * dts;
+        g_sim.tyre[1] += heat_f * (left ? 1.0f : 0.6f) * dts;
+        g_sim.tyre[2] += heat_r * (left ? 0.6f : 1.0f) * dts;
+        g_sim.tyre[3] += heat_r * (left ? 1.0f : 0.6f) * dts;
+        for (int i = 0; i < 4; i++) {
+            if (g_sim.tyre[i] < 70.0f) { g_sim.tyre[i] = 70.0f; }
+            if (g_sim.tyre[i] > 112.0f) { g_sim.tyre[i] = 112.0f; }
+        }
+    }
+
+    g_sim.fuel -= thr / 100.0f * 0.09f * dts;
+    if (g_sim.fuel < 0.0f) { g_sim.fuel = 0.0f; }
+
+    sim_fmt_lap(cur, sizeof(cur), now - g_sim.lap_start);
+    sim_fmt_lap(last, sizeof(last), g_sim.last_ms);
+    sim_fmt_lap(best, sizeof(best), g_sim.best_ms);
+    /* 欄位順序照 simhub/racedash-serial.js */
     snprintf(out, (size_t)cap,
-             "DSH1;%lu;1;%d;%d;%ld;%ld;92;%02lu:%02lu.%03lu;01:24.631;01:23.912;12.8;5;3;10;96;%d;%d;0;0;0;78.4;85.2;96.1;109.3",
-             (unsigned long)++seq, speed, gear, (long)rpm, (long)(rpm * 100 / 8500),
-             (unsigned long)(lap / 60000u), (unsigned long)((lap / 1000u) % 60u),
-             (unsigned long)(lap % 1000u), thr, brk);
+             "DSH1;%lu;1;%d;%d;%d;%d;92;%s;%s;%s;%.1f;%d;%d;%d;%d;%d;%d;%d;%d;%d;%.1f;%.1f;%.1f;%.1f",
+             (unsigned long)++seq, (int)(g_sim.speed + 0.5f), g_sim.gear, (int)rpm,
+             (int)(rpm * 100.0f / DEMO_MAX_RPM), cur, last, best,
+             (double)(g_sim.fuel / 4.5f), g_sim.pos, g_sim.lap, DEMO_LAPS, (int)(g_sim.fuel + 0.5f),
+             (int)thr, (int)brk, tc_on ? 1 : 0, abs_on ? 1 : 0, g_sim.invalid ? 1 : 0,
+             (double)g_sim.tyre[0], (double)g_sim.tyre[1], (double)g_sim.tyre[2], (double)g_sim.tyre[3]);
+}
+
+/* ------------------------------------------------------------------ */
+/* 左右黑邊的按鈕                                                       */
+/* ------------------------------------------------------------------ */
+/* 原作的畫面只佔中間 640 像素，左右各 80 像素黑邊沒有用到，放三顆按鈕：
+ *   左上「<」上一個主題   右邊「>」下一個主題（跟原作選單裡選一樣，會記住）
+ *   左下「DEMO」：點一下開始模擬跑圈，再點一下回到 SimHub 的資料（亮橘色 = 模擬中）
+ * 原作的設定選單開著時，切主題的按鈕不動作。黑邊的觸控都不交給原作
+ * （以前點到黑邊會當成點畫面邊緣）。按住時按鈕變亮。 */
+enum { BTN_PREV, BTN_NEXT, BTN_DEMO, BTN_COUNT, BTN_NONE = -1 };
+
+static const struct { int16_t x0, y0, x1, y1; } k_btn[BTN_COUNT] = {
+    {6,                  12,  74,                 392},   /* 上一個主題 */
+    {PHYS_W - 74,        12,  PHYS_W - 6,         468},   /* 下一個主題 */
+    {6,                  404, 74,                 468},   /* DEMO */
+};
+
+static const uint8_t k_demo_glyph[4][7] = {   /* 5x7：D E M O，每列低 5 位元 */
+    {0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E},
+    {0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F},
+    {0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11},
+    {0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E},
+};
+
+/* 點到線段的距離平方 */
+static float seg_dist2(float px, float py, float ax, float ay, float bx, float by)
+{
+    float dx = bx - ax, dy = by - ay;
+    float t = ((px - ax) * dx + (py - ay) * dy) / (dx * dx + dy * dy);
+    if (t < 0.0f) { t = 0.0f; }
+    if (t > 1.0f) { t = 1.0f; }
+    dx = px - (ax + t * dx);
+    dy = py - (ay + t * dy);
+    return dx * dx + dy * dy;
+}
+
+static void draw_button(int b, bool pressed, bool active)
+{
+    const uint16_t orange = 0xFC60u, grey = 0x52AAu, light = 0x9CD3u, dark = 0x2124u;
+    const int      x0 = k_btn[b].x0, y0 = k_btn[b].y0, x1 = k_btn[b].x1, y1 = k_btn[b].y1;
+    const uint16_t fill = active ? orange : pressed ? dark : 0x0000u;
+    const uint16_t edge = active ? orange : pressed ? light : grey;
+    const uint16_t ink  = active ? 0x0000u : pressed ? 0xFFFFu : light;
+    const float    cx = (x0 + x1) * 0.5f, cy = (y0 + y1) * 0.5f;
+
+    for (int f = 0; f < 2; f++) {                       /* 兩塊 framebuffer 都畫 */
+        uint16_t *fb = (uint16_t *)(f ? FB1_ADDR : FB0_ADDR);
+        for (int y = y0; y < y1; y++) {
+            for (int x = x0; x < x1; x++) {
+                int  ax = x - x0, bx = x1 - 1 - x, ay = y - y0, by = y1 - 1 - y;
+                bool cut = ax + ay < 4 || bx + ay < 4 || ax + by < 4 || bx + by < 4;   /* 切角 */
+                bool border = ax < 2 || bx < 2 || ay < 2 || by < 2 ||
+                              ax + ay < 6 || bx + ay < 6 || ax + by < 6 || bx + by < 6;
+                uint16_t c = cut ? 0x0000u : border ? edge : fill;
+                if (!cut && !border && b != BTN_DEMO) {
+                    /* 箭頭：兩條粗線組成的 < 或 > */
+                    float s = b == BTN_PREV ? -1.0f : 1.0f;
+                    float px = x + 0.5f, py = y + 0.5f;
+                    float tipx = cx + s * 11.0f, armx = cx - s * 9.0f;
+                    if (seg_dist2(px, py, tipx, cy, armx, cy - 20.0f) < 12.0f ||
+                        seg_dist2(px, py, tipx, cy, armx, cy + 20.0f) < 12.0f) { c = ink; }
+                }
+                fb[y * PHYS_W + x] = c;
+            }
+        }
+        if (b == BTN_DEMO) {
+            const int sc = 2, pitch = 6 * sc;
+            const int tx = (x0 + x1 - (4 * pitch - sc)) / 2, ty = (y0 + y1 - 7 * sc) / 2;
+            for (int ch = 0; ch < 4; ch++) {
+                for (int r = 0; r < 7; r++) {
+                    for (int bit = 0; bit < 5; bit++) {
+                        if (!(k_demo_glyph[ch][r] & (0x10u >> bit))) { continue; }
+                        for (int yy = 0; yy < sc; yy++) {
+                            for (int xx = 0; xx < sc; xx++) {
+                                fb[(ty + r * sc + yy) * PHYS_W + tx + ch * pitch + bit * sc + xx] = ink;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+static void draw_side_buttons(void)
+{
+    for (int b = 0; b < BTN_COUNT; b++) {
+        draw_button(b, false, b == BTN_DEMO && BOX[11] == DEMO_MAGIC);
+    }
+}
+
+/* 黑邊上的哪一顆按鈕（沒有就 BTN_NONE；黑邊上沒按鈕的地方也算黑邊） */
+static int side_button_at(int x, int y)
+{
+    for (int b = 0; b < BTN_COUNT; b++) {
+        if (x >= k_btn[b].x0 - 6 && x < k_btn[b].x1 + 6 && y >= k_btn[b].y0 - 6 && y < k_btn[b].y1 + 6) {
+            return b;
+        }
+    }
+    return BTN_NONE;
+}
+
+/* 每格讀一次觸控：黑邊上的按鈕自己處理（按下時動作、放開時恢復外觀），
+ * 畫面中間的觸控留給原作讀（racedash_touch）。 */
+static bool    g_ts_down;
+static int16_t g_ts_x, g_ts_y;
+
+static void poll_touch(void)
+{
+    static int held = BTN_NONE;     /* 按著的按鈕；在黑邊上但不是按鈕也算按著（BTN_COUNT） */
+    TS_State_t st;
+    int        x, y;
+
+    g_ts_down = false;
+    if (!g_have_touch || BSP_TS_GetState(0, &st) != BSP_ERROR_NONE || !st.TouchDetected) {
+        if (held >= 0 && held < BTN_COUNT) {
+            draw_button(held, false, held == BTN_DEMO && BOX[11] == DEMO_MAGIC);
+        }
+        held = BTN_NONE;
+        return;
+    }
+    x = (int)st.TouchX;
+    y = (int)st.TouchY;
+    if (x >= OFF_X && x < OFF_X + GT7DASH_W * SCALE && held == BTN_NONE) {
+        g_ts_down = true;           /* 畫面中間：交給原作 */
+        g_ts_x = (int16_t)x;
+        g_ts_y = (int16_t)y;
+        return;
+    }
+    if (held != BTN_NONE) { return; }   /* 同一次按壓只動作一次 */
+
+    held = side_button_at(x, y);
+    if (held == BTN_NONE) { held = BTN_COUNT; return; }
+    switch (held) {
+    case BTN_PREV:
+    case BTN_NEXT:
+        if (!gt7dash_step_theme(held == BTN_PREV ? -1 : 1)) { held = BTN_COUNT; return; }
+        draw_button(held, true, false);
+        break;
+    default: {
+        bool on = BOX[11] != DEMO_MAGIC;
+        BOX[11] = on ? DEMO_MAGIC : 0u;
+        if (on) { g_sim.started = false; }      /* 每次開始都從出站重新跑 */
+        draw_button(BTN_DEMO, true, on);
+        break;
+    }
+    }
+}
+
+bool racedash_touch(int *x, int *y)
+{
+    int tx, ty;
+
+    if (!g_ts_down) { return false; }
+    /* 面板座標 -> 畫布座標：扣掉左邊黑邊、除以放大倍率。點到右邊黑邊就貼齊畫布邊緣。 */
+    tx = ((int)g_ts_x - OFF_X) / SCALE;
+    ty = (int)g_ts_y / SCALE;
+    if (tx < 0) { tx = 0; }
+    if (tx >= GT7DASH_W) { tx = GT7DASH_W - 1; }
+    if (ty >= GT7DASH_H) { ty = GT7DASH_H - 1; }
+    *x = tx;
+    *y = ty;
+    return true;
 }
 
 /* ------------------------------------------------------------------ */
 /* 主迴圈                                                               */
 /* ------------------------------------------------------------------ */
-void gt7dash_set_theme(int theme);   /* port.cpp，除錯用 */
 
 void racedash_run(void)
 {
@@ -378,10 +679,13 @@ void racedash_run(void)
     /* BOX[20] 寫 "LOWR" 再重置：不配 2 倍鏡像，只跑原作（量原作本身的時間用） */
     gt7dash_hires_set(BOX[20] != LOWR_MAGIC);
     gt7dash_init();
+    draw_side_buttons();
 
     for (;;) {
         uint32_t now = HAL_GetTick();
         int      n;
+
+        poll_touch();
 
         while ((n = serial_read_line(line, sizeof(line))) >= 0) {
             if (n == 0 || BOX[11] == DEMO_MAGIC) { continue; }
@@ -390,11 +694,11 @@ void racedash_run(void)
         if (BOX[11] == DEMO_MAGIC && (int32_t)(now - demo_next) >= 0) {
             char demo[160];
 
-            /* 預設跟 SimHub 免費版一樣一秒 10 次；BOX[17] 可改間隔（毫秒），
-             * 寫 16 就是授權版的一秒 60 次 */
-            uint32_t period = (BOX[17] >= 1u && BOX[17] <= 1000u) ? BOX[17] : 100u;
+            /* 預設一秒 60 次（跟授權版 SimHub 一樣，轉速條最順）；BOX[17] 可改間隔
+             * （毫秒），寫 100 就是免費版的一秒 10 次 */
+            uint32_t period = (BOX[17] >= 1u && BOX[17] <= 1000u) ? BOX[17] : 16u;
             demo_next = now + period;
-            demo_line(demo, sizeof(demo), now, period);
+            demo_line(demo, sizeof(demo), now);
             if (gt7dash_feed(demo)) { BOX[3]++; } else { BOX[4]++; }
         }
         if ((BOX[12] & 0xFFFF0000u) == 0x54480000u) {

@@ -22,6 +22,11 @@ const uint16_t *gt7dash_canvas_hi(void);
 int gt7dash_canvas_hi_dirty(int *y0, int *y1);
 /* gt7dash_init() 之前呼叫：要不要配 2 倍鏡像（預設要）。 */
 void gt7dash_hires_set(int on);
+/* 切主題（0 Classic、1 GT3、2 Retro、3 Radar、4 Mono、5 Pocket、6 Endurance），
+ * 跟原作選單裡選一樣，會記進設定。 */
+void gt7dash_set_theme(int theme);
+/* 上一個（dir = -1）／下一個（+1）主題。原作的設定選單開著時不動作，回 0。 */
+int  gt7dash_step_theme(int dir);
 
 /* ---- 由 C 這邊（race_main.c）提供 ---- */
 /* 觸控：座標已換算成畫布的 320x240。沒按回 false。 */
