@@ -16,6 +16,7 @@
 # 就中止，看不出壞在哪（board-notes 10.5 / 17.8）。
 #
 set -e
+export PYTHONIOENCODING=utf-8   # 讀回比對的中文訊息在 Windows 主控台才不會變亂碼
 cd "$(dirname "$0")"
 HERE=$(pwd)
 
