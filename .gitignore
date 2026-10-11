@@ -46,3 +46,7 @@ projects/*/test/out/
 # 測試用的第三方照片，不進版控
 projects/*/test/photos/
 projects/racedash/gt7dash/build/
+
+# RaceDash Bridge：exe 留著（換電腦直接裝），紀錄檔不要
+projects/racedash/bridge/build/*.log
+projects/racedash/bridge/build/*.txt
