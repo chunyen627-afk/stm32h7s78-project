@@ -32,7 +32,7 @@ EL="$(dirname "$CLI")/ExternalLoader/MX66UW1G45G_STM32H7S78-DK.stldr"
 # 新增專案只要加一個資料夾，這個腳本不用改。
 # 設定檔先去掉 CR 再載入：Git 在 Windows 會把它轉成 CRLF 行尾。
 load_conf() {
-    TITLE=""; DESC=""; ALIASES=""; ITEMS=""; SOURCE=""
+    TITLE=""; DESC=""; ALIASES=""; ITEMS=""; SOURCE=""; PC_INSTALL=""
     source <(tr -d '\r' < "$1")
 }
 
@@ -117,5 +117,11 @@ echo "==> 重置"
 if [ "$FAIL" -ne 0 ]; then
     echo "!! 有檔案讀回不符，見上面"
     exit 1
+fi
+
+# 有電腦端程式的專案（例如賽車儀表的 RaceDash Bridge）：一起裝好
+if [ -n "$PC_INSTALL" ] && [ -f "$DIR/$PC_INSTALL" ]; then
+    echo "==> 電腦端程式（$PC_INSTALL）"
+    powershell -NoProfile -ExecutionPolicy Bypass -Command "[Console]::OutputEncoding=[Text.Encoding]::UTF8; & '$(cygpath -w "$DIR/$PC_INSTALL")'"
 fi
 echo "==> 完成"

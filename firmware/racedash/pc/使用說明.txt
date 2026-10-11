@@ -1,0 +1,73 @@
+﻿賽車儀表（RaceDash）使用說明
+=============================
+
+整套東西分兩塊：
+  ・儀表板：STM32H7S78-DK 開發板（5 吋螢幕），用 USB 線接電腦（插板子上 ST-LINK 那個 USB 孔，要直插電腦，不要經過 USB 集線器）
+  ・RaceDash Bridge：電腦上的小程式，讀遊戲的資料，每秒 60 次送給儀表板。取代 SimHub。
+
+平常的用法：插好板子 → 開遊戲 → 儀表自動動起來。什麼都不用按。
+
+
+一、RaceDash Bridge（電腦端）
+----------------------------
+・開機會自動在背景執行，不會跳視窗。
+・右下角系統匣（時鐘旁邊，可能收在「^」裡面）有它的圖示：
+    滑鼠移上去：顯示「遊戲名稱｜COM 埠｜每秒幾筆」
+                 例如「Assetto Corsa EVO｜COM3｜每秒 60.0 筆」
+    按右鍵：「開啟紀錄檔」、「結束 RaceDash Bridge」
+・會自動偵測現在開的是哪套遊戲，不用手動選。
+・板子拔掉再插回去，它會自己重新連上。
+・如果不小心結束了：點這個資料夾裡的「RaceDash Bridge」捷徑重新開。
+・不要同時開 SimHub：兩個程式會搶同一個 COM 埠，儀表會沒資料。
+
+
+二、支援的遊戲與遊戲內設定
+--------------------------
+  Assetto Corsa EVO ............ 不用設定
+  Assetto Corsa Competizione ... 不用設定
+  Assetto Corsa Rally .......... 不用設定（沒有單圈成績、油耗、TC/ABS 燈，遊戲本身沒提供）
+  F1 25 ........................ 這台電腦已經設好了（遊戲 設定 → Telemetry Settings：
+                                 UDP Telemetry 開、Port 20888、Send Rate 60Hz）
+                                 若重灌或設定被改掉：UDP Telemetry 開、Port 20777 或 20888、Send Rate 選 60Hz
+  Forza Motorsport ............. 設定 → GAMEPLAY & HUD → UDP RACE TELEMETRY：
+                                 Data Out 開、IP 127.0.0.1、Port 20777、Packet Format 選 Dash
+  Forza Horizon 6 .............. 設定 → HUD AND GAMEPLAY：
+                                 Data Out 開、IP 127.0.0.1、Port 20777
+  The Crew Motorfest ........... 不支援（遊戲沒有提供遙測資料）
+
+遊戲沒提供的資料，儀表上顯示「--」。
+F1 和 Forza 沒有「TC / ABS 正在作動」的資料，那兩個燈不會亮。
+
+
+三、儀表板上的按鈕
+------------------
+螢幕左右兩邊的黑邊有三顆按鈕：
+  ・左上「<」：上一個儀表主題
+  ・右邊「>」：下一個儀表主題
+  ・左下「DEMO」：模擬跑圈（不用開遊戲就能看儀表動起來），亮橘色 = 模擬中。再按一次回到遊戲資料。
+
+點螢幕中間會叫出原作的設定選單（主題、亮度等）。
+
+七個主題：Classic、GT3、Retro、Radar、Mono、Pocket、Endurance。
+主題和亮度會記住，但板子完全斷電後會回到 GT3（之後會改）。
+
+
+四、儀表沒反應時
+----------------
+1. 看系統匣圖示：
+   ・顯示「找不到 ST-LINK」→ 板子沒接好，或插在 USB 集線器上（請直插電腦）
+   ・顯示「沒有遊戲」→ 遊戲還沒開，或 F1 / Forza 的遙測沒在遊戲設定裡打開
+   ・每秒 2 筆 → 沒偵測到遊戲；每秒 10 筆 → 遊戲在選單裡；開始開車就會變 60
+2. 有沒有開著 SimHub？有的話請關掉（從系統匣的 SimHub 圖示按右鍵 Exit），再重開 RaceDash Bridge。
+3. 還是不行：點「RaceDash 紀錄檔」捷徑，把內容給 Claude 看。
+
+
+五、檔案位置（給 Claude 或日後維護用）
+--------------------------------------
+・RaceDash Bridge 程式：C:\Users\user\RaceDash\racedash-bridge.exe
+・紀錄檔：C:\Users\user\RaceDash\racedash-bridge.log
+・開機自動啟動的捷徑：「啟動」資料夾裡的 RaceDash Bridge
+・原始碼與說明：C:\STM32CubeIDE\workspace_2.0.0\stm32h7s78-project\projects\racedash\
+  （GitHub：chunyen627-afk/stm32h7s78-project）
+    bridge\  ... 電腦端程式（重新安裝：在 bridge 資料夾執行 install.ps1）
+    app_src\、gt7dash\ ... 儀表板韌體

@@ -22,7 +22,10 @@ if ($Uninstall) {
 }
 
 New-Item -ItemType Directory -Force $dst | Out-Null
-Copy-Item (Join-Path $PSScriptRoot 'build\racedash-bridge.exe') $exe -Force
+# exe 在同一層（firmware/racedash/pc 的備份）或 build\ 底下（原始碼目錄）
+$src = Join-Path $PSScriptRoot 'racedash-bridge.exe'
+if (-not (Test-Path $src)) { $src = Join-Path $PSScriptRoot 'build\racedash-bridge.exe' }
+Copy-Item $src $exe -Force
 
 $sh = New-Object -ComObject WScript.Shell
 $s = $sh.CreateShortcut($lnk)

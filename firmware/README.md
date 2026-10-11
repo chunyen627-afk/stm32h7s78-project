@@ -7,6 +7,7 @@ STM32CubeProgrammer（CubeIDE 內附），不需要 540MB 的 ST 韌體包、不
 ```bash
 ./firmware/restore.sh 相簿
 ./firmware/restore.sh 俄羅斯方塊
+./firmware/restore.sh 賽車儀表
 ./firmware/restore.sh               # 不給名字：列出目前所有可燒回的專案
 ```
 
@@ -37,6 +38,24 @@ STM32CubeProgrammer（CubeIDE 內附），不需要 540MB 的 ST 韌體包、不
 
 燒錄內容：bootloader（有補開 HSE）＋ 相簿 `0x70000000` ＋ 隨身碟 `0x71000000`。
 
+### 賽車儀表　`restore.sh 賽車儀表`
+
+PC 玩賽車遊戲時當副儀表。也可以說：賽車、儀表、儀表板、racedash。
+
+| 功能 | 說明 |
+|---|---|
+| 畫面 | 原作 caa1211/esp32-gt7-dashboard 的七個主題（原始碼不改），2 倍解析度、抗鋸齒 |
+| 60Hz | 七個主題都驗證過每秒 60 格（`projects/racedash/tools/measure_fps.sh`） |
+| 黑邊按鈕 | 左上「<」、右邊「>」切主題；左下「DEMO」模擬跑圈，不用開遊戲 |
+| 資料來源 | 電腦端 **RaceDash Bridge**（`pc/`）讀遊戲官方遙測，每秒 60 次經 ST-LINK 的 COM 埠送來：AC EVO、ACC、AC Rally、F1 24/25、Forza Motorsport、Forza Horizon 6。不再需要 SimHub |
+
+**燒回時會順便裝電腦端程式**（`project.conf` 的 `PC_INSTALL`）：`pc/install.ps1` 把
+`racedash-bridge.exe` 裝到 `%USERPROFILE%\RaceDash`、登入 Windows 自動啟動。
+使用說明在 `pc/使用說明.txt`（記事本可開）。
+
+燒錄內容：bootloader（原廠，跟俄羅斯方塊同一顆）＋ 儀表 `0x70000000`。
+主題、亮度存在 DTCM，完全斷電會回到 GT3。
+
 ### 俄羅斯方塊　`restore.sh 俄羅斯方塊`
 
 直立版、繁體中文介面、超任風格觸控手把（十字鍵＋A/B/X/Y）。SRS 旋轉含踢牆、
@@ -65,6 +84,7 @@ STM32CubeProgrammer（CubeIDE 內附），不需要 540MB 的 ST 韌體包、不
    ALIASES="時鐘 鬧鐘 clock"             # 使用者可能怎麼叫它，空白分隔
    ITEMS="clock.bin:0x70000000"          # 外部 Flash：檔名:位址，可以多個
    SOURCE="<提交> (<日期>)"              # 快照從哪個版本編出來的
+   PC_INSTALL="pc/install.ps1"           # 選用：燒完順便執行的電腦端安裝腳本
    ```
 4. 跑一次 `./firmware/restore.sh` 確認列出來了，再實際燒一次驗證
 5. `git ls-files firmware` 確認 `.bin` / `.hex` 有進版控
@@ -104,6 +124,10 @@ $GCC/arm-none-eabi-objcopy -O binary $P/Applications/USB_Device/MSC_Standalone/S
 
 # 俄羅斯方塊（先 cd projects/tetris && ./scripts/build.sh）
 $GCC/arm-none-eabi-objcopy -O binary $P/Templates/Tetris/STM32CubeIDE/Appli/Debug/Template_XIP_Appli.elf firmware/tetris/tetris.bin
+
+# 賽車儀表（先 cd projects/racedash && ./scripts/build.sh；電腦端 cd projects/racedash/bridge && ./build.sh）
+$GCC/arm-none-eabi-objcopy -O binary $P/Templates/RaceDash/STM32CubeIDE/Appli/Debug/RaceDash_Appli.elf firmware/racedash/racedash.bin
+cp projects/racedash/bridge/build/racedash-bridge.exe projects/racedash/bridge/install.ps1 firmware/racedash/pc/
 ```
 
 **燒進去之前確認治具開關都是正式值**：`album_main.c` 的 `ALBUM_AUTOPLAY 0`、

@@ -11,7 +11,7 @@
 | [projects/usbdrive](projects/usbdrive) | 隨身碟模式：相簿的第二個 app，USB1 插上電腦就把 SD 卡直接掛給電腦 |
 | [projects/usbaudio](projects/usbaudio) | USB 無線耳機的開發治具與量測記錄（功能已整合進相簿）|
 | [projects/video](projects/video) | MJPEG 影片工具鏈：mp4 轉檔、獨立播放器、透過 ST-LINK 寫 SD 卡 |
-| [projects/racedash](projects/racedash) | 賽車儀表：PC 玩賽車遊戲時當 5 吋副儀表，SimHub 經 USB 送遙測（開發中）|
+| [projects/racedash](projects/racedash) | 賽車儀表：PC 玩賽車遊戲時當 5 吋副儀表（原作七個主題、2 倍抗鋸齒、60Hz），電腦端 [RaceDash Bridge](projects/racedash/bridge) 讀遊戲遙測取代 SimHub |
 
 ## 目錄結構
 
@@ -39,6 +39,7 @@ cube/                 ST 韌體包 STM32CubeH7RS（gitignore，所有專案共�
 ./firmware/restore.sh 相簿           # 含影片播放、USB 隨身碟、USB 耳機
 ./firmware/restore.sh 俄羅斯方塊
 ./firmware/restore.sh 影片燒卡工具
+./firmware/restore.sh 賽車儀表       # 連電腦端 RaceDash Bridge 一起裝
 ```
 
 不給名字會列出目前所有可燒回的專案。**每個專案有哪些功能、之後怎麼新增一個**，
