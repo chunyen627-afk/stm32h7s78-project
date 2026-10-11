@@ -17,7 +17,7 @@ COM 埠送給儀表。取代 SimHub（免費版只有每秒 10 次，而且要�
 | Assetto Corsa EVO | 官方共享記憶體 `acevo_pmf_*` | 不用 | — |
 | Assetto Corsa Competizione | 官方共享記憶體 `acpmf_*` | 不用 | 總圈數（計時賽） |
 | Assetto Corsa Rally | 同 ACC 的共享記憶體 | 不用 | TC/ABS 作動、單圈成績、油耗、名次（搶先體驗版沒發佈） |
-| F1 25 | 官方 UDP | 設定 → Telemetry Settings：UDP Telemetry **開**、Port **20777**、Send Rate **60Hz**（UDP Format 2025 或 2026 都可以） | TC/ABS 作動（遊戲只給開關設定） |
+| F1 25（也收 F1 24） | 官方 UDP | 設定 → Telemetry Settings：UDP Telemetry **開**、Port **20777 或 20888**（兩個都聽）、Send Rate **60Hz**（UDP Format 2024 / 2025 / 2026 都可以） | TC/ABS 作動（遊戲只給開關設定） |
 | Forza Motorsport | 官方 Data Out（UDP） | SETTINGS → GAMEPLAY & HUD → UDP RACE TELEMETRY：Data Out **開**、IP **127.0.0.1**、Port **20777**、Packet Format **Dash** | TC/ABS、總圈數 |
 | Forza Horizon 6 | 官方 Data Out（UDP） | SETTINGS → HUD AND GAMEPLAY：Data Out **開**、IP **127.0.0.1**、Port **20777** | TC/ABS、總圈數（只有開車時才送） |
 
@@ -27,7 +27,7 @@ COM 埠送給儀表。取代 SimHub（免費版只有每秒 10 次，而且要�
 資料，沒有轉速、檔位、圈速；ForceSeatPM 也在 2025 年因為遊戲不再送資料而拿掉支援）。
 只剩讀遊戲記憶體一途，遊戲更新就壞、也可能被反作弊當成外掛，所以不做。
 
-**同一時間只能一個程式用 COM 埠與 UDP 20777**：不要同時開 SimHub。
+**同一時間只能一個程式用 COM 埠與 UDP 20777 / 20888**：不要同時開 SimHub。
 
 ## 安裝
 
@@ -55,7 +55,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 | `main.c` | 偵測遊戲、送出節奏、油耗估算（每圈用量取最近三圈平均） |
 | `dsh1.c` | 組 DSH1 字串，格式跟 `../simhub/racedash-serial.js` 一模一樣 |
 | `serial_win.c` | 找 ST-LINK（登錄檔 USB VID_0483）、115200 8N1、斷線重開 |
-| `udp.c` | UDP 20777，依封包內容分給 F1 / Forza |
+| `udp.c` | UDP 20777 與 20888，依封包內容分給 F1 / Forza |
 | `src_acevo.c` | AC EVO（Kunos 官方文件 2026-04-01，頁大小 800 / 4900 / 208） |
 | `src_acc.c` | ACC 與 AC Rally（Kunos ACC 文件 v1.8.12，頁大小 800 / 1588 / 820；Rally 溫度是 Kelvin） |
 | `src_f1.c` | F1 25（EA 規格 2025 與 2026 Season Pack 兩種格式） |
@@ -67,5 +67,5 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 
 ## 驗證狀態
 
-- F1 25、Forza Horizon：用照官方格式組的假封包驗證過解析與每秒 60 筆（板子實收 60 筆、0 錯誤）
+- F1 25（2025 格式 @20777、2026 格式 @20888）、Forza Horizon：用照官方格式組的假封包驗證過解析與每秒 60 筆（板子實收 60 筆、0 錯誤）
 - AC EVO、ACC、AC Rally：需要遊戲開著才能驗證

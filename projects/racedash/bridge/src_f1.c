@@ -1,5 +1,5 @@
-/* EA SPORTS F1 25：官方 UDP 遙測（遊戲設定 → Telemetry Settings → UDP Telemetry 開、
- * Port 20777、Send Rate 60Hz）。依 EA《Data Output from F1 25 v3》與 2026 Season Pack 規格。
+/* EA SPORTS F1 25（也收 F1 24）：官方 UDP 遙測（遊戲設定 → Telemetry Settings → UDP Telemetry 開、
+ * Port 20777 或 20888、Send Rate 60Hz）。依 EA《Data Output from F1 25 v3》與 2026 Season Pack 規格。
  *
  * 封包開頭 29 位元組的 header：m_packetFormat（2025 或 2026）、m_packetId（偏移 6）、
  * m_sessionUID（7，uint64）、m_playerCarIndex（27）。玩家車的資料在
@@ -41,7 +41,8 @@ void f1_feed(const uint8_t *p, int n)
     int      car = p[27];
     uint64_t uid;
 
-    if ((fmt != 2025 && fmt != 2026) || car >= (fmt == 2026 ? 24 : 22)) { return; }
+    /* 2024 跟 2025 這幾種封包的版面完全一樣（EA 規格比對過） */
+    if (fmt < 2024 || fmt > 2026 || car >= (fmt == 2026 ? 24 : 22)) { return; }
     memcpy(&uid, p + 7, 8);
     if (uid != s.session_uid) {                      /* 新的一場：清掉最佳圈與換圈紀錄 */
         s.session_uid = uid;
@@ -122,4 +123,4 @@ static int f1_poll(tele_t *t)
     return 1;
 }
 
-const source_t src_f1 = { "F1 25", { "f1_25.exe", NULL }, f1_open, f1_poll, f1_close };
+const source_t src_f1 = { "F1", { "f1_25.exe", "f1_24.exe", NULL }, f1_open, f1_poll, f1_close };
