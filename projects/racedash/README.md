@@ -1,7 +1,11 @@
 # 賽車儀表（RaceDash）
 
-PC 玩賽車遊戲時，把板子當成 5 吋副儀表。資料由 PC 上的 **SimHub** 從遊戲讀出，
-經 USB 送給板子。
+PC 玩賽車遊戲時，把板子當成 5 吋副儀表。資料由電腦上的 **[RaceDash Bridge](bridge/)**
+從遊戲的官方遙測讀出，每秒 60 次經 USB 送給板子：自動偵測遊戲（AC EVO、ACC、AC Rally、
+F1 24/25、Forza Motorsport、Forza Horizon 6），開機自動在背景跑。也還能用 SimHub
+（免費版每秒 10 次，見下面「SimHub 設定」），兩者不能同時開。
+
+整套燒回（含電腦端程式）：`./firmware/restore.sh 賽車儀表`。
 
 **畫面就是原作**：[caa1211/esp32-gt7-dashboard](https://github.com/caa1211/esp32-gt7-dashboard)
 （MIT License）的整個儀表 App —— 資料處理、七個主題、觸控選單、設定畫面 ——
@@ -29,7 +33,7 @@ NVS，這塊板子還沒接上永久儲存）。
 「STMicroelectronics STLink Virtual COM Port」（這台電腦是 COM3），
 供電、燒錄、遙測都走這一條。**要直插電腦**，經過 USB 集線器實測認不到。
 
-## SimHub 設定
+## SimHub 設定（舊的做法，已由 RaceDash Bridge 取代）
 
 SimHub 是 PC 上免費的賽車遙測軟體（simhubdash.com），支援 Assetto Corsa、
 AC EVO、ACC、iRacing、F1、Forza 等。
