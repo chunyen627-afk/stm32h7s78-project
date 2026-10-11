@@ -20,8 +20,19 @@ COM 埠送給儀表。
 | F1 25（也收 F1 24） | 官方 UDP | 設定 → Telemetry Settings：UDP Telemetry **開**、Port **20777 或 20888**（兩個都聽）、Send Rate **60Hz**（UDP Format 2024 / 2025 / 2026 都可以） | TC/ABS 作動（遊戲只給開關設定） |
 | Forza Motorsport | 官方 Data Out（UDP） | SETTINGS → GAMEPLAY & HUD → UDP RACE TELEMETRY：Data Out **開**、IP **127.0.0.1**、Port **20777**、Packet Format **Dash** | TC/ABS、總圈數 |
 | Forza Horizon 6 | 官方 Data Out（UDP） | SETTINGS → HUD AND GAMEPLAY：Data Out **開**、IP **127.0.0.1**、Port **20777** | TC/ABS、總圈數（只有開車時才送） |
+| Gran Turismo 7（PS5） | 官方遙測（UDP、Salsa20 加密），電腦當中繼 | 不用；PS5 跟電腦在同一個家用網路就好 | ABS；名次只有開賽前有 |
 
 沒有的資料在儀表上顯示 `--`。
+
+**GT7（PS5）怎麼運作**：Bridge 每 0.5 秒對 PS5 的 UDP 33739 埠送一個字元的心跳，PS5 就
+每秒 60 次把加密封包送回電腦的 33740 埠（協定跟原作 `gt7dash/orig/GT7UDPParser.cpp` 一樣，
+Salsa20 用原作的 C++ 版比對過 200 個封包全部相同）。PS5 的 IP **自動找**：還沒找到時每 5 秒
+對家裡區網（對外連線走的那張網卡）的 /24 網段逐一送心跳，只有在跑 GT7 的 PS5 會回應，
+找到就寫進 exe 旁邊的 `racedash-bridge.ini`（`[gt7] ps5=...`），也可以手動填。心跳版本先要
+C 版（直接帶本圈時間），沒回應依序退到 ~、B、A。Windows 防火牆要允許 racedash-bridge.exe
+接收區網的連線（第一次執行時 Windows 會問）。
+
+**PS5 上玩 F1 25**：遊戲 UDP 設定的 IP 填這台電腦的區網 IP（不是 127.0.0.1），Bridge 一樣收得到。
 
 **不支援 The Crew Motorfest**：遊戲沒有官方遙測輸出（前作有的輸出只有動態座椅用的物理
 資料，沒有轉速、檔位、圈速；ForceSeatPM 也在 2025 年因為遊戲不再送資料而拿掉支援）。
@@ -60,6 +71,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 | `src_acc.c` | ACC 與 AC Rally（Kunos ACC 文件 v1.8.12，頁大小 800 / 1588 / 820；Rally 溫度是 Kelvin） |
 | `src_f1.c` | F1 25（EA 規格 2025 與 2026 Season Pack 兩種格式） |
 | `src_forza.c` | Forza Motorsport / Horizon（官方 Data Out 文件，依封包長度分） |
+| `src_gt7.c` | GT7（PS5）：心跳、Salsa20 解密、自動找 PS5 |
 | `tray.c` | 系統匣圖示 |
 
 共享記憶體只能用 `OpenFileMapping` 唯讀開：自己建立對應的話，遊戲啟動時發現大小不對
@@ -90,4 +102,6 @@ DSH1;序號;遊戲在跑;速度;檔位;轉速;轉速%;紅線%;本圈;上一圈;�
 ## 驗證狀態
 
 - F1 25（2025 格式 @20777、2026 格式 @20888）、Forza Horizon：用照官方格式組的假封包驗證過解析與每秒 60 筆（板子實收 60 筆、0 錯誤）
-- AC EVO、ACC、AC Rally：需要遊戲開著才能驗證
+- AC EVO：實機每秒 60 筆、0 錯誤（TC/ABS 改看 graphics 旗標後也會亮）
+- GT7：用假 PS5（照 GT7 格式加密回送）驗證心跳、解密、各欄位與每秒 60 筆；還沒在真的 PS5 上跑過
+- ACC、AC Rally：需要遊戲開著才能驗證

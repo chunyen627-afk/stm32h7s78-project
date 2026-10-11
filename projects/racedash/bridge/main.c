@@ -172,7 +172,7 @@ int main(int argc, char **argv)
             const source_t *s = detect_by_process();
             last_detect = now;
             /* 靠 UDP 封包認出來的（例如 PS5 上的 F1，電腦上沒有遊戲行程）：封包還在來就維持 */
-            bool udp_alive = (src == &src_f1 || src == &src_forza) && now - last_data < 3000;
+            bool udp_alive = (src == &src_f1 || src == &src_forza || src == &src_gt7) && now - last_data < 3000;
             if (s != src && !(s == NULL && udp_alive)) {
                 if (src && src_open) { src->close(); }
                 src = s;
@@ -193,9 +193,10 @@ int main(int argc, char **argv)
             if (r > 0) { last_data = now; }
             if (r < 0) { src->close(); src_open = false; }
         } else {
-            /* 沒偵測到行程：看 UDP 有沒有 F1 或 Forza 的封包 */
+            /* 沒偵測到行程：看 UDP 有沒有 F1、Forza 的封包，或 PS5 上的 GT7（會自己找 PS5） */
             if (src_f1.poll(&t) > 0) { last_data = now; src = &src_f1; src_open = true; logf_("收到 F1 封包"); }
             else if (src_forza.poll(&t) > 0) { last_data = now; src = &src_forza; src_open = true; logf_("收到 Forza 封包"); }
+            else if (src_gt7.poll(&t) > 0) { last_data = now; src = &src_gt7; src_open = true; logf_("收到 GT7 封包"); }
         }
         if (!test) { fresh = now - last_data < 1000; }
 

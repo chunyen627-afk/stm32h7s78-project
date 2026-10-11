@@ -14,7 +14,7 @@ void tele_clear(tele_t *t)
     t->cur_ms = t->last_ms = t->best_ms = TELE_UNKNOWN_I;
     t->lap = t->total_laps = t->position = TELE_UNKNOWN_I;
     t->tc = t->abs = t->invalid = TELE_UNKNOWN_I;
-    t->speed_kmh = t->rpm = t->max_rpm = t->throttle = t->brake = NAN;
+    t->speed_kmh = t->rpm = t->max_rpm = t->throttle = t->brake = t->redline_pct = NAN;
     t->fuel_l = t->fuel_max_l = t->fuel_laps = t->fuel_pct = NAN;
     for (int i = 0; i < 4; i++) { t->tyre_c[i] = NAN; }
 }
@@ -64,7 +64,8 @@ int dsh1_format(char *out, int cap, uint32_t seq, bool game_running, const tele_
     else { snprintf(f[4], 24, "--"); }
     num(f[5], 24, t->rpm, 0, 30000, 0);
     num(f[6], 24, (t->max_rpm > 0) ? t->rpm / t->max_rpm * 100.0 : NAN, 0, 100, 0);
-    snprintf(f[7], 24, "92");                       /* 紅線（換檔燈）：轉速 92% 起亮 */
+    /* 紅線（換檔燈起亮的轉速%）：遊戲有給就用（GT7），不然 92 */
+    num(f[7], 24, (t->redline_pct > 0 && t->redline_pct < 100) ? t->redline_pct : 92.0, 0, 100, 0);
     laptime(f[8], 24, t->cur_ms);
     laptime(f[9], 24, t->last_ms);
     laptime(f[10], 24, t->best_ms);

@@ -18,6 +18,7 @@ typedef struct {
     float   speed_kmh;
     int     gear;           /* -1 倒檔、0 空檔、1~9；TELE_UNKNOWN_I = 不知道 */
     float   rpm, max_rpm;
+    float   redline_pct;    /* 換檔燈起亮的轉速%；NAN = 預設 92 */
     float   throttle, brake;            /* 0..1 */
     int32_t cur_ms, last_ms, best_ms;   /* 圈速毫秒；0 = 還沒有；TELE_UNKNOWN_I = 不知道 */
     int     lap;            /* 現在第幾圈（從 1 開始） */
@@ -43,7 +44,7 @@ typedef struct source {
     void (*close)(void);
 } source_t;
 
-extern const source_t src_acevo, src_acc, src_acrally, src_f1, src_forza;
+extern const source_t src_acevo, src_acc, src_acrally, src_f1, src_forza, src_gt7;
 
 /* UDP（F1、Forza 共用一個接收埠，依封包內容分給各自的解析） */
 bool udp_open(void);

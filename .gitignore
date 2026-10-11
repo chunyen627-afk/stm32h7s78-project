@@ -50,3 +50,4 @@ projects/racedash/gt7dash/build/
 # RaceDash Bridge：exe 留著（換電腦直接裝），紀錄檔不要
 projects/racedash/bridge/build/*.log
 projects/racedash/bridge/build/*.txt
+projects/racedash/bridge/build/*.ini

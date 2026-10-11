@@ -33,10 +33,14 @@
                                  Data Out 開、IP 127.0.0.1、Port 20777、Packet Format 選 Dash
   Forza Horizon 6 .............. 設定 → HUD AND GAMEPLAY：
                                  Data Out 開、IP 127.0.0.1、Port 20777
+  Gran Turismo 7（PS5）......... 不用設定。PS5 跟電腦接在同一個家用網路就好，
+                                 開 GT7 後電腦會自己找到 PS5（最多等 5 秒）。
+                                 第一次若跳出 Windows 防火牆詢問，請按「允許」。
+  F1 25 在 PS5 上玩 ............ 遊戲 UDP 設定的 IP 填這台電腦的 IP（192.168.31.162），Port 20777
   The Crew Motorfest ........... 不支援（遊戲沒有提供遙測資料）
 
 遊戲沒提供的資料，儀表上顯示「--」。
-F1 和 Forza 沒有「TC / ABS 正在作動」的資料，那兩個燈不會亮。
+F1 和 Forza 沒有「TC / ABS 正在作動」的資料，那兩個燈不會亮；GT7 只有 TC 燈會亮。
 
 
 三、儀表板上的按鈕
