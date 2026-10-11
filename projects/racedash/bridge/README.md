@@ -33,7 +33,7 @@ COM 埠送給儀表。取代 SimHub（免費版只有每秒 10 次，而且要�
 
 ```bash
 ./build.sh                                                   # 編譯（w64devkit gcc）
-powershell -ExecutionPolicy Bypass -File install.ps1         # 裝到 %LOCALAPPDATA%\RaceDash、開機自動啟動、現在啟動
+powershell -ExecutionPolicy Bypass -File install.ps1         # 裝到 %USERPROFILE%\RaceDash、開機自動啟動、現在啟動
 powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 ```
 

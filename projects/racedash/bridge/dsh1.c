@@ -69,9 +69,10 @@ int dsh1_format(char *out, int cap, uint32_t seq, bool game_running, const tele_
     laptime(f[9], 24, t->last_ms);
     laptime(f[10], 24, t->best_ms);
     num(f[11], 24, !isnan(t->fuel_laps) ? t->fuel_laps : fuel_laps_est, 0, 9999, 1);
-    inum(f[12], 24, t->position, 0, 9999);
-    inum(f[13], 24, t->lap, 0, 9999);
-    inum(f[14], 24, t->total_laps, 0, 9999);
+    /* 名次、圈數、總圈數是 0 就是「沒有」（例如 EVO 單人練習名次報 0、計時賽總圈數 0） */
+    inum(f[12], 24, t->position, 1, 9999);
+    inum(f[13], 24, t->lap, 1, 9999);
+    inum(f[14], 24, t->total_laps, 1, 9999);
     num(f[15], 24, fuel_pct, 0, 100, 0);
     num(f[16], 24, t->throttle * 100.0, 0, 100, 0);
     num(f[17], 24, t->brake * 100.0, 0, 100, 0);

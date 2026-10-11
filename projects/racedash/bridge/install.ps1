@@ -1,10 +1,12 @@
-﻿# 安裝 RaceDash Bridge：複製到 %LOCALAPPDATA%\RaceDash、登入 Windows 時自動啟動、現在就啟動。
+﻿# 安裝 RaceDash Bridge：複製到 %USERPROFILE%\RaceDash、登入 Windows 時自動啟動、現在就啟動。
+# 不放 AppData：從封裝過的程式（例如 Claude 桌面版）裡執行這個腳本時，寫進 AppData 的檔案
+# 會被 Windows 轉到那個程式自己的資料夾，開機啟動和捷徑都找不到。
 #   powershell -ExecutionPolicy Bypass -File install.ps1
 # 解除安裝：install.ps1 -Uninstall
 param([switch]$Uninstall)
 
 $ErrorActionPreference = 'Stop'
-$dst  = Join-Path $env:LOCALAPPDATA 'RaceDash'
+$dst  = Join-Path $env:USERPROFILE 'RaceDash'
 $exe  = Join-Path $dst 'racedash-bridge.exe'
 $lnk  = Join-Path ([Environment]::GetFolderPath('Startup')) 'RaceDash Bridge.lnk'
 

@@ -75,7 +75,8 @@ static int acpmf_poll(tele_t *t, bool rally)
     s_last_gr = gid;
 
     tele_clear(t);
-    t->running   = rally ? (GetTickCount() - s_ph_moved < 300) : (i32(gr, 4) == AC_LIVE);
+    /* 暫停也算在跑（儀表停在暫停那一刻）；Rally 的 status 沒驗證過，看物理有沒有在走 */
+    t->running   = rally ? (GetTickCount() - s_ph_moved < 300) : (i32(gr, 4) == AC_LIVE || i32(gr, 4) == AC_PAUSE);
     t->speed_kmh = f32(ph, 28);
     t->gear      = i32(ph, 16) - 1;                 /* 0=R、1=N、2=1 檔 */
     t->rpm       = (float)i32(ph, 20);

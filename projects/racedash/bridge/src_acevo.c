@@ -68,8 +68,17 @@ static int acevo_poll(tele_t *t)
     s_last_ph = pid;
     s_last_gr = gid;
 
+    /* 暫停時遊戲把物理資料清成 0（檔位會變成 R、時速 0），所以停在暫停前最後一刻的
+     * 數值；暫停也算在跑，不要切到等待畫面。回到選單（OFF）才算沒在跑。 */
+    static tele_t s_live;
+    static bool   s_have_live;
+    if (i32(gr, 4) == AC_PAUSE && s_have_live) {
+        *t = s_live;
+        return 1;
+    }
+
     tele_clear(t);
-    t->running   = i32(gr, 4) == AC_LIVE;
+    t->running   = i32(gr, 4) == AC_LIVE || i32(gr, 4) == AC_PAUSE;
     t->speed_kmh = f32(ph, 28);
     t->gear      = i32(ph, 16) - 1;                 /* 0=R、1=N、2=1 檔 → -1、0、1 */
     t->rpm       = (float)i32(ph, 20);
@@ -92,6 +101,7 @@ static int acevo_poll(tele_t *t)
     t->total_laps = st[85] ? 0 : i32(gr, 2544);     /* 計時賽沒有總圈數 */
     t->position = (int)u32(gr, 2388);
     t->invalid = !gr[3121] || gr[2849];             /* is_valid_lap、timing_state.is_invalid */
+    if (i32(gr, 4) == AC_LIVE) { s_live = *t; s_have_live = true; }
     return 1;
 }
 
