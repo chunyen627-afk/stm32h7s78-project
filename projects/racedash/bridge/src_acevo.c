@@ -86,8 +86,11 @@ static int acevo_poll(tele_t *t)
     if (t->max_rpm <= 0) { t->max_rpm = NAN; }
     t->throttle  = f32(ph, 4);
     t->brake     = f32(ph, 8);
-    t->tc        = i32(ph, 672) != 0;               /* tcinAction */
-    t->abs       = i32(ph, 676) != 0;               /* absInAction */
+    /* TC / ABS 作動：實測（Ferrari 296 GT3、0.9.1）physics 的 tcinAction / absInAction 一直是 0，
+     * 會跟著重煞、出彎動的是 graphics 的 tc_active / abs_active 與 physics 的 tc / abs 強度。
+     * 三個任一有值就亮 */
+    t->tc        = i32(ph, 672) != 0 || gr[45] || f32(ph, 204) > 0.01f;
+    t->abs       = i32(ph, 676) != 0 || gr[46] || f32(ph, 252) > 0.01f;
     for (int i = 0; i < 4; i++) { t->tyre_c[i] = f32(ph, 152 + i * 4); }   /* 胎芯溫度 FL FR RL RR */
 
     t->fuel_l     = f32(gr, 196);
