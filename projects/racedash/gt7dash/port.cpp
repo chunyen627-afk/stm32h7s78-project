@@ -21,7 +21,7 @@ WiFiClass WiFi;
 GT7_UDP_Parser gt7Telem;
 Packet gt7Packet;
 
-/* 原作走 SimHub Arduino 協定時用的序列埠函式。racedash 直接把整行交給它，用不到。 */
+/* 原作在 ESP32 上自己讀序列埠用的函式。racedash 直接把整行交給它，用不到。 */
 int  FlowSerialAvailable() { return 0; }
 int  FlowSerialTimedRead() { return -1; }
 void FlowSerialWrite(uint8_t) {}
@@ -53,10 +53,12 @@ extern "C" void gt7dash_init(void)
 
     s_dash = &dash;
     /* 沒有存過設定就是第一次開機：原作會進「觸控校正 -> 選連線方式」。
-     * 板子只有 SimHub 這條路，而且觸控方向固定，直接設好跳過。 */
+     * 板子只有 USB 序列埠這條路（RaceDash Bridge），而且觸控方向固定，直接設好跳過。 */
     unsigned char v;
     if (!racedash_pref_get("touchRot", &v))   { racedash_pref_put("touchRot", 0); }
-    if (!racedash_pref_get("connection", &v)) { racedash_pref_put("connection", 2); }  /* TelemetryMode::SimHub */
+    /* 一律 USB 序列埠模式：板子沒有 Wi-Fi，原作的 GT7 直連模式不能用。等待畫面上
+     * 「SWITCH TO DIRECT GT7」點到的話會被存起來，重開機就卡在 Wi-Fi 設定畫面 */
+    racedash_pref_put("connection", 2);
     dash.setup();
     dash.initializeTelemetry();
 }
@@ -72,7 +74,14 @@ extern "C" int gt7dash_feed(const char *line)
 
 extern "C" void gt7dash_step(void)
 {
-    if (s_dash) { s_dash->loop(); }
+    if (!s_dash) { return; }
+    s_dash->loop();
+    /* 執行中被切到 GT7 直連（板子沒有 Wi-Fi，不能用）：離開 Wi-Fi 設定畫面後自動切回
+     * USB 序列埠模式，不然遊戲資料進不來 */
+    if (s_dash->telemetry.mode == TelemetryMode::GT7 &&
+        s_dash->settingsScreen != SHCustomProtocol::SettingsScreen::WifiSettings) {
+        s_dash->selectConnection(TelemetryMode::SimHub);
+    }
 }
 
 extern "C" const uint16_t *gt7dash_canvas(void)

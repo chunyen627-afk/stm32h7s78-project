@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # 驗證每個主題能不能 60Hz：板子自己產生資料（展示模式），間隔預設 16ms
-# （= 授權版 SimHub 一秒 60 次），每個主題熱身 6 秒、量 10 秒。
+# （= RaceDash Bridge 遊戲中的一秒 60 次），每個主題熱身 6 秒、量 10 秒。
 # 經 SWD（HOTPLUG，不重置板子）讀寫 DTCM 的狀態格，見 README「除錯」。
 #
 #   tools/measure_fps.sh                 # 七個主題
 #   THEMES="0 3" tools/measure_fps.sh    # 只量 Classic、Radar
-#   PERIOD=100 tools/measure_fps.sh      # 免費版的一秒 10 次
+#   PERIOD=100 tools/measure_fps.sh      # 一秒 10 次
 #
-# 量完會關掉展示模式、切回 GT3。SimHub 開著也可以量（展示模式時板子不理序列埠）。
+# 量完會關掉展示模式、切回 GT3。RaceDash Bridge 開著也可以量（展示模式時板子不理序列埠）。
 TOOLS="C:/ST/STM32CubeIDE_2.0.0/STM32CubeIDE/plugins/com.st.stm32cube.ide.mcu.externaltools"
 CLI="$TOOLS.cubeprogrammer.win32_2.2.300.202508131133/tools/bin/STM32_Programmer_CLI.exe"
 W() { "$CLI" -c port=SWD mode=HOTPLUG -w32 "$1" "$2" >/dev/null 2>&1; }

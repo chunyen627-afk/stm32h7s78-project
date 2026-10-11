@@ -1,7 +1,7 @@
 /* UART4 接收：中斷收進環形緩衝，主迴圈逐行取出。
  *
  * 只用 HAL 做初始化（鮑率要從 UART4 的核心時脈算，交給 HAL 不會算錯），
- * 接收不走 HAL_UART_Receive_IT —— 那套要預先給長度，而 SimHub 送的是
+ * 接收不走 HAL_UART_Receive_IT —— 那套要預先給長度，而 RaceDash Bridge 送的是
  * 不定長的一行一行文字。中斷處理常式直接讀 RDR。
  *
  * 腳位：PD1 = TX、PD0 = RX、AF8（board-notes 9.2）。 */

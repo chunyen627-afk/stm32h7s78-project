@@ -7,7 +7,7 @@
 #include <winsock2.h>
 #include <stdio.h>
 
-/* 20777 是 F1 的出廠設定；20888 是這台電腦上 F1 25 設定檔裡的埠（之前給 SimHub 用的）。
+/* 20777 是 F1 的出廠設定；20888 是這台電腦上 F1 25 設定檔裡的埠。
  * 兩個都聽，遊戲設定不用改。 */
 static const uint16_t k_ports[] = { 20777, 20888 };
 #define N_PORTS (int)(sizeof(k_ports) / sizeof(k_ports[0]))
@@ -35,7 +35,7 @@ bool udp_open(void)
         a.sin_port = htons(k_ports[i]);
         a.sin_addr.s_addr = htonl(INADDR_ANY);
         if (bind(s_sock[i], (struct sockaddr *)&a, sizeof(a)) != 0) {
-            logf_("UDP %d 埠開不起來（被別的程式佔用？例如 SimHub）", k_ports[i]);
+            logf_("UDP %d 埠開不起來（被別的程式佔用？）", k_ports[i]);
             closesocket(s_sock[i]);
             s_sock[i] = INVALID_SOCKET;
             continue;

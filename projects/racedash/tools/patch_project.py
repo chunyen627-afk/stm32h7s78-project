@@ -29,7 +29,7 @@ SRC = "PARENT-2-PROJECT_LOC"
 # 沒有這些模組，BSP 的 LCD/觸控/PSRAM 都編不過。
 HAL_MODULES = ["LTDC", "I2C", "DMA2D", "XSPI", "LPTIM", "SDRAM",
                "GFXTIM", "RAMCFG", "MDF", "CRC",
-               "UART"]   # UART4 = ST-LINK 的虛擬 COM 埠，SimHub 從這裡送遙測
+               "UART"]   # UART4 = ST-LINK 的虛擬 COM 埠，RaceDash Bridge 從這裡送遙測
 
 HAL_SOURCES = [
     "stm32h7rsxx_hal_ltdc.c", "stm32h7rsxx_hal_ltdc_ex.c",

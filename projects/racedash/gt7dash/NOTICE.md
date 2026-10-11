@@ -8,8 +8,11 @@ https://github.com/caa1211/esp32-gt7-dashboard ，v2.0.1。
 TelemetrySource.h、DashboardWiFiCredentials.h、dashboard/ 底下的七個主題與圖示、
 GT7DerivedMetrics、GT7UDPParser 與 Salsa20），`compat/version.h` 也是原作的
 `include/version.h`。原作在 README 宣告採用 MIT License；著作權歸原作者所有。
-`simhub/racedash-serial.js` 是原作 `simhub/custom-protocol.txt` 只改最後一行
-（結尾加換行）。
+
+**唯一的修改**：`SHCustomProtocol.h` 裡畫面上顯示的 9 個字串。原作的 USB 模式是接
+SimHub，板子改用自製的 RaceDash Bridge，所以把提到 SimHub 的顯示文字換掉
+（例如等待畫面的「SIMHUB DASH」→「RACEDASH」、「Waiting for SimHub」→「Waiting for game」、
+設定選單的「SIMHUB USB」→「PC USB」）。程式邏輯、排版、內部的名稱都沒動。
 
 GT7UDPParser 與 Salsa20 是原作從 MacManley/gt7-udp 收錄的（見原作的
 platformio.ini 與 lib/GT7Udp/LICENSE）。

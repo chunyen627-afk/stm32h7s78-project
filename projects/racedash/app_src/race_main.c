@@ -1,5 +1,6 @@
 /**
- * 賽車儀表：SimHub 經 ST-LINK 的虛擬 COM 埠（UART4）送遙測，畫在 5 吋螢幕上。
+ * 賽車儀表：電腦上的 RaceDash Bridge（bridge/）經 ST-LINK 的虛擬 COM 埠（UART4）送遙測，
+ * 畫在 5 吋螢幕上。
  *
  * 畫面整個是原作（caa1211/esp32-gt7-dashboard，MIT）：資料處理、七個主題、
  * 觸控選單都是原作的程式碼，一行不改，畫在 320x240 的畫布上（gt7dash/）。
@@ -296,12 +297,12 @@ void racedash_pref_clear(void)
 }
 
 /* ------------------------------------------------------------------ */
-/* 展示模式：板子自己產生一行 DSH1（跟 tools/fake_simhub.ps1 一樣的動作）  */
+/* 展示模式：板子自己產生一行 DSH1（跟 RaceDash Bridge 送來的一樣）       */
 /* ------------------------------------------------------------------ */
 /* ------------------------------------------------------------------ */
 /* 展示模式：板子自己模擬跑圈                                           */
 /* ------------------------------------------------------------------ */
-/* 不用遊戲、不用 SimHub 就能看儀表動起來。一圈由直線、煞車、彎道組成：
+/* 不用開遊戲就能看儀表動起來。一圈由直線、煞車、彎道組成：
  * 直線全油門、轉速到頂升檔；進彎前重煞（ABS 閃）、降檔；彎中半油門；
  * 出彎低檔 TC 介入。每圈結束更新上一圈／最佳圈、圈數，油量逐圈下降，
  * 胎溫隨彎道升降，偶爾換名次、偶爾一圈被判無效。
@@ -471,7 +472,7 @@ static void demo_line(char *out, int cap, uint32_t now)
     sim_fmt_lap(cur, sizeof(cur), now - g_sim.lap_start);
     sim_fmt_lap(last, sizeof(last), g_sim.last_ms);
     sim_fmt_lap(best, sizeof(best), g_sim.best_ms);
-    /* 欄位順序照 simhub/racedash-serial.js */
+    /* 欄位順序見 bridge/README.md 的 DSH1 格式 */
     snprintf(out, (size_t)cap,
              "DSH1;%lu;1;%d;%d;%d;%d;92;%s;%s;%s;%.1f;%d;%d;%d;%d;%d;%d;%d;%d;%d;%.1f;%.1f;%.1f;%.1f",
              (unsigned long)++seq, (int)(g_sim.speed + 0.5f), g_sim.gear, (int)rpm,
@@ -486,7 +487,7 @@ static void demo_line(char *out, int cap, uint32_t now)
 /* ------------------------------------------------------------------ */
 /* 原作的畫面只佔中間 640 像素，左右各 80 像素黑邊沒有用到，放三顆按鈕：
  *   左上「<」上一個主題   右邊「>」下一個主題（跟原作選單裡選一樣，會記住）
- *   左下「DEMO」：點一下開始模擬跑圈，再點一下回到 SimHub 的資料（亮橘色 = 模擬中）
+ *   左下「DEMO」：點一下開始模擬跑圈，再點一下回到遊戲的資料（亮橘色 = 模擬中）
  * 原作的設定選單開著時，切主題的按鈕不動作。黑邊的觸控都不交給原作
  * （以前點到黑邊會當成點畫面邊緣）。按住時按鈕變亮。 */
 enum { BTN_PREV, BTN_NEXT, BTN_DEMO, BTN_COUNT, BTN_NONE = -1 };
@@ -694,7 +695,7 @@ void racedash_run(void)
         if (BOX[11] == DEMO_MAGIC && (int32_t)(now - demo_next) >= 0) {
             char demo[160];
 
-            /* 預設一秒 60 次（跟授權版 SimHub 一樣，轉速條最順）；BOX[17] 可改間隔
+            /* 預設一秒 60 次（跟 RaceDash Bridge 一樣，轉速條最順）；BOX[17] 可改間隔
              * （毫秒），寫 100 就是免費版的一秒 10 次 */
             uint32_t period = (BOX[17] >= 1u && BOX[17] <= 1000u) ? BOX[17] : 16u;
             demo_next = now + period;

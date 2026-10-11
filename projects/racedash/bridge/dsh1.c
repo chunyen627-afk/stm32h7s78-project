@@ -1,4 +1,4 @@
-/* 組 DSH1 一行。格式跟 simhub/racedash-serial.js 一模一樣（板子上的原作解析就是看這個）：
+/* 組 DSH1 一行（板子上的原作解析就是看這個格式，詳見 README.md「DSH1 格式」）：
  *   DSH1;序號;遊戲在跑;速度;檔位;轉速;轉速%;紅線%;本圈;上一圈;最佳圈;剩幾圈油;名次;
  *   第幾圈;共幾圈;油量%;油門%;煞車%;TC;ABS;本圈無效;胎溫左前;右前;左後;右後
  * 不知道的欄位一律 "--"。 */
@@ -64,7 +64,7 @@ int dsh1_format(char *out, int cap, uint32_t seq, bool game_running, const tele_
     else { snprintf(f[4], 24, "--"); }
     num(f[5], 24, t->rpm, 0, 30000, 0);
     num(f[6], 24, (t->max_rpm > 0) ? t->rpm / t->max_rpm * 100.0 : NAN, 0, 100, 0);
-    snprintf(f[7], 24, "92");                       /* 紅線（換檔燈）：跟 SimHub 預設一樣 */
+    snprintf(f[7], 24, "92");                       /* 紅線（換檔燈）：轉速 92% 起亮 */
     laptime(f[8], 24, t->cur_ms);
     laptime(f[9], 24, t->last_ms);
     laptime(f[10], 24, t->best_ms);

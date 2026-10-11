@@ -5,7 +5,7 @@
 #include <stdint.h>
 
 /* UART4 = ST-LINK 的虛擬 COM 埠（板子插 CN7 那條線，電腦上是 COM3 之類）。
- * SimHub 的 Custom Serial devices 從這裡每秒送 10 行遙測。 */
+ * 電腦上的 RaceDash Bridge 從這裡每秒送 60 行遙測（DSH1）。 */
 bool serial_init(uint32_t baud);
 
 /* 收到完整一行就回傳長度，內容在 buf（不含換行、以 NUL 結尾）；還沒收完回 -1。

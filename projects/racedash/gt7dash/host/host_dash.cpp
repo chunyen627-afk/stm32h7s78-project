@@ -10,7 +10,7 @@ WiFiClass WiFi;
 GT7_UDP_Parser gt7Telem;
 Packet gt7Packet;
 
-/* 原作 SimHub 走 Arduino 協定時用的序列埠函式；racedash 直接把整行交給它，用不到。 */
+/* 原作在 ESP32 上自己讀序列埠用的函式；racedash 直接把整行交給它，用不到。 */
 int  FlowSerialAvailable() { return 0; }
 int  FlowSerialTimedRead() { return -1; }
 void FlowSerialWrite(uint8_t) {}
@@ -91,7 +91,7 @@ int main(int argc, char **argv)
   char out[64]; snprintf(out, sizeof(out), "theme%d.ppm", theme);
 
   racedash_pref_put("touchRot", 0);
-  racedash_pref_put("connection", 2);           /* SimHub */
+  racedash_pref_put("connection", 2);           /* USB 序列埠模式 */
   racedash_pref_put("theme", (unsigned char)theme);
   static SHCustomProtocol dash;
   dash.setup();

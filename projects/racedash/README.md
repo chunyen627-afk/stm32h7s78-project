@@ -2,14 +2,15 @@
 
 PC 玩賽車遊戲時，把板子當成 5 吋副儀表。資料由電腦上的 **[RaceDash Bridge](bridge/)**
 從遊戲的官方遙測讀出，每秒 60 次經 USB 送給板子：自動偵測遊戲（AC EVO、ACC、AC Rally、
-F1 24/25、Forza Motorsport、Forza Horizon 6），開機自動在背景跑。也還能用 SimHub
-（免費版每秒 10 次，見下面「SimHub 設定」），兩者不能同時開。
+F1 24/25、Forza Motorsport、Forza Horizon 6），開機自動在背景跑。各遊戲的設定與安裝
+見 [bridge/README.md](bridge/README.md)。
 
 整套燒回（含電腦端程式）：`./firmware/restore.sh 賽車儀表`。
 
 **畫面就是原作**：[caa1211/esp32-gt7-dashboard](https://github.com/caa1211/esp32-gt7-dashboard)
 （MIT License）的整個儀表 App —— 資料處理、七個主題、觸控選單、設定畫面 ——
-**原始碼一行不改**編進板子，連同它用的繪圖函式庫 LovyanGFX（FreeBSD License）。
+編進板子，連同它用的繪圖函式庫 LovyanGFX（FreeBSD License）。原作的程式只改了畫面上
+的幾個字串（等待畫面等，見 `gt7dash/NOTICE.md`）。
 原作畫在 320x240；板子顯示的是**同一個畫面的 2 倍抗鋸齒版本**（640x480，置中在
 800x480 面板上，左右各 80 像素黑邊）：排版、配色、字距照原作，文字用原始字型的
 輪廓重畫、圓和斜線抗鋸齒，不再是放大的方塊（見下面「高解析度」）。
@@ -33,31 +34,10 @@ NVS，這塊板子還沒接上永久儲存）。
 「STMicroelectronics STLink Virtual COM Port」（這台電腦是 COM3），
 供電、燒錄、遙測都走這一條。**要直插電腦**，經過 USB 集線器實測認不到。
 
-## SimHub 設定（舊的做法，已由 RaceDash Bridge 取代）
-
-SimHub 是 PC 上免費的賽車遙測軟體（simhubdash.com），支援 Assetto Corsa、
-AC EVO、ACC、iRacing、F1、Forza 等。
-
-1. 左側選單 **Add/remove features**，打開 **Custom serial devices**
-   （新版 Settings 裡已經沒有 Plugins 分頁）
-2. Custom serial devices → **Add new serial device**：COM 埠選 ST-LINK 那個、Baudrate **115200**
-3. Update messages 的 **EDIT** → 打開 **Use javascript** → 把
-   [`simhub/racedash-serial.js`](simhub/racedash-serial.js) **整個檔案**貼進去
-4. 打開 **Automatic reconnect**
-5. **免費版不會自動切換遊戲**：在 SimHub 先選好要玩的遊戲（例如 AC EVO），
-   沒選對的話板子收得到資料但一直顯示等待
-
-**設定備份**：[`simhub/CustomSerialPlugin.GeneralSettings2.json`](simhub/CustomSerialPlugin.GeneralSettings2.json)
-是設定好的完整檔案。重灌時**先從系統匣的 SimHub 圖示選 Exit SimHub**（關視窗只會
-縮到系統匣，而且 SimHub 結束時才寫設定檔，會把複製進去的蓋掉），再把它複製到
-`C:\Program Files (x86)\SimHub\PluginsData\Common\`，重開 SimHub。
-
-免費版每秒更新 10 次。
-
 ## 架構
 
 ```
-SimHub ──USB(COM3)──> UART4 ──> race_main.c ──一行 DSH1──> 原作 SHCustomProtocol
+Bridge ──USB(COM3)──> UART4 ──> race_main.c ──一行 DSH1──> 原作 SHCustomProtocol
                                     │                         │（解析、主題、觸控 UI）
                                     │                         ▼
                                     │                LovyanGFX 320x240 記憶體畫布
@@ -72,7 +52,7 @@ SimHub ──USB(COM3)──> UART4 ──> race_main.c ──一行 DSH1──>
 | `app_src/race_main.c` | 螢幕、序列埠、貼圖（只貼改過的列）、觸控座標換算、背光、設定儲存、PSRAM 堆積 |
 | `gt7dash/hires/` | 2 倍抗鋸齒鏡像：`hires.cpp`、字型輪廓 `hires_fonts.inc`（由 `tools/gen_hires_fonts.c` 從 TTF 產生）、stb_truetype |
 | `app_src/serial.c` | UART4 中斷接收、逐行取出 |
-| `gt7dash/orig/` | **原作檔案，不修改**（SHCustomProtocol.h、七個主題、SimHub 解析、GT7 解析器…）|
+| `gt7dash/orig/` | **原作檔案**（SHCustomProtocol.h、七個主題、DSH1 解析、GT7 解析器…），只改了顯示文字 |
 | `gt7dash/lgfx/` | LovyanGFX（只取記憶體畫布與字型），三處修補見下 |
 | `gt7dash/compat/` | Arduino／ESP32 相容層：String、Preferences（NVS）、Wi-Fi 空殼、`tft` 畫布 |
 | `gt7dash/port.cpp` | 銜接層：對 C 開 `gt7dash_init/feed/step/canvas` |
@@ -134,14 +114,13 @@ gt7dash/build/host/host_dash 1 "DSH1;..." 40 160,120   # 主題、一行資料�
 
 ## 不開遊戲也能看
 
-- **展示模式**：點**左下角黑邊的「DEMO」**（亮橘色 = 模擬中），再點一下回到 SimHub
+- **展示模式**：點**左下角黑邊的「DEMO」**（亮橘色 = 模擬中），再點一下回到遊戲
   的資料。板子自己模擬跑圈，一秒 60 筆：直線全油門升檔、進彎重煞降檔（ABS 閃）、
   彎中半油門、出彎 TC 介入；每圈約 1 分 11 秒，每圈長度與彎速略有變化，更新上一圈／
   最佳圈、圈數（共 10 圈），油量逐圈下降（剩 8% 自動加滿），胎溫隨彎道升降（左右彎
   輪流），偶爾換名次、偶爾一圈出界不算。模擬中板子不理序列埠。
   SWD 也能開關：寫 `0x2000404C = 0x44454D4F`（"DEMO"），寫 0 關
-- **假 SimHub**：`powershell -ExecutionPolicy Bypass -File tools/fake_simhub.ps1`
-  （SimHub 開著時 COM 埠被佔，用不了）
+- **Bridge 的模擬資料**：`racedash-bridge.exe --test`（不讀遊戲，經 COM 埠每秒送 60 筆）
 
 ## 建置與燒錄
 
@@ -153,7 +132,7 @@ gt7dash/build/host/host_dash 1 "DSH1;..." 40 160,120   # 主題、一行資料�
 
 ## 量到的數字
 
-每秒 60 筆資料（等同授權版 SimHub，`tools/measure_fps.sh`，展示模式每 16ms 所有數值都變）：
+每秒 60 筆資料（跟 RaceDash Bridge 遊戲中一樣，`tools/measure_fps.sh`，展示模式每 16ms 所有數值都變）：
 
 | 主題 | 每秒幾格 | 掉格 | 最慢一格 |
 |---|---|---|---|
@@ -173,7 +152,7 @@ gt7dash/build/host/host_dash 1 "DSH1;..." 40 160,120   # 主題、一行資料�
   不走掃描線（Classic 每格重畫的大圓角框原本要 1ms 以上）；一列像素自己搬
   （newlib-nano 的 memcpy 是省空間版，不快）
 - 堆積（PSRAM）：主畫布與鏡像約 1.2MB，七個主題都看過約 2.2MB（上限 12MB）
-- SimHub 實機：AC EVO，原作解析器 0 行無效
+- RaceDash Bridge 實機：AC EVO 每秒 60 筆、原作解析器 0 行無效
 
 ## 除錯
 

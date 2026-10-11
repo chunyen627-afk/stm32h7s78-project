@@ -961,7 +961,7 @@ public:
 #endif
 
     const char *sourceName() const {
-        return telemetry.active == TelemetrySource::GT7 ? "GT7 Wi-Fi" : telemetry.active == TelemetrySource::SimHub ? "SimHub USB" : "Waiting";
+        return telemetry.active == TelemetrySource::GT7 ? "GT7 Wi-Fi" : telemetry.active == TelemetrySource::SimHub ? "PC USB" : "Waiting";
     }
     TelemetryMode telemetryMode() const { return telemetry.mode; }
     bool needsFirstSetup() const {
@@ -1371,7 +1371,7 @@ public:
 
 		tft.setTextColor(TFT_WHITE, TFT_BLACK);
 		tft.drawCentreString(
-			telemetry.mode == TelemetryMode::SimHub ? "SIMHUB DASH" : "GT7 DASH",
+			telemetry.mode == TelemetryMode::SimHub ? "RACEDASH" : "GT7 DASH",
 			SCREEN_WIDTH / 2,
 			75,
 			4);
@@ -1381,16 +1381,16 @@ public:
 			TFT_BLACK);
 
 		tft.drawCentreString(
-			telemetry.mode == TelemetryMode::SimHub ? "Waiting for SimHub" : "Waiting for GT7",
+			telemetry.mode == TelemetryMode::SimHub ? "Waiting for game" : "Waiting for GT7",
 			SCREEN_WIDTH / 2,
 			120,
 			2);
 
         const bool usbActive = usbSeen && uint32_t(millis() - lastUsbCommandTime) < 5000;
         const String hint = telemetry.mode == TelemetryMode::SimHub
-            ? (customProtocolError ? "Check Custom Protocol (DSH1)" :
-                usbActive && !telemetry.simhub.alive(millis()) ? "USB linked: set Custom Protocol" :
-                "Connect USB and start SimHub")
+            ? (customProtocolError ? "Check RaceDash Bridge (DSH1)" :
+                usbActive && !telemetry.simhub.alive(millis()) ? "USB linked: start a game" :
+                "Start a game on the PC")
             : (wifiConfigured ? networkStatus : "Wi-Fi setup required");
         tft.setTextColor(tft.color565(120, 120, 120), TFT_BLACK);
         tft.drawCentreString(hint, X_CENTER, 183, 1);
@@ -1432,7 +1432,7 @@ public:
 		tft.drawString(
 			telemetry.mode == TelemetryMode::SimHub
 				? "SWITCH TO DIRECT GT7"
-				: "SWITCH TO SIMHUB USB",
+				: "SWITCH TO PC USB",
 			x + width / 2, y + height / 2, 1);
 	}
 
@@ -1821,7 +1821,7 @@ public:
             tft.setTextColor(TFT_WHITE, TFT_BLACK);
             tft.drawString("CHOOSE CONNECTION", X_CENTER, 24, 4);
             drawSettingsButton(25, 62, 270, 58, "DIRECT GT7", pressedButton == 0);
-            drawSettingsButton(25, 132, 270, 58, "SIMHUB USB", pressedButton == 1);
+            drawSettingsButton(25, 132, 270, 58, "PC USB", pressedButton == 1);
             if (connectionChoiceCanCancel)
                 drawSettingsButton(105, 202, 110, 30, "BACK", pressedButton == 2);
             else {
@@ -1859,7 +1859,7 @@ public:
 			tft.drawString("CONNECTION", X_CENTER, 101, 1);
 			drawSettingsButton(20, 111, 135, 38, "DIRECT GT7", pressedButton == 2,
 				telemetry.mode == TelemetryMode::GT7);
-			drawSettingsButton(165, 111, 135, 38, "SIMHUB USB", pressedButton == 3,
+			drawSettingsButton(165, 111, 135, 38, "PC USB", pressedButton == 3,
 				telemetry.mode == TelemetryMode::SimHub);
 			drawSettingsButton(20, 158, 280, 38, "RESET TO DEFAULT", pressedButton == 4, false, true);
 			drawSettingsButton(20, 204, 280, 28, "BACK", pressedButton == 5);
@@ -1916,7 +1916,7 @@ public:
 				drawSettingsButton(20, 111, 135, 38, "DIRECT GT7", pressed,
 					telemetry.mode == TelemetryMode::GT7);
 			else if (button == 3)
-				drawSettingsButton(165, 111, 135, 38, "SIMHUB USB", pressed,
+				drawSettingsButton(165, 111, 135, 38, "PC USB", pressed,
 					telemetry.mode == TelemetryMode::SimHub);
 			else if (button == 4)
 				drawSettingsButton(20, 158, 280, 38, "RESET TO DEFAULT", pressed, false, true);
