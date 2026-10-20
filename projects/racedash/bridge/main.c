@@ -27,6 +27,9 @@ void tray_init(const char *log_path_utf8);
 void tray_status(const char *utf8);
 bool tray_pump(void);
 void tray_close(void);
+void cyd_start(void);
+void cyd_offer(const char *line, int n);
+const char *cyd_status(long *sent);
 
 void logf_(const char *fmt, ...)
 {
@@ -157,6 +160,7 @@ int main(int argc, char **argv)
     tray_init(log_path);
     timeBeginPeriod(1);
     udp_open();
+    cyd_start();                            /* 2.8 吋 ESP32（原作韌體）：自己的執行緒 */
     tele_clear(&t);
     logf_("RaceDash Bridge 啟動%s", test ? "（模擬資料）" : "");
 
@@ -209,16 +213,21 @@ int main(int argc, char **argv)
             if (!fresh) { tele_clear(&none); use = &none; }
             int n = dsh1_format(line, sizeof(line), ++seq, fresh && t.running, use, fuel_laps_estimate(use));
             if (serial_write(line, n)) { sent++; }
+            cyd_offer(line, n);
             /* 固定節拍：跟著理想時間走，不要因為一次晚了就整體變慢 */
             last_send = (now - last_send < period * 2) ? last_send + period : now;
         }
 
         if (now - last_status >= 5000) {
-            char status[128];
-            snprintf(status, sizeof(status), "%s｜%s｜每秒 %.1f 筆",
+            char status[256];
+            long        cyd_sent;
+            const char *cyd = cyd_status(&cyd_sent);
+            char        cyd_txt[48] = "";
+            if (cyd) { snprintf(cyd_txt, sizeof(cyd_txt), "｜2.8吋 %s 每秒 %.1f 筆", cyd, cyd_sent * 1000.0 / (now - last_status)); }
+            snprintf(status, sizeof(status), "%s｜%s｜每秒 %.1f 筆%s",
                      test ? "模擬資料" : src ? src->name : "沒有遊戲",
                      serial_port_name() ? serial_port_name() : "找不到 ST-LINK",
-                     sent * 1000.0 / (now - last_status));
+                     sent * 1000.0 / (now - last_status), cyd_txt);
             tray_status(status);
             if (s_console) { logf_("%s", status); }
             sent = 0;
