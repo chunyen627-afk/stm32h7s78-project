@@ -7,7 +7,9 @@ COM 埠送給儀表。
   玩 F1 也行），不用手動切
 - 自動找 ST-LINK 的 COM 埠，板子拔掉再插回去會自己重連
 - 開機自動在背景跑，右下角系統匣有圖示：滑鼠移上去看「遊戲｜COM 埠｜每秒幾筆」，
-  右鍵可以開紀錄檔或結束
+  右鍵可以開「展示模式」、開紀錄檔或結束
+- 展示模式（系統匣右鍵，或 `--demo` 啟動）：不讀遊戲，每秒 60 次送模擬跑圈（跟 H7 板子
+  DEMO 按鈕同一套模擬，`demo.c`），用來看儀表流暢度
 - 單一個 exe（約 110KB），不用安裝執行環境
 
 ## 支援的遊戲
@@ -40,6 +42,10 @@ C 版（直接帶本圈時間），沒回應依序退到 ~、B、A。Windows 防
 
 **同一時間只能一個程式用 COM 埠與 UDP 20777 / 20888**：其他會讀遊戲遙測或佔用 COM 埠的程式不要同時開。
 
+**2.8 吋 ESP32**：USB 插電腦就會自己連上，跟 H7 同時顯示。板子是 USB-C + micro-USB 雙孔版，
+螢幕是 ST7789，要燒原作的 `firmware-st7789.bin`（燒 ILI9341 版會左右鏡像、偏藍）。第一次開機
+點靶心校正觸控，再選「SIMHUB USB」（原作韌體的選項名稱；實際接的是這支程式）。
+
 ## 安裝
 
 ```bash
@@ -48,7 +54,7 @@ powershell -ExecutionPolicy Bypass -File install.ps1         # 裝到 %USERPROFI
 powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 ```
 
-除錯：`racedash-bridge.exe --console`（開主控台看紀錄）、`--test`（不讀遊戲，送模擬資料
+除錯：`racedash-bridge.exe --demo`（展示模式）、`--console`（開主控台看紀錄）、`--test`（不讀遊戲，送模擬資料
 驗證每秒 60 筆）、`--com COM3`（指定 COM 埠）。紀錄檔在 exe 旁邊的 `racedash-bridge.log`。
 
 ## 送出的節奏
@@ -72,7 +78,9 @@ powershell -ExecutionPolicy Bypass -File install.ps1 -Uninstall
 | `src_f1.c` | F1 25（EA 規格 2025 與 2026 Season Pack 兩種格式） |
 | `src_forza.c` | Forza Motorsport / Horizon（官方 Data Out 文件，依封包長度分） |
 | `src_gt7.c` | GT7（PS5）：心跳、Salsa20 解密、自動找 PS5 |
-| `tray.c` | 系統匣圖示 |
+| `tray.c` | 系統匣圖示、右鍵選單（展示模式開關） |
+| `cyd.c` | 2.8 吋 ESP32（ESP32-2432S028，原作 v2.0.1 韌體不改）：找 CH340 / CP210x 的 COM 埠，用原作韌體吃的序列協定（封包＋CRC8＋ACK）送同一行 DSH1，1Mbaud、每秒 60 行 |
+| `demo.c` | 展示模式的模擬跑圈（照抄 `app_src/race_main.c` 的 `demo_line`） |
 
 共享記憶體只能用 `OpenFileMapping` 唯讀開：自己建立對應的話，遊戲啟動時發現大小不對
 會整場不送遙測（AC EVO 會跳「A 3rd party tool created an outdated share memory」）。
@@ -105,3 +113,4 @@ DSH1;序號;遊戲在跑;速度;檔位;轉速;轉速%;紅線%;本圈;上一圈;�
 - AC EVO：實機每秒 60 筆、0 錯誤（TC/ABS 改看 graphics 旗標後也會亮）
 - GT7：用假 PS5（照 GT7 格式加密回送）驗證心跳、解密、各欄位與每秒 60 筆；還沒在真的 PS5 上跑過
 - ACC、AC Rally：需要遊戲開著才能驗證
+- 2.8 吋 ESP32（原作韌體）：展示模式實測每秒 60.0 筆

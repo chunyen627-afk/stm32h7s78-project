@@ -9,10 +9,12 @@
 #define WM_TRAY      (WM_APP + 1)
 #define ID_OPEN_LOG  1
 #define ID_EXIT      2
+#define ID_DEMO      3
 
 static HWND            s_wnd;
 static NOTIFYICONDATAW s_nid;
 static bool            s_quit;
+static bool            s_demo;
 static wchar_t         s_log_path[MAX_PATH];
 
 static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
@@ -20,6 +22,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     if (msg == WM_TRAY && (LOWORD(lp) == WM_RBUTTONUP || LOWORD(lp) == WM_CONTEXTMENU)) {
         POINT pt;
         HMENU m = CreatePopupMenu();
+        AppendMenuW(m, MF_STRING | (s_demo ? MF_CHECKED : 0), ID_DEMO, L"展示模式（模擬跑圈）");
         AppendMenuW(m, MF_STRING, ID_OPEN_LOG, L"開啟紀錄檔");
         AppendMenuW(m, MF_SEPARATOR, 0, NULL);
         AppendMenuW(m, MF_STRING, ID_EXIT, L"結束 RaceDash Bridge");
@@ -31,6 +34,7 @@ static LRESULT CALLBACK wnd_proc(HWND h, UINT msg, WPARAM wp, LPARAM lp)
     }
     if (msg == WM_COMMAND) {
         if (LOWORD(wp) == ID_EXIT) { s_quit = true; }
+        if (LOWORD(wp) == ID_DEMO) { s_demo = !s_demo; }
         if (LOWORD(wp) == ID_OPEN_LOG) { ShellExecuteW(NULL, L"open", s_log_path, NULL, NULL, SW_SHOWNORMAL); }
         return 0;
     }
@@ -78,6 +82,13 @@ bool tray_pump(void)
         DispatchMessageW(&m);
     }
     return s_quit;
+}
+
+/* 右鍵選單的「展示模式」：on 傳 -1 只查詢，0 / 1 設定（--demo 啟動時用） */
+bool tray_demo(int on)
+{
+    if (on >= 0) { s_demo = on != 0; }
+    return s_demo;
 }
 
 void tray_close(void)

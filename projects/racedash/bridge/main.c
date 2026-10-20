@@ -3,6 +3,7 @@
  *   racedash-bridge.exe                 自動找 ST-LINK 的 COM 埠、自動偵測遊戲
  *   racedash-bridge.exe --com COM3      指定 COM 埠
  *   racedash-bridge.exe --test          不讀遊戲，送模擬資料（驗證每秒 60 筆用）
+ *   racedash-bridge.exe --demo          展示模式：送模擬跑圈（也可以從系統匣右鍵開關）
  *   racedash-bridge.exe --console       開主控台顯示紀錄（平常在背景跑，只有系統匣圖示）
  *
  * 送出的節奏：遊戲有新資料時每秒 60 次；遊戲開著但沒在跑（選單、暫停）每秒 10 次；
@@ -26,6 +27,8 @@ static bool  s_console;
 void tray_init(const char *log_path_utf8);
 void tray_status(const char *utf8);
 bool tray_pump(void);
+bool tray_demo(int on);
+int  demo_line(char *out, int cap, uint32_t now);
 void tray_close(void);
 void cyd_start(void);
 void cyd_offer(const char *line, int n);
@@ -140,6 +143,7 @@ int main(int argc, char **argv)
         if (!strcmp(argv[i], "--com") && i + 1 < argc) { force_port = argv[++i]; }
         else if (!strcmp(argv[i], "--test")) { test = true; }
         else if (!strcmp(argv[i], "--console")) { s_console = true; }
+        else if (!strcmp(argv[i], "--demo")) { tray_demo(1); }
     }
     if (s_console) {
         /* 從命令列啟動就印在那個視窗，不然開一個新的 */
@@ -204,9 +208,22 @@ int main(int argc, char **argv)
         }
         if (!test) { fresh = now - last_data < 1000; }
 
+        /* 展示模式：不管遊戲，送模擬跑圈，每秒 60 */
+        bool demo = tray_demo(-1);
+        static bool was_demo;
+        if (demo != was_demo) { logf_(demo ? "展示模式開始" : "展示模式結束"); was_demo = demo; }
+        if (demo) {
+            if (now - last_send >= 1000.0 / 60.0 - 0.5) {
+                char line[256];
+                int  n = demo_line(line, sizeof(line), (uint32_t)now);
+                if (serial_write(line, n)) { sent++; }
+                cyd_offer(line, n);
+                last_send = (now - last_send < 1000.0 / 30.0) ? last_send + 1000.0 / 60.0 : now;
+            }
+        }
         /* 送出：在跑每秒 60、開著沒在跑每秒 10、沒遊戲每秒 2 */
         double period = (fresh && t.running) ? 1000.0 / 60.0 : fresh ? 100.0 : 500.0;
-        if (now - last_send >= period - 0.5) {
+        if (!demo && now - last_send >= period - 0.5) {
             char   line[256];
             tele_t none;
             const tele_t *use = &t;
@@ -225,7 +242,7 @@ int main(int argc, char **argv)
             char        cyd_txt[48] = "";
             if (cyd) { snprintf(cyd_txt, sizeof(cyd_txt), "｜2.8吋 %s 每秒 %.1f 筆", cyd, cyd_sent * 1000.0 / (now - last_status)); }
             snprintf(status, sizeof(status), "%s｜%s｜每秒 %.1f 筆%s",
-                     test ? "模擬資料" : src ? src->name : "沒有遊戲",
+                     demo ? "展示模式" : test ? "模擬資料" : src ? src->name : "沒有遊戲",
                      serial_port_name() ? serial_port_name() : "找不到 ST-LINK",
                      sent * 1000.0 / (now - last_status), cyd_txt);
             tray_status(status);
